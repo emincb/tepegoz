@@ -18,10 +18,15 @@ pub mod socket;
 
 /// Current wire protocol version. Bumps on breaking change.
 ///
-/// Bumped to 3 in Phase 3 Slice A: added `Subscription::Docker`,
-/// `Event::ContainerList`, `Event::DockerUnavailable`, plus the
-/// `DockerContainer`/`DockerPort`/`KeyValue` types they reference.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version history:
+/// - **v3 (Phase 3 Slice A)**: `Subscription::Docker`, `Event::ContainerList`,
+///   `Event::DockerUnavailable`, `DockerContainer`/`DockerPort`/`KeyValue`.
+/// - **v4 (Phase 3 Slice B)**: `Subscription::DockerLogs` /
+///   `Subscription::DockerStats`, `Payload::DockerAction` +
+///   `Payload::DockerActionResult`, `Event::ContainerLog` /
+///   `Event::ContainerStats` / `Event::DockerLogStreamEnded`, plus
+///   `DockerActionKind`, `DockerActionOutcome`, `LogStream`, `DockerStats`.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Identifier for a pty pane owned by the daemon.
 pub type PaneId = u64;
@@ -64,6 +69,11 @@ pub enum Payload {
         cols: u16,
     },
 
+    // docker commands (client → daemon)
+    /// One-shot lifecycle action against a container. Daemon replies with a
+    /// matching `DockerActionResult` carrying the same `request_id`.
+    DockerAction(DockerActionRequest),
+
     // ---- daemon → client ----
     Welcome(Welcome),
     Pong,
@@ -72,6 +82,9 @@ pub enum Payload {
     PaneList {
         panes: Vec<PaneInfo>,
     },
+    /// Response to a `DockerAction` command. `request_id` mirrors the
+    /// originating request so clients can multiplex multiple in-flight actions.
+    DockerActionResult(DockerActionResult),
     Error(ErrorInfo),
 }
 
@@ -102,6 +115,25 @@ pub enum Subscription {
     /// restarts without the client having to resubscribe.
     Docker {
         id: u64,
+    },
+    /// Stream a single container's logs. `tail_lines = 0` means "all". When
+    /// `follow = true` the subscription stays live until cancelled, the
+    /// container exits, or the engine becomes unreachable; on terminal
+    /// conditions the daemon emits `Event::DockerLogStreamEnded`.
+    DockerLogs {
+        id: u64,
+        container_id: String,
+        follow: bool,
+        tail_lines: u32,
+    },
+    /// Stream a single container's stats (CPU%, memory). Periodic events
+    /// every ~1 s while the container is alive. Like docker logs, the
+    /// stream terminates with `DockerLogStreamEnded` (reused for stats —
+    /// the name is generic enough that adding a separate `DockerStatsEnded`
+    /// would just be churn).
+    DockerStats {
+        id: u64,
+        container_id: String,
     },
 }
 
@@ -143,6 +175,23 @@ pub enum Event {
     /// to unreachable; the daemon keeps retrying internally and will follow up
     /// with a `ContainerList` once a connection is established.
     DockerUnavailable {
+        reason: String,
+    },
+    /// One chunk of container log output (delivered under a `DockerLogs`
+    /// subscription).
+    ContainerLog {
+        stream: LogStream,
+        data: Vec<u8>,
+    },
+    /// One sample of container resource usage (delivered under a
+    /// `DockerStats` subscription).
+    ContainerStats(DockerStats),
+    /// Streaming subscription terminated. Reason is human-readable; common
+    /// causes are container exit, container removal, or engine going away.
+    /// After this event the daemon will not emit further events on this
+    /// subscription id (it's effectively closed; client may unsubscribe to
+    /// free local state, but doesn't have to).
+    DockerLogStreamEnded {
         reason: String,
     },
 }
@@ -240,4 +289,71 @@ pub struct DockerPort {
 pub struct KeyValue {
     pub key: String,
     pub value: String,
+}
+
+/// Lifecycle operations a client can request against a container.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerActionKind {
+    Start,
+    Stop,
+    Restart,
+    /// Send SIGKILL (or container's stop signal if explicitly configured).
+    Kill,
+    /// Force-remove the container, including running ones.
+    Remove,
+}
+
+/// One-shot lifecycle command.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct DockerActionRequest {
+    /// Client-assigned id mirrored back in the response. Lets the client
+    /// match a response to its in-flight request without holding the only
+    /// outbound socket lock.
+    pub request_id: u64,
+    pub container_id: String,
+    pub kind: DockerActionKind,
+}
+
+/// Daemon's reply to a `DockerActionRequest`.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct DockerActionResult {
+    pub request_id: u64,
+    pub container_id: String,
+    pub kind: DockerActionKind,
+    pub outcome: DockerActionOutcome,
+}
+
+/// Result of a docker lifecycle action.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum DockerActionOutcome {
+    Success,
+    /// The action failed. `reason` carries the error verbatim from bollard
+    /// (and ultimately from dockerd) — surface it to the user; don't try to
+    /// classify it on the wire.
+    Failure {
+        reason: String,
+    },
+}
+
+/// Which docker log stream a `ContainerLog` chunk came from.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+/// One sample of container resource usage. Computed by the daemon from the
+/// raw bollard stats response; clients render this directly.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DockerStats {
+    /// CPU usage as a percentage (0.0..=N*100 where N = number of cores).
+    /// Computed from cpu_stats vs precpu_stats deltas using the standard
+    /// docker stats CLI formula. `0.0` if a delta could not be calculated
+    /// (e.g. first sample, or precpu missing on Windows).
+    pub cpu_percent: f32,
+    /// Current memory usage in bytes.
+    pub mem_bytes: u64,
+    /// Container memory limit in bytes; `0` if no limit (unconstrained — use
+    /// host total memory if you want to compute a percent).
+    pub mem_limit_bytes: u64,
 }

@@ -228,6 +228,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_action_roundtrip_preserves_request_id_and_kind() {
+        use crate::{DockerActionKind, DockerActionRequest};
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerAction(DockerActionRequest {
+                request_id: 17,
+                container_id: "abc123".into(),
+                kind: DockerActionKind::Restart,
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::DockerAction(req) => {
+                assert_eq!(req.request_id, 17);
+                assert_eq!(req.container_id, "abc123");
+                assert_eq!(req.kind, DockerActionKind::Restart);
+            }
+            other => panic!("expected DockerAction, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn docker_action_result_roundtrip_failure_reason() {
+        use crate::{DockerActionKind, DockerActionOutcome, DockerActionResult};
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerActionResult(DockerActionResult {
+                request_id: 17,
+                container_id: "abc123".into(),
+                kind: DockerActionKind::Stop,
+                outcome: DockerActionOutcome::Failure {
+                    reason: "container is not running".into(),
+                },
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::DockerActionResult(res) => {
+                assert_eq!(res.request_id, 17);
+                assert_eq!(res.container_id, "abc123");
+                assert_eq!(res.kind, DockerActionKind::Stop);
+                match res.outcome {
+                    DockerActionOutcome::Failure { reason } => {
+                        assert_eq!(reason, "container is not running");
+                    }
+                    other => panic!("expected Failure, got {other:?}"),
+                }
+            }
+            other => panic!("expected DockerActionResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_docker_logs_roundtrip() {
+        use crate::Subscription;
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::DockerLogs {
+                id: 99,
+                container_id: "abc".into(),
+                follow: true,
+                tail_lines: 200,
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::Subscribe(Subscription::DockerLogs {
+                id,
+                container_id,
+                follow,
+                tail_lines,
+            }) => {
+                assert_eq!(id, 99);
+                assert_eq!(container_id, "abc");
+                assert!(follow);
+                assert_eq!(tail_lines, 200);
+            }
+            other => panic!("expected Subscribe(DockerLogs), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn container_log_event_roundtrip() {
+        use crate::LogStream;
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let payload_bytes = b"hello stderr line\n".to_vec();
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 5,
+                event: Event::ContainerLog {
+                    stream: LogStream::Stderr,
+                    data: payload_bytes.clone(),
+                },
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::ContainerLog { stream, data },
+            }) => {
+                assert_eq!(subscription_id, 5);
+                assert_eq!(stream, LogStream::Stderr);
+                assert_eq!(data, payload_bytes);
+            }
+            other => panic!("expected Event(ContainerLog), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn container_stats_event_roundtrip() {
+        use crate::DockerStats;
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 6,
+                event: Event::ContainerStats(DockerStats {
+                    cpu_percent: 12.5,
+                    mem_bytes: 1_073_741_824,
+                    mem_limit_bytes: 8_589_934_592,
+                }),
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::ContainerStats(s),
+            }) => {
+                assert_eq!(subscription_id, 6);
+                assert!((s.cpu_percent - 12.5).abs() < f32::EPSILON);
+                assert_eq!(s.mem_bytes, 1_073_741_824);
+                assert_eq!(s.mem_limit_bytes, 8_589_934_592);
+            }
+            other => panic!("expected Event(ContainerStats), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn frame_too_large_errors_before_allocation() {
         // Write a len prefix that exceeds MAX_FRAME_SIZE, then zero bytes.
         let (mut a, mut b) = tokio::io::duplex(1024);

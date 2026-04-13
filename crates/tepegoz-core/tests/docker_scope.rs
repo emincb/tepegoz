@@ -13,11 +13,15 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 
 use tepegoz_proto::{
-    Envelope, Event, EventFrame, Hello, PROTOCOL_VERSION, Payload, Subscription,
+    DockerActionKind, DockerActionOutcome, DockerActionRequest, Envelope, Event, EventFrame, Hello,
+    PROTOCOL_VERSION, Payload, Subscription,
     codec::{read_envelope, write_envelope},
 };
 
 const DOCKER_SUB_ID: u64 = 7;
+const LOGS_SUB_ID: u64 = 8;
+const STATS_SUB_ID: u64 = 9;
+const ACTION_REQ_ID: u64 = 100;
 
 /// Wait up to this long for the daemon to deliver a docker event after we
 /// subscribe. Generous because `Engine::connect` walks every candidate
@@ -132,7 +136,385 @@ async fn docker_subscription_returns_container_list_when_engine_is_running() {
     daemon_handle.abort();
 }
 
+/// `DockerAction` against an unreachable engine must come back as
+/// `DockerActionResult { outcome: Failure }` carrying a useful reason —
+/// not silently dropped, not panicking, not the wrong request_id.
+///
+/// This is the failure-path companion to the opt-in
+/// docker_action_restart_against_known_container Available-path test below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn docker_action_against_unreachable_engine_returns_failure_with_reason() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock_path = tmp.path().join("daemon.sock");
+
+    let config = tepegoz_core::DaemonConfig {
+        socket_path: Some(sock_path.clone()),
+    };
+    let daemon_handle = tokio::spawn(async move {
+        tepegoz_core::run_daemon(config).await.expect("daemon ran");
+    });
+
+    wait_for_socket(&sock_path, Duration::from_secs(5)).await;
+    let (mut r, mut w) = connect(&sock_path).await;
+
+    // Skip when docker IS reachable (this test asserts the Failure path).
+    if std::env::var("TEPEGOZ_DOCKER_TEST").ok().as_deref() == Some("1") {
+        eprintln!(
+            "skipping: TEPEGOZ_DOCKER_TEST=1 set — this test asserts the unreachable-engine path"
+        );
+        daemon_handle.abort();
+        return;
+    }
+
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerAction(DockerActionRequest {
+                request_id: ACTION_REQ_ID,
+                container_id: "no-such-container".into(),
+                kind: DockerActionKind::Restart,
+            }),
+        },
+    )
+    .await
+    .expect("send action");
+
+    let env = tokio::time::timeout(FIRST_EVENT_TIMEOUT, read_envelope(&mut r))
+        .await
+        .expect("must produce a result within the connect-probe budget")
+        .expect("read");
+
+    match env.payload {
+        Payload::DockerActionResult(res) => {
+            assert_eq!(res.request_id, ACTION_REQ_ID);
+            assert_eq!(res.container_id, "no-such-container");
+            assert_eq!(res.kind, DockerActionKind::Restart);
+            match res.outcome {
+                DockerActionOutcome::Failure { reason } => {
+                    assert!(
+                        !reason.is_empty(),
+                        "Failure must carry a non-empty reason — clients render it directly"
+                    );
+                }
+                DockerActionOutcome::Success => {
+                    panic!("expected Failure (no engine reachable), got Success");
+                }
+            }
+        }
+        other => panic!("expected DockerActionResult, got {other:?}"),
+    }
+
+    daemon_handle.abort();
+}
+
+/// `Subscribe(DockerLogs)` against an unreachable engine must terminate
+/// cleanly with `Event::DockerLogStreamEnded` — without that signal a UI
+/// would spin forever waiting for log chunks that won't come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn docker_logs_against_unreachable_engine_emits_stream_ended() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock_path = tmp.path().join("daemon.sock");
+
+    let config = tepegoz_core::DaemonConfig {
+        socket_path: Some(sock_path.clone()),
+    };
+    let daemon_handle = tokio::spawn(async move {
+        tepegoz_core::run_daemon(config).await.expect("daemon ran");
+    });
+
+    wait_for_socket(&sock_path, Duration::from_secs(5)).await;
+    let (mut r, mut w) = connect(&sock_path).await;
+
+    if std::env::var("TEPEGOZ_DOCKER_TEST").ok().as_deref() == Some("1") {
+        eprintln!("skipping: this test asserts the unreachable-engine path");
+        daemon_handle.abort();
+        return;
+    }
+
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::DockerLogs {
+                id: LOGS_SUB_ID,
+                container_id: "no-such-container".into(),
+                follow: true,
+                tail_lines: 0,
+            }),
+        },
+    )
+    .await
+    .expect("send subscribe");
+
+    let event = read_event_for(&mut r, LOGS_SUB_ID).await;
+    match event {
+        Event::DockerLogStreamEnded { reason } => {
+            assert!(!reason.is_empty());
+            assert!(
+                reason.to_lowercase().contains("engine") || reason.contains("docker"),
+                "reason should mention the engine being unavailable, got: {reason:?}"
+            );
+        }
+        other => panic!("expected DockerLogStreamEnded, got {other:?}"),
+    }
+
+    daemon_handle.abort();
+}
+
+/// Same shape as the logs failure path: stats subscription against an
+/// unreachable engine must reach a terminal `DockerLogStreamEnded` event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn docker_stats_against_unreachable_engine_emits_stream_ended() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock_path = tmp.path().join("daemon.sock");
+
+    let config = tepegoz_core::DaemonConfig {
+        socket_path: Some(sock_path.clone()),
+    };
+    let daemon_handle = tokio::spawn(async move {
+        tepegoz_core::run_daemon(config).await.expect("daemon ran");
+    });
+
+    wait_for_socket(&sock_path, Duration::from_secs(5)).await;
+    let (mut r, mut w) = connect(&sock_path).await;
+
+    if std::env::var("TEPEGOZ_DOCKER_TEST").ok().as_deref() == Some("1") {
+        eprintln!("skipping: this test asserts the unreachable-engine path");
+        daemon_handle.abort();
+        return;
+    }
+
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::DockerStats {
+                id: STATS_SUB_ID,
+                container_id: "no-such-container".into(),
+            }),
+        },
+    )
+    .await
+    .expect("send subscribe");
+
+    let event = read_event_for(&mut r, STATS_SUB_ID).await;
+    match event {
+        Event::DockerLogStreamEnded { reason } => {
+            assert!(!reason.is_empty());
+        }
+        other => panic!("expected DockerLogStreamEnded, got {other:?}"),
+    }
+
+    daemon_handle.abort();
+}
+
+/// Available-path acceptance: provision a short-lived alpine container,
+/// restart it, subscribe to its logs, send a marker via SendInput-equivalent
+/// (we use a container that prints a marker on start), and verify each
+/// surface area produces the expected event.
+///
+/// Opt-in via `TEPEGOZ_DOCKER_TEST=1` (requires running docker + ability to
+/// pull `alpine:latest` if not already cached).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn docker_action_logs_stats_end_to_end_against_real_engine() {
+    if std::env::var("TEPEGOZ_DOCKER_TEST").ok().as_deref() != Some("1") {
+        eprintln!("skipping: set TEPEGOZ_DOCKER_TEST=1 to enable (requires running docker)");
+        return;
+    }
+
+    // Provision a container that lives long enough to subscribe + restart +
+    // observe stats, and produces deterministic stdout for the logs check.
+    // Use a 60s sleep so the container outlives the test by far.
+    let container_name = format!("tepegoz-test-{}", std::process::id());
+    let run = std::process::Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &container_name,
+            "alpine:latest",
+            "sh",
+            "-c",
+            "echo TEPEGOZ_LOG_MARKER; sleep 60",
+        ])
+        .output()
+        .expect("docker run");
+    assert!(
+        run.status.success(),
+        "docker run failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let container_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(!container_id.is_empty(), "docker run returned no id");
+
+    // Always teardown, even on test panic.
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+    let _cleanup = Cleanup(container_name.clone());
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock_path = tmp.path().join("daemon.sock");
+    let config = tepegoz_core::DaemonConfig {
+        socket_path: Some(sock_path.clone()),
+    };
+    let daemon_handle = tokio::spawn(async move {
+        tepegoz_core::run_daemon(config).await.expect("daemon ran");
+    });
+    wait_for_socket(&sock_path, Duration::from_secs(5)).await;
+
+    // ---- Logs: marker must appear ----
+    let (mut r, mut w) = connect(&sock_path).await;
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::DockerLogs {
+                id: LOGS_SUB_ID,
+                container_id: container_id.clone(),
+                follow: true,
+                tail_lines: 0,
+            }),
+        },
+    )
+    .await
+    .expect("subscribe logs");
+
+    let mut found_marker = false;
+    let logs_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < logs_deadline {
+        match tokio::time::timeout(Duration::from_secs(2), read_envelope(&mut r)).await {
+            Ok(Ok(env)) => {
+                if let Payload::Event(EventFrame {
+                    subscription_id: LOGS_SUB_ID,
+                    event: Event::ContainerLog { data, .. },
+                }) = env.payload
+                {
+                    if data
+                        .windows(b"TEPEGOZ_LOG_MARKER".len())
+                        .any(|w| w == b"TEPEGOZ_LOG_MARKER")
+                    {
+                        found_marker = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(found_marker, "log marker TEPEGOZ_LOG_MARKER never arrived");
+
+    // ---- Stats: at least one sample with sane mem_bytes ----
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::DockerStats {
+                id: STATS_SUB_ID,
+                container_id: container_id.clone(),
+            }),
+        },
+    )
+    .await
+    .expect("subscribe stats");
+
+    let mut got_stats = false;
+    let stats_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < stats_deadline {
+        match tokio::time::timeout(Duration::from_secs(3), read_envelope(&mut r)).await {
+            Ok(Ok(env)) => {
+                if let Payload::Event(EventFrame {
+                    subscription_id: STATS_SUB_ID,
+                    event: Event::ContainerStats(s),
+                }) = env.payload
+                {
+                    assert!(
+                        s.mem_bytes > 0,
+                        "alpine sleep should have nonzero RSS, got {}",
+                        s.mem_bytes
+                    );
+                    got_stats = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(got_stats, "ContainerStats event never arrived");
+
+    // ---- Action: restart succeeds ----
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerAction(DockerActionRequest {
+                request_id: ACTION_REQ_ID,
+                container_id: container_id.clone(),
+                kind: DockerActionKind::Restart,
+            }),
+        },
+    )
+    .await
+    .expect("send action");
+
+    let mut got_action_result = false;
+    let action_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < action_deadline {
+        match tokio::time::timeout(Duration::from_secs(3), read_envelope(&mut r)).await {
+            Ok(Ok(env)) => {
+                if let Payload::DockerActionResult(res) = env.payload {
+                    assert_eq!(res.request_id, ACTION_REQ_ID);
+                    assert_eq!(res.kind, DockerActionKind::Restart);
+                    match res.outcome {
+                        DockerActionOutcome::Success => {
+                            got_action_result = true;
+                            break;
+                        }
+                        DockerActionOutcome::Failure { reason } => {
+                            panic!("restart failed: {reason}");
+                        }
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(got_action_result, "DockerActionResult never arrived");
+
+    daemon_handle.abort();
+}
+
 // ---- helpers ----
+
+/// Read events on the connection until one references `target_sub_id`,
+/// dropping any other-subscription events that interleave.
+async fn read_event_for(r: &mut tokio::net::unix::OwnedReadHalf, target_sub_id: u64) -> Event {
+    let deadline = tokio::time::Instant::now() + FIRST_EVENT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let env = tokio::time::timeout(remaining, read_envelope(r))
+            .await
+            .expect("event must arrive within timeout")
+            .expect("read");
+        if let Payload::Event(EventFrame {
+            subscription_id,
+            event,
+        }) = env.payload
+        {
+            if subscription_id == target_sub_id {
+                return event;
+            }
+        }
+    }
+}
 
 async fn read_first_docker_event(r: &mut tokio::net::unix::OwnedReadHalf) -> Event {
     let env = tokio::time::timeout(FIRST_EVENT_TIMEOUT, read_envelope(r))

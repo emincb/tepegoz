@@ -40,15 +40,15 @@ pub struct Envelope {
     pub payload: Payload,
 }
 
-pub const PROTOCOL_VERSION: u32 = 3;  // bumped on breaking change
+pub const PROTOCOL_VERSION: u32 = 4;  // bumped on breaking change
 ```
 
-### Payload taxonomy (v3)
+### Payload taxonomy (v4)
 
 Client → daemon (commands):
 - `Hello(Hello { client_version, client_name })` — handshake
 - `Ping` — keepalive
-- `Subscribe(Subscription::{ Status { id } | Docker { id } })` — subscribe to a stream
+- `Subscribe(Subscription::{ Status { id } | Docker { id } | DockerLogs { id, container_id, follow, tail_lines } | DockerStats { id, container_id } })` — subscribe to a stream
 - `Unsubscribe { id }` — cancel a subscription
 - `OpenPane(OpenPaneSpec { shell, cwd, env, rows, cols })`
 - `AttachPane { pane_id, subscription_id }`
@@ -56,6 +56,7 @@ Client → daemon (commands):
 - `ListPanes`
 - `SendInput { pane_id, data }`
 - `ResizePane { pane_id, rows, cols }`
+- `DockerAction(DockerActionRequest { request_id, container_id, kind: Start | Stop | Restart | Kill | Remove })` — one-shot lifecycle action; daemon replies with a matching `DockerActionResult`
 
 Daemon → client (responses and events):
 - `Welcome(Welcome { daemon_version, protocol_version, daemon_pid })` — response to Hello
@@ -63,6 +64,7 @@ Daemon → client (responses and events):
 - `Event(EventFrame { subscription_id, event })` — subscription-keyed event stream
 - `PaneOpened(PaneInfo)` — response to OpenPane
 - `PaneList { panes }` — response to ListPanes
+- `DockerActionResult(DockerActionResult { request_id, container_id, kind, outcome: Success | Failure { reason } })` — response to DockerAction; `request_id` mirrors the request so clients can multiplex many in-flight actions
 - `Error(ErrorInfo { kind, message })` — protocol or daemon error
 
 Events (inside `Event(EventFrame)`):
@@ -73,6 +75,9 @@ Events (inside `Event(EventFrame)`):
 - `PaneLagged { dropped_bytes }` — subscriber fell behind; broadcast dropped events
 - `ContainerList { containers, engine_source }` — full docker container list (running + stopped); refreshed every 2 s while engine is reachable; `engine_source` identifies which docker (e.g. `"Docker Desktop (/Users/me/.docker/run/docker.sock)"`) so the user can tell which runtime they're looking at
 - `DockerUnavailable { reason }` — emitted on availability *transitions* (subscribe-time or after the engine goes away). `reason` lists every connect candidate the daemon tried; the daemon keeps retrying every 5 s and follows up with `ContainerList` once a connection comes back
+- `ContainerLog { stream: Stdout|Stderr, data }` — one chunk of container log output (under a `DockerLogs` subscription)
+- `ContainerStats(DockerStats { cpu_percent, mem_bytes, mem_limit_bytes })` — one resource sample (under a `DockerStats` subscription); `cpu_percent` from cpu/precpu deltas, `0.0` on first sample
+- `DockerLogStreamEnded { reason }` — terminal event for `DockerLogs`/`DockerStats` subscriptions (container exit, removal, engine going away, connect failure). After this event no further events arrive on the subscription id; client may unsubscribe to free local state
 
 ### Validation
 
@@ -209,6 +214,8 @@ Broadcast channel capacity is 1024 `PaneUpdate`s. Slow subscribers get `RecvErro
   - Per-client writer task owning the socket's write half, drains an unbounded mpsc of `Envelope`s.
   - Per-subscription forwarder task for each active AttachPane.
   - Per-`Subscribe(Docker)` poll task. Tracked in a `HashMap<id, AbortHandle>` so `Unsubscribe { id }` can cancel just that subscription. Refresh interval 2 s, reconnect interval 5 s; tolerates `dockerd` restarts and engine swaps without re-subscription.
+  - Per-`Subscribe(DockerLogs)` and `Subscribe(DockerStats)` forwarder task. Same `HashMap<id, AbortHandle>` registry. Both forwarders open a bollard stream against a freshly-connected `Engine`, translate to wire types, and always emit a terminal `Event::DockerLogStreamEnded` on stream end (engine unreachable, container exit, container removal, network error). UI never spins waiting for events that won't come.
+  - Per-`DockerAction` action task (transient). Spawned so a slow dockerd doesn't stall the session loop; the task always sends back `DockerActionResult` whether the engine was reachable or not.
 - TUI: single task with `tokio::select!` over `stdin.read`, `read_envelope`, `winch.recv`. No ratatui rendering in v1 (raw passthrough).
 
 ### Backpressure summary

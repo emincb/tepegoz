@@ -74,7 +74,7 @@ Per-phase: goal, delivered (or scope), acceptance test, explicit non-goals, risk
 
 ---
 
-## Phase 3 — Docker scope panel · 🟠 (Slice A landed)
+## Phase 3 — Docker scope panel · 🟠 (Slices A + B landed)
 
 **Goal.** First scope panel. Lists containers; tails logs; execs into container (opens a new pane); lifecycle actions. Sets the UX template for Ports/Processes/Logs in Phase 4.
 
@@ -96,14 +96,17 @@ Phase 3 is large enough to land in slices. Each slice is independently green and
 
 **Not in this slice.** Lifecycle actions, logs streaming, container stats, TUI scope view. See B/C/D below.
 
-### Slice B — Lifecycle actions + logs streaming + container stats · ⚪
+### Slice B — Lifecycle actions + logs streaming + container stats · ✅
 
-**Scope.**
-- Commands: `DockerAction { container_id, kind: Start|Stop|Restart|Kill|Remove }`. Daemon translates to bollard calls; emits a one-shot `DockerActionResult { container_id, kind, outcome }` event keyed to the originating subscription (or to a per-command response payload — TBD when we get there).
-- `Subscribe(DockerLogs { container_id, follow, tail_lines })` subscription. Daemon streams `ContainerLog { container_id, stream: Stdout|Stderr, data, ts }` events.
-- `ContainerStats { container_id, cpu_percent, mem_bytes, mem_percent }` periodic events (every 1–2 s) embedded in the existing `Subscribe(Docker)` stream — or a separate `Subscribe(DockerStats)`, TBD.
+**Delivered (code).**
+- Wire protocol bumped to **v4**. Commands: `Payload::DockerAction(DockerActionRequest { request_id, container_id, kind: DockerActionKind })`. Responses: `Payload::DockerActionResult(DockerActionResult { request_id, container_id, kind, outcome: Success | Failure { reason } })`. New subscriptions: `Subscription::DockerLogs { id, container_id, follow, tail_lines }` and `Subscription::DockerStats { id, container_id }`. New events: `Event::ContainerLog { stream, data }`, `Event::ContainerStats(DockerStats { cpu_percent, mem_bytes, mem_limit_bytes })`, `Event::DockerLogStreamEnded { reason }`. Supporting types `LogStream { Stdout, Stderr }` and `DockerStats`.
+- `tepegoz-docker`: `Engine::action(container_id, DockerActionKind)` translates to bollard `start_container` / `stop_container` / `restart_container` / `kill_container` / `remove_container` (force-remove for the last). `Engine::logs_stream(container_id, follow, tail_lines)` returns a boxed `Stream<Item = anyhow::Result<(LogStream, Vec<u8>)>>`; bollard's `LogOutput::{StdOut, StdErr, Console}` map to wire types (`Console` flows as `Stdout`; `StdIn` is dropped). `Engine::stats_stream(container_id)` returns `Stream<Item = anyhow::Result<DockerStats>>`. CPU% computed from `cpu_stats` vs `precpu_stats` deltas using the standard docker-stats-CLI formula; `0.0` when the delta can't be calculated (first sample, missing precpu, sys_delta=0).
+- `tepegoz-core`: per-subscription forwarder tasks for `DockerLogs` and `DockerStats`, tracked in the same `HashMap<id, AbortHandle>` as `Subscribe(Docker)` so `Unsubscribe { id }` cancels uniformly. Both forwarders always emit a terminal `Event::DockerLogStreamEnded { reason }` (even on connect failure or empty stream) so the client knows the stream is done. `DockerAction` runs in a spawned task — slow dockerd doesn't stall the session loop; engine-unavailable and bollard errors both surface as `DockerActionResult::Failure { reason }`.
 
-**Acceptance.** Provision a known short-lived alpine container; subscribe to docker; restart it; verify the action succeeded and a follow-up `ContainerList` reflects the change.
+**Acceptance tests.**
+- `tepegoz-proto::codec` — roundtrip for `DockerAction`, `DockerActionResult` (including `Failure` reason), `Subscribe(DockerLogs)`, `Event::ContainerLog`, `Event::ContainerStats`.
+- `tepegoz-docker::tests` — `stats_to_wire_computes_cpu_percent` (synthetic CPU delta → 80%), `stats_to_wire_returns_zero_cpu_when_delta_is_unavailable` (no precpu, sys_delta=0), `stats_to_wire_handles_missing_memory_section`.
+- `tepegoz-core/tests/docker_scope.rs` adds three always-on unreachable-engine tests (`DockerAction` returns `Failure` with reason; `Subscribe(DockerLogs)` and `Subscribe(DockerStats)` both terminate with `DockerLogStreamEnded`) plus an opt-in `TEPEGOZ_DOCKER_TEST=1` end-to-end test that provisions an `alpine:latest` container, observes a stdout marker through `Subscribe(DockerLogs)`, observes a stats sample with `mem_bytes > 0` through `Subscribe(DockerStats)`, and asserts `DockerAction(Restart)` returns `Success`. The container is force-removed via `Drop` cleanup so a panic mid-test doesn't leak it.
 
 ### Slice C — TUI scope view + scope/pty switch · ⚪
 

@@ -12,6 +12,7 @@ description = "Tepegöz daemon engine: state store, event bus, command dispatch.
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+futures-util = "0.3"
 tepegoz-proto = { workspace = true }
 tepegoz-pty = { workspace = true }
 tepegoz-docker = { workspace = true }

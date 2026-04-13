@@ -6,13 +6,23 @@
 //! see that as a [`tepegoz_proto::Event::DockerUnavailable`] and the daemon
 //! retries on its own cadence.
 
+use std::pin::Pin;
 use std::time::Duration;
 
 use bollard::Docker;
-use bollard::query_parameters::ListContainersOptionsBuilder;
+use bollard::container::LogOutput;
+use bollard::query_parameters::{
+    KillContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
+    RemoveContainerOptionsBuilder, RestartContainerOptionsBuilder, StatsOptionsBuilder,
+    StopContainerOptionsBuilder,
+};
+use futures_util::Stream;
+use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 
-use tepegoz_proto::{DockerContainer, DockerPort};
+use tepegoz_proto::{
+    DockerActionKind, DockerContainer, DockerPort, DockerStats, LogStream as WireLogStream,
+};
 
 pub mod socket;
 
@@ -24,6 +34,16 @@ pub use socket::{SocketCandidate, discover_socket_candidates};
 /// fall through to the next candidate quickly. Five seconds is more than
 /// enough for a local Unix socket.
 const PROBE_TIMEOUT_SECS: u64 = 5;
+
+/// Stream of container log chunks, already translated from `bollard::LogOutput`
+/// to wire-side `(LogStream, Vec<u8>)`. Boxed so the daemon doesn't need to
+/// know about the bollard type machinery.
+pub type LogChunkStream =
+    Pin<Box<dyn Stream<Item = anyhow::Result<(WireLogStream, Vec<u8>)>> + Send>>;
+
+/// Stream of container resource samples, already translated from bollard's
+/// `ContainerStatsResponse` to wire-side [`DockerStats`].
+pub type StatsStream = Pin<Box<dyn Stream<Item = anyhow::Result<DockerStats>> + Send>>;
 
 /// Engine wrapper around a connected `bollard::Docker`.
 ///
@@ -128,6 +148,93 @@ impl Engine {
         let summaries = self.docker.list_containers(Some(opts)).await?;
         Ok(summaries.into_iter().map(into_wire).collect())
     }
+
+    /// Run a one-shot lifecycle action against a container. Maps the wire
+    /// `DockerActionKind` to the matching bollard call.
+    ///
+    /// `Remove` uses force-remove so the action works on running containers
+    /// too — that matches `docker rm -f` and what the TUI's "remove" key is
+    /// expected to do.
+    pub async fn action(&self, container_id: &str, kind: DockerActionKind) -> anyhow::Result<()> {
+        match kind {
+            DockerActionKind::Start => {
+                self.docker.start_container(container_id, None).await?;
+            }
+            DockerActionKind::Stop => {
+                let opts = StopContainerOptionsBuilder::new().build();
+                self.docker.stop_container(container_id, Some(opts)).await?;
+            }
+            DockerActionKind::Restart => {
+                let opts = RestartContainerOptionsBuilder::new().build();
+                self.docker
+                    .restart_container(container_id, Some(opts))
+                    .await?;
+            }
+            DockerActionKind::Kill => {
+                let opts = KillContainerOptionsBuilder::new().build();
+                self.docker.kill_container(container_id, Some(opts)).await?;
+            }
+            DockerActionKind::Remove => {
+                let opts = RemoveContainerOptionsBuilder::new().force(true).build();
+                self.docker
+                    .remove_container(container_id, Some(opts))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream a container's logs.
+    ///
+    /// `tail_lines = 0` means "all" (matches bollard's `tail = "all"`
+    /// default — keeps the wire knob intuitive). `follow = true` keeps the
+    /// stream open until the container exits or the engine goes away.
+    /// Each yielded item is a `(LogStream, bytes)` pair already translated
+    /// to wire types so the daemon doesn't need to know about bollard.
+    pub fn logs_stream(&self, container_id: &str, follow: bool, tail_lines: u32) -> LogChunkStream {
+        let tail = if tail_lines == 0 {
+            "all".to_string()
+        } else {
+            tail_lines.to_string()
+        };
+        let opts = LogsOptionsBuilder::new()
+            .stdout(true)
+            .stderr(true)
+            .follow(follow)
+            .tail(&tail)
+            .build();
+        let stream = self.docker.logs(container_id, Some(opts));
+        Box::pin(stream.filter_map(|item| async move {
+            match item {
+                Ok(LogOutput::StdOut { message }) => {
+                    Some(Ok((WireLogStream::Stdout, message.to_vec())))
+                }
+                Ok(LogOutput::StdErr { message }) => {
+                    Some(Ok((WireLogStream::Stderr, message.to_vec())))
+                }
+                // Console (raw tty) and StdIn aren't meaningful for our log
+                // panel — treat both as stdout so the user still sees them.
+                Ok(LogOutput::Console { message }) => {
+                    Some(Ok((WireLogStream::Stdout, message.to_vec())))
+                }
+                Ok(LogOutput::StdIn { .. }) => None,
+                Err(e) => Some(Err(anyhow::anyhow!("docker logs: {e}"))),
+            }
+        }))
+    }
+
+    /// Stream a container's stats samples (~1/sec). Each item is already
+    /// translated to wire types (`DockerStats`); CPU% comes from the
+    /// standard docker stats CLI formula and is `0.0` whenever a delta
+    /// can't be calculated (first sample, missing precpu on Windows).
+    pub fn stats_stream(&self, container_id: &str) -> StatsStream {
+        let opts = StatsOptionsBuilder::new().stream(true).build();
+        let stream = self.docker.stats(container_id, Some(opts));
+        Box::pin(stream.map(|item| {
+            item.map(stats_to_wire)
+                .map_err(|e| anyhow::anyhow!("docker stats: {e}"))
+        }))
+    }
 }
 
 /// Structured failure: every connection attempt that was made and why it
@@ -230,6 +337,47 @@ fn into_wire(s: bollard::models::ContainerSummary) -> DockerContainer {
     }
 }
 
+/// Translate a bollard `ContainerStatsResponse` into our wire-side
+/// [`DockerStats`].
+///
+/// CPU calculation matches the standard formula used by the `docker stats`
+/// CLI: `(cpu_delta / system_delta) * online_cpus * 100`, where the deltas
+/// are computed against the matching `precpu_stats` fields. `0.0` whenever
+/// any field needed for the calculation is missing or `system_delta == 0`,
+/// which is normal on the first sample of a stream.
+fn stats_to_wire(s: bollard::models::ContainerStatsResponse) -> DockerStats {
+    let cpu_percent = s
+        .cpu_stats
+        .as_ref()
+        .and_then(|cs| {
+            let pre = s.precpu_stats.as_ref()?;
+            let cpu_total = cs.cpu_usage.as_ref()?.total_usage?;
+            let pre_total = pre.cpu_usage.as_ref()?.total_usage?;
+            let sys_now = cs.system_cpu_usage?;
+            let sys_pre = pre.system_cpu_usage?;
+            let online = cs.online_cpus.unwrap_or(1).max(1) as f32;
+            if sys_now <= sys_pre || cpu_total <= pre_total {
+                return Some(0.0_f32);
+            }
+            let cpu_delta = (cpu_total - pre_total) as f32;
+            let sys_delta = (sys_now - sys_pre) as f32;
+            Some((cpu_delta / sys_delta) * online * 100.0)
+        })
+        .unwrap_or(0.0);
+
+    let (mem_bytes, mem_limit_bytes) = s
+        .memory_stats
+        .as_ref()
+        .map(|m| (m.usage.unwrap_or(0), m.limit.unwrap_or(0)))
+        .unwrap_or((0, 0));
+
+    DockerStats {
+        cpu_percent,
+        mem_bytes,
+        mem_limit_bytes,
+    }
+}
+
 /// Path on disk used by docker socket discovery — exposed for testing.
 #[doc(hidden)]
 pub use socket::candidate_paths_for_test;
@@ -317,5 +465,111 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(into_wire(summary).state, "unknown");
+    }
+
+    /// CPU% formula: `(cpu_delta / sys_delta) * online_cpus * 100`.
+    /// With cpu_total = 200, pre_total = 100, sys_now = 1000, sys_pre = 500,
+    /// online = 4 → (100 / 500) * 4 * 100 = 80.0%.
+    #[test]
+    fn stats_to_wire_computes_cpu_percent() {
+        use bollard::models::{
+            ContainerCpuStats, ContainerCpuUsage, ContainerMemoryStats, ContainerStatsResponse,
+        };
+
+        let response = ContainerStatsResponse {
+            cpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(200),
+                    ..Default::default()
+                }),
+                system_cpu_usage: Some(1000),
+                online_cpus: Some(4),
+                ..Default::default()
+            }),
+            precpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(100),
+                    ..Default::default()
+                }),
+                system_cpu_usage: Some(500),
+                ..Default::default()
+            }),
+            memory_stats: Some(ContainerMemoryStats {
+                usage: Some(2_147_483_648),
+                limit: Some(8_589_934_592),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let stats = stats_to_wire(response);
+        assert!(
+            (stats.cpu_percent - 80.0).abs() < 0.001,
+            "expected 80.0%, got {}",
+            stats.cpu_percent
+        );
+        assert_eq!(stats.mem_bytes, 2_147_483_648);
+        assert_eq!(stats.mem_limit_bytes, 8_589_934_592);
+    }
+
+    /// First sample / missing precpu / sys_delta=0 → cpu_percent must be
+    /// 0.0, not NaN, not a divide-by-zero, not a panic.
+    #[test]
+    fn stats_to_wire_returns_zero_cpu_when_delta_is_unavailable() {
+        use bollard::models::{ContainerCpuStats, ContainerCpuUsage, ContainerStatsResponse};
+
+        // No precpu_stats at all.
+        let response = ContainerStatsResponse {
+            cpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(200),
+                    ..Default::default()
+                }),
+                system_cpu_usage: Some(1000),
+                online_cpus: Some(4),
+                ..Default::default()
+            }),
+            precpu_stats: None,
+            ..Default::default()
+        };
+        assert_eq!(stats_to_wire(response).cpu_percent, 0.0);
+
+        // sys_delta = 0 (sys_now == sys_pre).
+        let response = ContainerStatsResponse {
+            cpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(200),
+                    ..Default::default()
+                }),
+                system_cpu_usage: Some(1000),
+                online_cpus: Some(4),
+                ..Default::default()
+            }),
+            precpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(100),
+                    ..Default::default()
+                }),
+                system_cpu_usage: Some(1000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(stats_to_wire(response).cpu_percent, 0.0);
+    }
+
+    /// Memory section missing entirely → both fields default to 0 (no panic,
+    /// no overflow, just a sensibly-empty stats sample).
+    #[test]
+    fn stats_to_wire_handles_missing_memory_section() {
+        use bollard::models::ContainerStatsResponse;
+        let response = ContainerStatsResponse {
+            memory_stats: None,
+            ..Default::default()
+        };
+        let stats = stats_to_wire(response);
+        assert_eq!(stats.mem_bytes, 0);
+        assert_eq!(stats.mem_limit_bytes, 0);
+        assert_eq!(stats.cpu_percent, 0.0);
     }
 }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{AbortHandle, JoinSet};
@@ -17,7 +18,8 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use tepegoz_proto::{
-    DockerContainer, Envelope, ErrorInfo, ErrorKind, Event, EventFrame, PROTOCOL_VERSION, Payload,
+    DockerActionOutcome, DockerActionRequest, DockerActionResult, DockerContainer, DockerStats,
+    Envelope, ErrorInfo, ErrorKind, Event, EventFrame, LogStream, PROTOCOL_VERSION, Payload,
     Subscription, Welcome,
     codec::{read_envelope, write_envelope},
 };
@@ -170,6 +172,49 @@ async fn handle_command(
                 forward_docker(id, tx).await;
             });
             docker_subs.insert(id, handle.abort_handle());
+        }
+
+        Payload::Subscribe(Subscription::DockerLogs {
+            id,
+            container_id,
+            follow,
+            tail_lines,
+        }) => {
+            if let Some(prev) = docker_subs.remove(&id) {
+                debug!(id, "replacing existing docker logs subscription");
+                prev.abort();
+            }
+            let tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                forward_docker_logs(id, container_id, follow, tail_lines, tx).await;
+            });
+            docker_subs.insert(id, handle.abort_handle());
+        }
+
+        Payload::Subscribe(Subscription::DockerStats { id, container_id }) => {
+            if let Some(prev) = docker_subs.remove(&id) {
+                debug!(id, "replacing existing docker stats subscription");
+                prev.abort();
+            }
+            let tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                forward_docker_stats(id, container_id, tx).await;
+            });
+            docker_subs.insert(id, handle.abort_handle());
+        }
+
+        Payload::DockerAction(req) => {
+            let tx = event_tx.clone();
+            // Spawn so a slow docker daemon doesn't stall the session loop.
+            // Each action is independent; we don't track these handles —
+            // the writer mpsc closing will collapse any orphaned task.
+            tokio::spawn(async move {
+                let result = run_docker_action(req).await;
+                let _ = tx.send(Envelope {
+                    version: PROTOCOL_VERSION,
+                    payload: Payload::DockerActionResult(result),
+                });
+            });
         }
 
         Payload::Unsubscribe { id } => {
@@ -469,6 +514,147 @@ fn docker_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope
         payload: Payload::Event(EventFrame {
             subscription_id,
             event: Event::DockerUnavailable { reason },
+        }),
+    }
+}
+
+fn log_stream_ended_envelope(subscription_id: u64, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::DockerLogStreamEnded { reason },
+        }),
+    }
+}
+
+/// Execute a one-shot docker lifecycle action.
+///
+/// Always returns a `DockerActionResult` — never propagates an `anyhow::Error`
+/// up — so callers (in particular the spawned task in `handle_command`) can
+/// reliably forward the structured result back to the client. Engine connect
+/// failures and bollard errors both surface as `Failure { reason }`.
+async fn run_docker_action(req: DockerActionRequest) -> DockerActionResult {
+    let outcome = match tepegoz_docker::Engine::connect().await {
+        Ok(engine) => match engine.action(&req.container_id, req.kind).await {
+            Ok(()) => DockerActionOutcome::Success,
+            Err(e) => DockerActionOutcome::Failure {
+                reason: format!("{e:#}"),
+            },
+        },
+        Err(e) => DockerActionOutcome::Failure {
+            reason: format!("docker engine unavailable: {e}"),
+        },
+    };
+    DockerActionResult {
+        request_id: req.request_id,
+        container_id: req.container_id,
+        kind: req.kind,
+        outcome,
+    }
+}
+
+/// Per-`Subscribe(DockerLogs)` forwarder.
+///
+/// Connects to the engine, opens the bollard log stream, and forwards each
+/// chunk as a `ContainerLog` event. Always emits a final
+/// `DockerLogStreamEnded` (even on connect failure or if the container
+/// doesn't exist) so the client knows the stream is terminal — without it
+/// a UI would be left "spinning" with no signal that the docker side is
+/// gone. After that event the task exits; client may unsubscribe to free
+/// local state.
+async fn forward_docker_logs(
+    subscription_id: u64,
+    container_id: String,
+    follow: bool,
+    tail_lines: u32,
+    event_tx: mpsc::UnboundedSender<Envelope>,
+) {
+    let engine = match tepegoz_docker::Engine::connect().await {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = event_tx.send(log_stream_ended_envelope(
+                subscription_id,
+                format!("engine unavailable: {e}"),
+            ));
+            return;
+        }
+    };
+
+    let mut stream = engine.logs_stream(&container_id, follow, tail_lines);
+    let mut end_reason = String::from("stream ended");
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok((stream_kind, data)) => {
+                let env = log_chunk_envelope(subscription_id, stream_kind, data);
+                if event_tx.send(env).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                end_reason = e.to_string();
+                break;
+            }
+        }
+    }
+    let _ = event_tx.send(log_stream_ended_envelope(subscription_id, end_reason));
+}
+
+/// Per-`Subscribe(DockerStats)` forwarder.
+///
+/// Same shape as `forward_docker_logs`: stream samples until the container
+/// or engine goes away, then emit `DockerLogStreamEnded` with the reason.
+async fn forward_docker_stats(
+    subscription_id: u64,
+    container_id: String,
+    event_tx: mpsc::UnboundedSender<Envelope>,
+) {
+    let engine = match tepegoz_docker::Engine::connect().await {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = event_tx.send(log_stream_ended_envelope(
+                subscription_id,
+                format!("engine unavailable: {e}"),
+            ));
+            return;
+        }
+    };
+
+    let mut stream = engine.stats_stream(&container_id);
+    let mut end_reason = String::from("stream ended");
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(stats) => {
+                let env = stats_envelope(subscription_id, stats);
+                if event_tx.send(env).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                end_reason = e.to_string();
+                break;
+            }
+        }
+    }
+    let _ = event_tx.send(log_stream_ended_envelope(subscription_id, end_reason));
+}
+
+fn log_chunk_envelope(subscription_id: u64, stream: LogStream, data: Vec<u8>) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::ContainerLog { stream, data },
+        }),
+    }
+}
+
+fn stats_envelope(subscription_id: u64, stats: DockerStats) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::ContainerStats(stats),
         }),
     }
 }
