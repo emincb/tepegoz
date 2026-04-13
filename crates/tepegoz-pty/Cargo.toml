@@ -12,3 +12,6 @@ description = "PTY session manager — daemon-owned ptys with ring buffer and su
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+portable-pty = "0.8"
+bytes = "1"
+tepegoz-proto = { workspace = true }

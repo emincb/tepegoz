@@ -1,18 +1,13 @@
-//! Terminal setup and RAII guard for restoration.
+//! Terminal raw-mode setup and RAII guard.
 
-use std::io::Stdout;
-
-use ratatui::Terminal;
-use ratatui::prelude::CrosstermBackend;
-
-pub(crate) fn setup() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
+pub(crate) fn enter_raw() -> anyhow::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(stdout)).map_err(Into::into)
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    Ok(())
 }
 
-/// Dropping this restores the terminal — safe under panic, early return, etc.
+/// Dropping this restores the terminal — safe under panic, early return, or
+/// normal exit.
 pub(crate) struct TerminalGuard;
 
 impl Drop for TerminalGuard {

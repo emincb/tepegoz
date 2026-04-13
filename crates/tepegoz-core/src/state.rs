@@ -1,12 +1,14 @@
 //! Shared daemon state.
 //!
-//! Kept atomic so client tasks sample without lock contention.
+//! Counters are atomic so client tasks sample without lock contention. The
+//! pty manager owns any live ptys and their scrollback buffers.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tepegoz_proto::StatusSnapshot;
+use tepegoz_pty::PtyManager;
 
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -18,6 +20,7 @@ pub struct SharedState {
     pub events_sent: AtomicU64,
     pub daemon_pid: u32,
     pub socket_path: PathBuf,
+    pub pty: PtyManager,
 }
 
 impl SharedState {
@@ -35,10 +38,12 @@ impl SharedState {
             events_sent: AtomicU64::new(0),
             daemon_pid: std::process::id(),
             socket_path,
+            pty: PtyManager::new(),
         }
     }
 
-    pub fn snapshot(&self) -> StatusSnapshot {
+    pub async fn snapshot(&self) -> StatusSnapshot {
+        let panes_open = u32::try_from(self.pty.count().await).unwrap_or(u32::MAX);
         StatusSnapshot {
             daemon_pid: self.daemon_pid,
             daemon_version: DAEMON_VERSION.to_string(),
@@ -48,6 +53,7 @@ impl SharedState {
             clients_total: self.clients_total.load(Ordering::Relaxed),
             events_sent: self.events_sent.load(Ordering::Relaxed),
             socket_path: self.socket_path.to_string_lossy().into_owned(),
+            panes_open,
         }
     }
 }

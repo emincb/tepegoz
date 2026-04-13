@@ -6,13 +6,12 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Ratatui-based TUI client for the Tepegöz daemon."
+description = "Tepegöz TUI client: raw-passthrough attach to a daemon-owned pty."
 
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
-ratatui = "0.28"
 crossterm = "0.28"
 tepegoz-proto = { workspace = true }

@@ -92,6 +92,7 @@ mod tests {
             clients_total: 3,
             events_sent: 99,
             socket_path: "/tmp/tepegoz-501/daemon.sock".into(),
+            panes_open: 0,
         };
 
         let original = Envelope {
