@@ -161,6 +161,8 @@ async fn attach(
 
     let mut winch = signal(SignalKind::window_change())?;
 
+    tracing::info!("attach loop starting");
+
     let exit_reason: ExitReason = 'attach: loop {
         tokio::select! {
             n = stdin.read(&mut stdin_buf) => {
@@ -169,9 +171,19 @@ async fn attach(
                     Ok(n) => n,
                     Err(e) => break 'attach ExitReason::StdinError(e.to_string()),
                 };
+                tracing::info!(
+                    n,
+                    preview = %format_bytes(&stdin_buf[..n.min(64)]),
+                    "stdin read"
+                );
                 for action in input_filter.process(&stdin_buf[..n]) {
                     match action {
                         InputAction::Forward(bytes) => {
+                            tracing::info!(
+                                len = bytes.len(),
+                                preview = %format_bytes(&bytes[..bytes.len().min(64)]),
+                                "forward to daemon"
+                            );
                             let env = Envelope {
                                 version: PROTOCOL_VERSION,
                                 payload: Payload::SendInput { pane_id, data: bytes },
@@ -181,6 +193,7 @@ async fn attach(
                             }
                         }
                         InputAction::Detach => {
+                            tracing::warn!("InputFilter produced Detach");
                             break 'attach ExitReason::UserDetach;
                         }
                     }
@@ -268,4 +281,19 @@ enum ExitReason {
 
 fn terminal_size_fallback() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((120, 40))
+}
+
+/// Hex-dump a byte slice for diagnostic logging. Printable ASCII rendered
+/// literally, everything else as `\xNN`.
+fn format_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 4);
+    for &b in bytes {
+        if (0x20..=0x7e).contains(&b) && b != b'\\' {
+            out.push(b as char);
+        } else {
+            write!(out, "\\x{b:02x}").expect("write to String");
+        }
+    }
+    out
 }
