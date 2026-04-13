@@ -6,21 +6,15 @@ Active bugs and their diagnostic state. Resolved issues archived below with fix 
 
 ## Active
 
-### ⚠️ Vim-preservation across Scope→Pane re-attach — pending eyeball confirmation
-
-Byte-level proxy (`crates/tepegoz-core/tests/vim_preservation.rs`) passes: `PaneSnapshot` after the synthetic re-attach contains the alt-screen entry, cursor positioning, and marker text. Real-terminal confirmation happens at C2c3 manual demo (Step 1 of the demo sequence in `docs/OPERATIONS.md`).
-
-If vim breaks in a real terminal, fallback mitigations ranked by cost:
-
-1. **Resize-after-attach (cheapest).** In `App::switch_to_pane`, after the new `AttachPane`, emit a second `ResizePane` with the current dims. The pty's child receives `SIGWINCH`; vim / htop / less / tmux / anything else that tracks terminal size all redraw on `SIGWINCH`. ~3-line change, no protocol churn.
-
-2. **Keep `AttachPane` alive across mode switches (real refactor).** App keeps the pane subscription live in scope mode but drops incoming `PaneOutput` bytes on the floor instead of writing them to stdout. No synthetic re-attach needed; no scrollback re-transfer cost. Requires changing the `AppAction` set (no more `EnterPaneMode → Unsubscribe + AttachPane` on switch) and the runtime's mode-switch handling. Also requires the runtime to re-emit a synthetic "current screen" buffer on Scope→Pane to repaint whatever the screen looked like before the scope takeover. ~50-line change.
-
-Pick (1) first if eyeball fails. Only escalate to (2) if (1) doesn't fix it.
+_(none)_
 
 ---
 
 ## Resolved
+
+### ✅ Vim-preservation across Scope→Pane re-attach — moot after Decision #7
+Closed 2026-04-14. The synthetic re-attach pattern was removed in C1.5b when the `View::{Pane, Scope}` mode model gave way to the tiled god view: vim lives in the always-on pty tile and its `AttachPane` subscription never tears down. The automated vt100 reconstruction test (`crates/tepegoz-core/tests/vim_preservation.rs`) was kept and repurposed as the per-CI pin for "bytes flowing into the pty tile render correctly through the vt100 parser." C1.5c's real-terminal run on 2026-04-14 confirmed vim renders + survives focus movement + detach/reattach with no visible corruption. The two fallback mitigations (resize-after-attach, keep-sub-alive-with-drop) are no longer applicable since there is no mode switch to interfere with.
+
 
 ### ✅ "TUI immediate-detach on attach" was user confusion, not a bug
 Reported 2026-04-13, closed same day after reading `~/.cache/tepegoz/tui.log`. The log showed every `UserDetach` was preceded by real `\x02` + `d` bytes on stdin, and one session had the user pasting `./target/debug/tepegoz tui` *inside* the attached pane — the inner invocation hit the `TEPEGOZ_PANE_ID` guard, which the user read as an outer-shell error. Root cause: the pane's zsh prompt is visually identical to the outer shell, so there was no way to tell you were attached. Mitigation: TUI now sets an OSC 0 window title (`tepegoz · pane N`) on attach and clears it on detach, giving an unambiguous visual marker. `f12d194`'s tracing demoted from `info`/`warn` to `debug`.

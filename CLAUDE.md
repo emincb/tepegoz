@@ -76,12 +76,21 @@ xtask/               build tasks (agent cross-compile, release packaging)
 - **Sharpen the blade first.** No AI shortcuts in v1. No features that compromise the substrate.
 - **Implementation autonomy, architectural guardrails.** Tactical calls (local functions, crate plumbing, logging, test shape) are yours. Anything that changes the locked commitments in `docs/DECISIONS.md` needs the user's sign-off.
 - **Docs are authoritative.** When docs and reality conflict, trust reality and update the docs in the same commit. Keep `docs/STATUS.md` and `docs/ISSUES.md` current as phases land.
+- **Session-boundary handoff.** CTO and engineer work in separate Claude Code sessions with separate contexts; the user relays between them. Before context clears, update your section of `docs/HANDOFF.md` with what's in-flight and what you're expecting next. On every session start, read `docs/HANDOFF.md` to pick up where the previous session left off.
+
+## Session start ritual
+
+1. Read this file (auto-loaded) + `docs/STATUS.md` + `docs/ISSUES.md` + `docs/HANDOFF.md`.
+2. `git log --oneline -10` — verify recent commits match what the handoff / status claim.
+3. Run `cargo test --workspace` if touching code; green before starting new work.
+4. If anything in HANDOFF / STATUS is stale vs. reality, fix it before acting.
 
 ## Detailed docs (the authoritative written state)
 
 - `docs/STATUS.md` — current phase state, last commit, acceptance test coverage
 - `docs/ROADMAP.md` — full 10-phase plan with per-phase goals, scope, acceptance criteria
 - `docs/ARCHITECTURE.md` — protocol spec, crate layout, platform matrix, concurrency model, security posture
-- `docs/DECISIONS.md` — the six locked architectural decisions with reasoning
+- `docs/DECISIONS.md` — the seven locked architectural decisions with reasoning
 - `docs/OPERATIONS.md` — build/test/run/debug runbook, log locations, common issues
 - `docs/ISSUES.md` — active bugs with diagnostic state, resolved issues archive
+- `docs/HANDOFF.md` — in-flight CTO + engineer state between session-boundary clears

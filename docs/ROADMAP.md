@@ -248,24 +248,29 @@ Full script in `docs/OPERATIONS.md` "Slice C manual demo prep".
 - Add to `crates/tepegoz-core/tests/docker_scope.rs` a TUI-driver test that spawns the daemon, runs a scripted `App` (no terminal) through "subscribe → receive ContainerList → press r → receive DockerActionResult". Bypasses crossterm but exercises the entire wire path.
 - **Manual demo (per CTO §7 sign-off, including new Step 10):** start daemon + TUI; switch to scope (`Ctrl-b s`); see container table; navigate (j/k); filter (`/`); switch back to pane (`Ctrl-b a`); verify vim-preservation; detach + reattach (`Ctrl-b d`, `tepegoz tui`); **kill the docker daemon, verify scope view transitions to Unavailable within ~5 s without crashing the TUI; restart docker, verify scope view recovers**. Standing victim-container snippet in `docs/OPERATIONS.md`.
 
-#### Slice C3 — Action keybinds + toasts + logs panel · ⚪
+#### Slice C3 — Action keybinds + toasts + logs panel · 🟠 (C3a landed; C3b + C3c pending)
 
-**Scope.**
-- Scope view keybinds (per CTO §4 sign-off):
-  - `r` restart (immediate; recoverable)
-  - `s` stop (immediate; recoverable)
-  - `K` (capital) kill — **requires `y` confirmation modal** (n/Esc/anything-else cancels)
-  - `X` (capital) remove — **requires `y` confirmation modal**
-  - `l` open logs panel (`Subscribe(DockerLogs)` for selected container)
-  - `Enter` exec into container (Slice D — opens new pane)
-  - `?` help overlay
-- Action results render as toasts (overlay near bottom of scope view) — "✓ Restarted nginx" / "✗ Stop failed: container not running".
-- **Pending-action timeout** (per CTO §5 sign-off): each in-flight `DockerAction` carries a `deadline: Instant`; a 30 s sweep timer in the runtime emits `AppEvent::PendingActionTimeout(request_id)` for any expired entry; App emits a "Action timed out — check engine" toast. Cheap to add now; expensive to retrofit.
+Lands as three sub-commits per CTO sign-off: **C3a** (actions + confirm modal + toasts + timeout sweep), **C3b** (logs panel sub-state inside the Docker tile), **C3c** (end-to-end Restart test + manual demo).
 
-**Acceptance tests.**
-- App state-machine tests: `r`/`s`/`K`/`X` emit the right `DockerAction` envelope (with the right `kind`); destructive actions (`K`/`X`) require `y` confirm before emitting; `n`/`Esc`/other key cancels. Pending-action timeout fires the toast.
-- End-to-end test: spawn daemon, drive scripted App through Restart of a real container (opt-in via `TEPEGOZ_DOCKER_TEST=1`).
-- **Manual demo (Slice C overall acceptance — see §7 in the C1 commit history for the full sequence with Step 10).**
+**C3a scope (delivered).**
+- `r` restart (immediate; recoverable) and `s` stop (immediate; recoverable) dispatch `DockerAction` against the selected container on the focused Docker tile. Both also bind `R` / `S` so caps-lock doesn't silently steal the action.
+- `K` (capital) kill and `X` (capital) remove enter an inline confirm modal inside the Docker tile's `Rect` (not full-screen — per C3a UX clarification #3). `y`/`Y` confirms + dispatches; any other key cancels. Focus moving away from the Docker tile cancels. 10 s idle auto-cancel.
+- Toast overlay renders as a 1-line-per-toast strip directly above the Claude Code tile (per C3a UX clarification #2). Max 3 visible; a 4th arrival drops the oldest silently. Auto-dismiss: Success ~3 s, Error ~8 s, Info ~4 s. Never blocks keystrokes.
+- Pending-action 30 s timeout sweep runs on every Tick: expired entries emit an "`<verb> <name>` timed out — check engine" error toast. The `AppEvent::PendingActionTimeout(id)` wire is kept on the input surface so a future dedicated sweeper (timer wheel) can feed it without reshaping the event API.
+- `DockerActionResult::Success` emits a green "`<verb> <name>` — succeeded" toast matched against the pending action description; `Failure { reason }` emits a red "`<verb> <name>` failed: `<reason>`" toast. Stale results (no matching pending action) fall back to `<verb> <container_id>` so the user still sees the outcome.
+- `Payload::Error` from the daemon also lands in the toast overlay queue (previously logged only).
+
+**C3b scope (pending).** `l` opens logs panel as a sub-state of the Docker tile (not a modal — preserves Decision #7 all-scopes-visible). `Subscribe(DockerLogs)` on entry; `Unsubscribe` on exit. ContainerLog chunks render as scrolling transcript with auto-scroll-to-bottom-unless-user-scrolled-up; `j`/`k`/`PgUp`/`PgDn` navigate; `G` jumps to bottom; `Esc`/`q` returns to list. `DockerStreamEnded` renders a terminal "— log stream ended: `<reason>` —" line.
+
+**C3c scope (pending).** End-to-end integration test in `crates/tepegoz-core/tests/`: provision alpine container, drive `Restart` through the App + wire, assert `DockerActionResult::Success` arrives and the follow-up `ContainerList` reflects the change. Opt-in `TEPEGOZ_DOCKER_TEST=1`. Plus a manual-demo script addition in `docs/OPERATIONS.md` for the user's eyeball check.
+
+**C3a acceptance tests (143 workspace-wide, +29 from C1.5b's 114).**
+- `tepegoz-tui::app::tests` 51 (up from 29): all C3a state transitions — r/s immediate dispatch, K/X enter confirm, y/n/Esc/random-char/focus-away cancel paths, 10 s confirm timeout, 30 s action timeout toast, `PendingActionTimeout(id)` event expiry, unknown-id no-op, Success/Failure toasts with description, fallback description for stale results, no-op when PTY focused, no-op when Docker Unavailable, no-op when list empty, toast overflow drop-oldest, toast sweep per-kind cadence, daemon error lands in toast queue.
+- `tepegoz-tui::scope::docker::tests` 11 (up from 8): confirm modal renders with container name + prompt; confirm absent when no pending; help bar shows action keybinds in idle state.
+- `tepegoz-tui::toast::tests` 5 new: empty list paints nothing; single Error toast lands directly above Claude Code strip; three toasts stack on three lines; cap at `MAX_TOASTS` drops oldest; too-small fallback layout no-ops rather than panicking.
+- Combined: `cargo fmt --all` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` 143 passed / 0 failed.
+
+**C3b + C3c acceptance tests (pending).** State-machine + render tests for the logs sub-state; end-to-end integration test per CTO §C3c; manual demo.
 
 ### Slice D — `DockerExec` → new pty pane · ⚪
 

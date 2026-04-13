@@ -19,11 +19,11 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
-use tepegoz_proto::DockerContainer;
+use tepegoz_proto::{DockerActionKind, DockerContainer};
 
-use crate::app::{DockerScope, DockerScopeState};
+use crate::app::{DockerScope, DockerScopeState, PendingConfirm, action_verb};
 
 pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect, focused: bool) {
     let border_color = if focused {
@@ -113,6 +113,79 @@ pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect, foc
     }
 
     render_help_bar(scope, frame, chunks[chunks.len() - 1]);
+
+    // Confirm modal overlays the tile's inner area when a K/X action
+    // is awaiting confirmation (per C3a UX clarification #3). It's
+    // drawn last so it paints over the table/help bar, but stays
+    // inside the tile's Rect so other tiles keep rendering.
+    if let Some(pending) = &scope.pending_confirm {
+        render_confirm_modal(frame, inner, pending);
+    }
+}
+
+/// Inline confirm prompt for `Kill` / `Remove` (the destructive
+/// actions). Centered inside the Docker tile's inner Rect; never
+/// covers the whole screen. Input routing is handled in
+/// `App::handle_scope_key`: while `pending_confirm` is `Some`, `y`/`Y`
+/// confirms; any other key cancels.
+fn render_confirm_modal(frame: &mut Frame<'_>, tile_inner: Rect, pending: &PendingConfirm) {
+    let verb = match pending.kind {
+        DockerActionKind::Kill => "Kill",
+        DockerActionKind::Remove => "Remove",
+        // begin_confirm is currently only called for Kill/Remove, but
+        // fall through to action_verb rather than unreachable!() so a
+        // future caller can't crash the TUI by adding a new confirm
+        // kind.
+        other => action_verb(other),
+    };
+    let width = tile_inner
+        .width
+        .saturating_sub(4)
+        .min(50)
+        .max(tile_inner.width.min(20));
+    let height = 5u16.min(tile_inner.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let x = tile_inner.x + (tile_inner.width.saturating_sub(width)) / 2;
+    let y = tile_inner.y + (tile_inner.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title(Span::styled(
+            " confirm ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    let prompt = format!("{verb} container {}?", pending.container_name);
+    let body = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            prompt,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        Line::from(Span::styled(
+            "[y] confirm · any other key cancels",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Center),
+    ])
+    .alignment(Alignment::Center);
+    frame.render_widget(body, inner_area);
 }
 
 fn render_status_bar(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect) {
@@ -303,10 +376,12 @@ fn render_unavailable(frame: &mut Frame<'_>, area: Rect, reason: &str) {
 }
 
 fn render_help_bar(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect) {
-    let help = if scope.filter_active {
+    let help = if scope.pending_confirm.is_some() {
+        "[y] confirm · any other key cancels"
+    } else if scope.filter_active {
         "[Enter] apply · [Esc] clear · [Backspace] delete"
     } else {
-        "[j/k] nav · [g/G] top/bot · [/] filter · [Ctrl-b h/j/k/l] focus · [Ctrl-b d] detach"
+        "[j/k] nav · [/] filter · [r] restart · [s] stop · [K] kill · [X] remove"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(help, Style::default().fg(Color::DarkGray))),
@@ -344,6 +419,7 @@ mod tests {
             filter: filter.to_string(),
             filter_active,
             sub_id: 42,
+            pending_confirm: None,
         }
     }
 
@@ -544,6 +620,75 @@ mod tests {
             web_row.contains("9090/tcp"),
             "internal-only port must render as `9090/tcp`; got {web_row:?}"
         );
+    }
+
+    #[test]
+    fn pending_confirm_renders_modal_with_container_name_and_prompt() {
+        use std::time::{Duration, Instant};
+        let mut scope = scope_with(
+            DockerScopeState::Available {
+                containers: vec![make_container("web", "nginx", "running", "Up")],
+                engine_source: "test".into(),
+            },
+            "",
+            false,
+        );
+        scope.pending_confirm = Some(PendingConfirm {
+            kind: DockerActionKind::Kill,
+            container_id: "id-web".into(),
+            container_name: "web".into(),
+            deadline: Instant::now() + Duration::from_secs(10),
+        });
+        let rows = draw_and_rows(&scope, 120, 30);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("Kill container web?"),
+            "confirm prompt must name the action + container; got {joined}"
+        );
+        assert!(
+            joined.contains("[y] confirm"),
+            "confirm body must list the y hint; got {joined}"
+        );
+        // Help bar swaps to the confirm-specific hint.
+        assert!(
+            any_row_contains(&rows, "[y] confirm"),
+            "help bar must change when confirm is active"
+        );
+    }
+
+    #[test]
+    fn confirm_modal_is_absent_without_pending_confirm() {
+        let scope = scope_with(
+            DockerScopeState::Available {
+                containers: vec![make_container("web", "nginx", "running", "Up")],
+                engine_source: "test".into(),
+            },
+            "",
+            false,
+        );
+        let rows = draw_and_rows(&scope, 120, 30);
+        let joined = rows.join("\n");
+        assert!(!joined.contains("confirm"));
+        assert!(!joined.contains("Kill container"));
+    }
+
+    #[test]
+    fn help_bar_shows_action_keybinds_when_idle() {
+        let scope = scope_with(
+            DockerScopeState::Available {
+                containers: vec![make_container("web", "nginx", "running", "Up")],
+                engine_source: "test".into(),
+            },
+            "",
+            false,
+        );
+        let rows = draw_and_rows(&scope, 120, 30);
+        assert!(
+            any_row_contains(&rows, "[r] restart"),
+            "help bar must advertise r/s/K/X keybinds in the idle state"
+        );
+        assert!(any_row_contains(&rows, "[K] kill"));
+        assert!(any_row_contains(&rows, "[X] remove"));
     }
 
     #[test]

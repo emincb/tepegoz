@@ -41,6 +41,7 @@ use crate::pty_tile;
 use crate::scope;
 use crate::terminal;
 use crate::tile::{TileDef, TileId, TileKind};
+use crate::toast;
 
 /// Redraw cadence. `DrawFrame` actions from the App coalesce through
 /// ratatui's buffer diff, but the tick also drives the pty tile
@@ -290,7 +291,8 @@ impl Drop for AppRuntime {
     }
 }
 
-/// Walk the tile layout and render each tile into its `Rect`.
+/// Walk the tile layout and render each tile into its `Rect`, then
+/// overlay the toast strip on top so it paints above any tile content.
 fn render_tiles(app: &App, frame: &mut Frame<'_>) {
     // If the layout is the too-small fallback, render just that.
     if app.view.layout.tiles.len() == 1 && app.view.layout.tiles[0].id == TileId::TooSmall {
@@ -323,6 +325,9 @@ fn render_tiles(app: &App, frame: &mut Frame<'_>) {
             }
         }
     }
+
+    let toasts: Vec<_> = app.toasts.iter().cloned().collect();
+    toast::render(&toasts, &app.view.layout, frame);
 }
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect) {

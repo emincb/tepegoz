@@ -20,17 +20,39 @@
 //! [`App::handle_daemon_envelope`], and the tile slot already exists as
 //! a labeled placeholder during development.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 use tepegoz_proto::{
-    DockerActionOutcome, DockerContainer, Envelope, ErrorInfo, Event, EventFrame, PROTOCOL_VERSION,
-    PaneId, Payload, Subscription,
+    DockerActionKind, DockerActionOutcome, DockerActionRequest, DockerContainer, Envelope, Event,
+    EventFrame, PROTOCOL_VERSION, PaneId, Payload, Subscription,
 };
 use vt100::Parser;
 
 use crate::input::{InputAction, InputFilter};
 use crate::tile::{FocusDir, TileId, TileLayout};
+
+/// Max visible toasts at once. A fourth arrival drops the oldest
+/// silently (per C3 UX clarification: never block a keystroke on a
+/// toast).
+pub(crate) const MAX_TOASTS: usize = 3;
+
+/// Auto-dismiss cadence per toast kind. Error toasts hang around longer
+/// because the user needs time to read the engine's reason text.
+const TOAST_SUCCESS_DURATION: Duration = Duration::from_secs(3);
+const TOAST_ERROR_DURATION: Duration = Duration::from_secs(8);
+const TOAST_INFO_DURATION: Duration = Duration::from_secs(4);
+
+/// How long a DockerAction may sit without a DockerActionResult before
+/// the App declares it lost and toasts a timeout. Covers daemon dead /
+/// engine hung / lost event.
+const PENDING_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle auto-cancel on the inline K/X confirm modal. If the user
+/// walks away and forgets the prompt, we don't leave stale modal state
+/// sitting on the tile forever.
+const PENDING_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Scrollback budget for the vt100 parser, in rows. Mirrors the daemon's
 /// 2 MiB scrollback ring in terms of practical replay depth; `1000` rows
@@ -78,9 +100,12 @@ pub(crate) enum AppEvent {
     Resize { rows: u16, cols: u16 },
     /// 30 Hz redraw tick. Always-on in C1.5+ (no mode gating).
     Tick,
-    /// A pending one-shot request (e.g. `DockerAction`) hit its deadline.
-    /// C3 wires this; the variant exists now so the runtime's loop shape
-    /// doesn't need a second refactor when the sweeper arrives.
+    /// A pending one-shot request (e.g. `DockerAction`) hit its
+    /// deadline. The Tick sweep drives expiry in C3a — the runtime
+    /// itself never constructs this variant today — but the variant
+    /// stays in the event surface so a dedicated runtime-side sweeper
+    /// (e.g. a timer wheel) can be added later without reshaping the
+    /// API. Exercised in tests via direct construction.
     #[allow(dead_code)]
     PendingActionTimeout(u64),
 }
@@ -105,10 +130,14 @@ pub(crate) enum AppAction {
     ShowToast { kind: ToastKind, message: String },
 }
 
-/// Severity / classification for [`AppAction::ShowToast`].
+/// Severity / classification for [`AppAction::ShowToast`] and
+/// entries in [`App::toasts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Info/Success produced by C3 once actions exist
 pub(crate) enum ToastKind {
+    /// Neutral notice — not produced by C3a (no path currently emits
+    /// `Info`), but kept for future reuse so we don't have to reshape
+    /// the enum when one arrives.
+    #[allow(dead_code)]
     Info,
     Success,
     Error,
@@ -138,6 +167,12 @@ pub(crate) struct DockerScope {
     /// Subscription id for `Subscribe(Docker)`. Allocated once at
     /// [`App::new`] and never cleared — the tile is always subscribed.
     pub(crate) sub_id: u64,
+    /// Inline confirm prompt for destructive actions (Kill / Remove).
+    /// Rendered as a centered bordered box inside the Docker tile's
+    /// Rect while set. Any key other than `y`/`Y` cancels; focus
+    /// moving away from the Docker tile cancels; a 10 s idle timeout
+    /// cancels. See C3a UX clarification #3.
+    pub(crate) pending_confirm: Option<PendingConfirm>,
 }
 
 impl DockerScope {
@@ -151,6 +186,7 @@ impl DockerScope {
             filter: String::new(),
             filter_active: false,
             sub_id,
+            pending_confirm: None,
         }
     }
 
@@ -176,6 +212,18 @@ impl DockerScope {
         }
     }
 
+    /// The currently selected (visible, filter-respecting) container,
+    /// or `None` if we're not in `Available` or the list is empty.
+    pub(crate) fn selected_container(&self) -> Option<&DockerContainer> {
+        match &self.state {
+            DockerScopeState::Available { containers, .. } => containers
+                .iter()
+                .filter(|c| self.matches_filter(c))
+                .nth(self.selection),
+            _ => None,
+        }
+    }
+
     /// Clamp `selection` into `[0, visible_count)` (or `0` when empty).
     /// Call after any state/filter change that can shrink the visible
     /// set.
@@ -187,6 +235,18 @@ impl DockerScope {
             self.selection = n - 1;
         }
     }
+}
+
+/// In-flight inline confirm prompt on the Docker tile.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingConfirm {
+    pub(crate) kind: DockerActionKind,
+    pub(crate) container_id: String,
+    /// Display name (first `names` entry with leading `/` stripped, or
+    /// short id if the container had no names).
+    pub(crate) container_name: String,
+    /// Idle auto-cancel deadline.
+    pub(crate) deadline: Instant,
 }
 
 /// Three-state lifecycle for the docker scope panel. Distinct visual
@@ -211,13 +271,29 @@ pub(crate) enum DockerScopeState {
     Unavailable { reason: String },
 }
 
-/// Pending one-shot request awaiting a response from the daemon. Slice
-/// C3 uses this for `DockerAction → DockerActionResult` correlation.
+/// Pending one-shot request awaiting a response from the daemon. Keyed
+/// by `request_id` in [`App::pending_actions`]; the id is mirrored back
+/// in the `DockerActionResult` so the App can look up the description
+/// (e.g. "Restart nginx") to include in the resulting toast.
 #[derive(Debug)]
-#[allow(dead_code)] // C3 fills in the consumers
 pub(crate) struct PendingAction {
-    pub(crate) deadline: std::time::Instant,
+    /// Absolute deadline. When `Instant::now()` exceeds this, the App
+    /// declares the action lost and emits a timeout error toast.
+    pub(crate) deadline: Instant,
+    /// Human-readable description ("Restart nginx"). Used as the toast
+    /// body prefix when the result (or a timeout) arrives.
     pub(crate) description: String,
+}
+
+/// A user-visible toast currently in the overlay strip. Stored newest-
+/// to-oldest in [`App::toasts`] (new toasts `push_back`, oldest drops
+/// off `pop_front` when the list exceeds [`MAX_TOASTS`]).
+#[derive(Debug, Clone)]
+pub(crate) struct Toast {
+    pub(crate) kind: ToastKind,
+    pub(crate) message: String,
+    /// Absolute deadline at which the Tick sweep drops this toast.
+    pub(crate) expires_at: Instant,
 }
 
 /// Semantic key events parsed from raw stdin bytes when the Docker
@@ -330,11 +406,18 @@ pub(crate) struct App {
     pub(crate) pty_parser: Parser,
     pub(crate) docker: DockerScope,
     pub(crate) terminal_size: (u16, u16),
-    /// Sub-id allocator. Client-chosen, monotonically increasing.
+    /// Monotonic id allocator shared between subscription ids and
+    /// DockerAction request ids. The daemon correlates each response by
+    /// its embedded id, so collisions between namespaces don't matter —
+    /// one counter keeps it simple.
     next_sub_id: u64,
-    /// In-flight one-shot requests. C3 uses this for action correlation.
-    #[allow(dead_code)]
+    /// In-flight `DockerAction` requests keyed by `request_id`. Entries
+    /// are removed when `DockerActionResult` arrives or the 30 s
+    /// deadline passes (the latter emits a timeout toast).
     pub(crate) pending_actions: HashMap<u64, PendingAction>,
+    /// Current toast overlay (newest at the back). Bounded to
+    /// [`MAX_TOASTS`]; a fourth arrival drops the oldest silently.
+    pub(crate) toasts: VecDeque<Toast>,
     input_filter: InputFilter,
     scope_key_parser: ScopeKeyParser,
 }
@@ -363,6 +446,7 @@ impl App {
             terminal_size,
             next_sub_id,
             pending_actions: HashMap::new(),
+            toasts: VecDeque::new(),
             input_filter: InputFilter::new(),
             scope_key_parser: ScopeKeyParser::default(),
         }
@@ -399,9 +483,12 @@ impl App {
             AppEvent::StdinChunk(bytes) => self.handle_stdin(&bytes, &mut actions),
             AppEvent::DaemonEnvelope(env) => self.handle_daemon_envelope(env, &mut actions),
             AppEvent::Resize { rows, cols } => self.handle_resize(rows, cols, &mut actions),
-            AppEvent::Tick => actions.push(AppAction::DrawFrame),
-            AppEvent::PendingActionTimeout(_id) => {
-                // C3 wires this. Empty arm locks the event surface.
+            AppEvent::Tick => {
+                self.sweep_expired(Instant::now(), &mut actions);
+                actions.push(AppAction::DrawFrame);
+            }
+            AppEvent::PendingActionTimeout(id) => {
+                self.expire_pending_action(id, &mut actions);
             }
         }
         actions
@@ -446,6 +533,11 @@ impl App {
     fn handle_focus_direction(&mut self, dir: FocusDir, actions: &mut Vec<AppAction>) {
         if let Some(next) = self.view.layout.next_focus(self.view.focused, dir) {
             if next != self.view.focused {
+                // Per C3a UX clarification #3: focus moving away from
+                // the Docker tile cancels any pending confirm.
+                if self.view.focused == TileId::Docker {
+                    self.docker.pending_confirm = None;
+                }
                 self.view.focused = next;
                 actions.push(AppAction::FocusTile(next));
                 actions.push(AppAction::DrawFrame);
@@ -454,6 +546,28 @@ impl App {
     }
 
     fn handle_scope_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
+        // Confirm modal takes priority: while visible, every key either
+        // confirms (`y` / `Y`) or cancels (anything else, per
+        // UX clarification #3).
+        if let Some(pending) = self.docker.pending_confirm.clone() {
+            match key {
+                ScopeKey::Char(b'y') | ScopeKey::Char(b'Y') => {
+                    self.docker.pending_confirm = None;
+                    self.dispatch_docker_action(
+                        pending.container_id,
+                        pending.container_name,
+                        pending.kind,
+                        actions,
+                    );
+                }
+                _ => {
+                    self.docker.pending_confirm = None;
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            return;
+        }
+
         if self.docker.filter_active {
             match key {
                 ScopeKey::Escape => {
@@ -520,10 +634,168 @@ impl App {
             ScopeKey::Char(b'g') => self.handle_scope_key(ScopeKey::Top, actions),
             ScopeKey::Char(b'G') => self.handle_scope_key(ScopeKey::Bottom, actions),
             ScopeKey::Char(b'/') => self.handle_scope_key(ScopeKey::FilterStart, actions),
+            ScopeKey::Char(b'r') | ScopeKey::Char(b'R') => {
+                self.issue_selected_docker_action(DockerActionKind::Restart, actions);
+            }
+            ScopeKey::Char(b's') | ScopeKey::Char(b'S') => {
+                self.issue_selected_docker_action(DockerActionKind::Stop, actions);
+            }
+            ScopeKey::Char(b'K') => self.begin_confirm(DockerActionKind::Kill, actions),
+            ScopeKey::Char(b'X') => self.begin_confirm(DockerActionKind::Remove, actions),
             ScopeKey::Escape => {}
-            ScopeKey::Enter => {} // C3 (Slice D) uses this for exec.
+            ScopeKey::Enter => {} // Slice D uses this for DockerExec.
             ScopeKey::Backspace | ScopeKey::Char(_) => {}
         }
+    }
+
+    /// Dispatch a DockerAction against the currently selected
+    /// container (if any). No-op when nothing is selected or the
+    /// docker scope is not in `Available`.
+    fn issue_selected_docker_action(
+        &mut self,
+        kind: DockerActionKind,
+        actions: &mut Vec<AppAction>,
+    ) {
+        let Some(container) = self.docker.selected_container() else {
+            return;
+        };
+        let container_id = container.id.clone();
+        let display_name = display_name_for(container);
+        self.dispatch_docker_action(container_id, display_name, kind, actions);
+    }
+
+    /// Register a PendingAction + emit the `DockerAction` envelope. The
+    /// daemon replies with `DockerActionResult` carrying the same
+    /// request_id; [`App::handle_daemon_envelope`] correlates.
+    fn dispatch_docker_action(
+        &mut self,
+        container_id: String,
+        display_name: String,
+        kind: DockerActionKind,
+        actions: &mut Vec<AppAction>,
+    ) {
+        let request_id = self.alloc_sub_id();
+        let description = format!("{} {display_name}", action_verb(kind));
+        self.pending_actions.insert(
+            request_id,
+            PendingAction {
+                deadline: Instant::now() + PENDING_ACTION_TIMEOUT,
+                description,
+            },
+        );
+        actions.push(AppAction::SendEnvelope(envelope(Payload::DockerAction(
+            DockerActionRequest {
+                request_id,
+                container_id,
+                kind,
+            },
+        ))));
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Begin a pending confirm prompt (K / X keybinds). No-op when no
+    /// container is selected — we have nothing to ask about.
+    fn begin_confirm(&mut self, kind: DockerActionKind, actions: &mut Vec<AppAction>) {
+        let Some(container) = self.docker.selected_container() else {
+            return;
+        };
+        let container_id = container.id.clone();
+        let display_name = display_name_for(container);
+        self.docker.pending_confirm = Some(PendingConfirm {
+            kind,
+            container_id,
+            container_name: display_name,
+            deadline: Instant::now() + PENDING_CONFIRM_TIMEOUT,
+        });
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Push a toast onto the overlay, drop the oldest if the queue is
+    /// already at [`MAX_TOASTS`]. Also emits `AppAction::ShowToast` so
+    /// the runtime's `tui.log` carries a trace of every toast.
+    ///
+    /// `now` is taken explicitly so the expire-sweep can drive toast
+    /// lifetimes relative to its synthetic clock in tests. Production
+    /// callers pass `Instant::now()`.
+    fn push_toast_at(
+        &mut self,
+        now: Instant,
+        kind: ToastKind,
+        message: String,
+        actions: &mut Vec<AppAction>,
+    ) {
+        let duration = match kind {
+            ToastKind::Success => TOAST_SUCCESS_DURATION,
+            ToastKind::Error => TOAST_ERROR_DURATION,
+            ToastKind::Info => TOAST_INFO_DURATION,
+        };
+        if self.toasts.len() >= MAX_TOASTS {
+            self.toasts.pop_front();
+        }
+        self.toasts.push_back(Toast {
+            kind,
+            message: message.clone(),
+            expires_at: now + duration,
+        });
+        actions.push(AppAction::ShowToast { kind, message });
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Convenience for non-sweep callers: uses `Instant::now()` as the
+    /// clock reference.
+    fn push_toast(&mut self, kind: ToastKind, message: String, actions: &mut Vec<AppAction>) {
+        self.push_toast_at(Instant::now(), kind, message, actions);
+    }
+
+    /// Expire one specific pending action — called by both the Tick
+    /// sweep and any runtime-driven `PendingActionTimeout` event.
+    /// `now` is the clock reference used for the resulting timeout
+    /// toast's `expires_at`.
+    fn expire_pending_action_at(&mut self, now: Instant, id: u64, actions: &mut Vec<AppAction>) {
+        if let Some(pa) = self.pending_actions.remove(&id) {
+            self.push_toast_at(
+                now,
+                ToastKind::Error,
+                format!("{} timed out — check engine", pa.description),
+                actions,
+            );
+        }
+    }
+
+    fn expire_pending_action(&mut self, id: u64, actions: &mut Vec<AppAction>) {
+        self.expire_pending_action_at(Instant::now(), id, actions);
+    }
+
+    /// Tick-driven sweep: expire pending confirms (10 s), pending
+    /// actions (30 s, each emits a timeout toast), and stale toasts
+    /// (per-kind duration).
+    ///
+    /// Factored out of [`App::handle_event`] so tests can drive expiry
+    /// without waiting on wall-clock time — pass an `Instant::now() +
+    /// Duration::from_secs(N)` to simulate the sweep at N seconds in
+    /// the future. All toast lifetimes are computed against the same
+    /// `now` so a freshly-pushed timeout toast isn't immediately
+    /// evicted in the same pass.
+    fn sweep_expired(&mut self, now: Instant, actions: &mut Vec<AppAction>) {
+        let confirm_expired = self
+            .docker
+            .pending_confirm
+            .as_ref()
+            .is_some_and(|pc| now >= pc.deadline);
+        if confirm_expired {
+            self.docker.pending_confirm = None;
+        }
+
+        let expired: Vec<u64> = self
+            .pending_actions
+            .iter()
+            .filter_map(|(&id, pa)| (now >= pa.deadline).then_some(id))
+            .collect();
+        for id in expired {
+            self.expire_pending_action_at(now, id, actions);
+        }
+
+        self.toasts.retain(|t| now < t.expires_at);
     }
 
     fn handle_daemon_envelope(&mut self, env: Envelope, actions: &mut Vec<AppAction>) {
@@ -541,18 +813,33 @@ impl App {
                 // Drop silently.
             }
             Payload::Error(info) => {
-                actions.push(daemon_error_toast(&info));
+                let message = format!("daemon error {:?}: {}", info.kind, info.message);
+                self.push_toast(ToastKind::Error, message, actions);
             }
             Payload::DockerActionResult(result) => {
-                if let DockerActionOutcome::Failure { reason } = &result.outcome {
-                    actions.push(AppAction::ShowToast {
-                        kind: ToastKind::Error,
-                        message: format!("{:?} failed: {reason}", result.kind),
-                    });
+                let pending = self.pending_actions.remove(&result.request_id);
+                // Fallback description: the App never issued this
+                // action (or its deadline fired first) — still surface
+                // the outcome so the user isn't in the dark.
+                let description = pending.map(|p| p.description).unwrap_or_else(|| {
+                    format!("{} {}", action_verb(result.kind), result.container_id)
+                });
+                match result.outcome {
+                    DockerActionOutcome::Success => {
+                        self.push_toast(
+                            ToastKind::Success,
+                            format!("{description} — succeeded"),
+                            actions,
+                        );
+                    }
+                    DockerActionOutcome::Failure { reason } => {
+                        self.push_toast(
+                            ToastKind::Error,
+                            format!("{description} failed: {reason}"),
+                            actions,
+                        );
+                    }
                 }
-                // Success toasts are C3 — they need pending_actions
-                // context ("Restarted nginx") rather than a bare
-                // "succeeded."
             }
             // Welcome, Pong, PaneOpened, PaneList — consumed by the
             // handshake / ensure_pane reads, not the event loop.
@@ -629,7 +916,8 @@ impl App {
         actions.push(AppAction::DrawFrame);
     }
 
-    #[allow(dead_code)] // C3 allocates per-action sub ids via this
+    /// Allocate a fresh id for either a subscription or a DockerAction
+    /// request. Monotonic; never reused.
     fn alloc_sub_id(&mut self) -> u64 {
         let id = self.next_sub_id;
         self.next_sub_id += 1;
@@ -651,10 +939,29 @@ fn envelope(payload: Payload) -> Envelope {
     }
 }
 
-fn daemon_error_toast(info: &ErrorInfo) -> AppAction {
-    AppAction::ShowToast {
-        kind: ToastKind::Error,
-        message: format!("daemon error {:?}: {}", info.kind, info.message),
+/// Human display name for a container: first `/name` entry with the
+/// leading slash stripped; short id prefix if the container had no
+/// names. Used in toasts and the confirm prompt.
+pub(crate) fn display_name_for(c: &DockerContainer) -> String {
+    if let Some(raw) = c.names.first() {
+        let trimmed = raw.trim_start_matches('/').to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let short = c.id.get(..12).unwrap_or(&c.id);
+    short.to_string()
+}
+
+/// Past-tense-neutral verb form used in toast descriptions. Matches
+/// `DockerActionKind` 1:1 so Slice D can reuse this when it adds Exec.
+pub(crate) fn action_verb(kind: DockerActionKind) -> &'static str {
+    match kind {
+        DockerActionKind::Start => "Start",
+        DockerActionKind::Stop => "Stop",
+        DockerActionKind::Restart => "Restart",
+        DockerActionKind::Kill => "Kill",
+        DockerActionKind::Remove => "Remove",
     }
 }
 
@@ -1134,26 +1441,47 @@ mod tests {
     }
 
     #[test]
-    fn docker_action_result_success_does_not_toast_yet() {
-        // Success toasts are C3 — they need pending_actions to name
-        // what the user acted on ("Restarted nginx"). In C1.5 no
-        // success branch.
+    fn docker_action_result_success_toasts_with_description() {
+        // C3a: a Success result whose request_id matches a pending
+        // action dequeues that pending action and emits a Success
+        // toast whose message includes the action verb + container
+        // name ("Restart nginx — succeeded").
         let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("nginx", "nginx", "running")]);
+        // Press `r` to dispatch a Restart against the selected row.
+        app.handle_event(AppEvent::StdinChunk(b"r".to_vec()));
+        let (request_id, _) = app
+            .pending_actions
+            .iter()
+            .next()
+            .map(|(&k, v)| (k, v.description.clone()))
+            .expect("dispatch should have inserted a pending action");
+
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::DockerActionResult(DockerActionResult {
-                request_id: 42,
-                container_id: "abc".into(),
+                request_id,
+                container_id: "id-nginx".into(),
                 kind: DockerActionKind::Restart,
                 outcome: DockerActionOutcome::Success,
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+
         assert!(
-            actions
-                .iter()
-                .all(|a| !matches!(a, AppAction::ShowToast { .. }))
+            app.pending_actions.is_empty(),
+            "matched result must clear the pending action"
         );
+        let success = count(&actions, |a| {
+            matches!(
+                a,
+                AppAction::ShowToast { kind: ToastKind::Success, message }
+                    if message.contains("Restart") && message.contains("nginx") && message.contains("succeeded")
+            )
+        });
+        assert_eq!(success, 1, "expected one Success toast; got {actions:?}");
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts.back().unwrap().kind, ToastKind::Success);
     }
 
     #[test]
@@ -1293,5 +1621,412 @@ mod tests {
         app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
         let actions = app.handle_event(AppEvent::Tick);
         assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
+    }
+
+    // ────────────────────── C3a — actions + toasts ──────────────────────
+
+    /// Extract the single DockerAction envelope from a vec of actions,
+    /// or fail the test. Used in multiple C3a tests.
+    fn find_docker_action(actions: &[AppAction]) -> &DockerActionRequest {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                AppAction::SendEnvelope(env) => match &env.payload {
+                    Payload::DockerAction(req) => Some(req),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("no DockerAction envelope in actions")
+    }
+
+    #[test]
+    fn r_dispatches_restart_immediately_when_docker_focused() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"r".to_vec()));
+        let req = find_docker_action(&actions);
+        assert_eq!(req.kind, DockerActionKind::Restart);
+        assert_eq!(req.container_id, "id-web");
+        assert!(
+            app.pending_actions.contains_key(&req.request_id),
+            "pending action must be recorded"
+        );
+        assert!(
+            app.docker.pending_confirm.is_none(),
+            "r is non-destructive — no confirm"
+        );
+    }
+
+    #[test]
+    fn s_dispatches_stop_immediately_when_docker_focused() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("db", "postgres", "running")]);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"s".to_vec()));
+        let req = find_docker_action(&actions);
+        assert_eq!(req.kind, DockerActionKind::Stop);
+        assert_eq!(req.container_id, "id-db");
+    }
+
+    #[test]
+    fn capital_k_enters_pending_confirm_kill_without_dispatching() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        // No DockerAction emitted yet.
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(&env.payload, Payload::DockerAction(_))
+            )),
+            0,
+            "K must enter confirm, not dispatch immediately"
+        );
+        let pc = app
+            .docker
+            .pending_confirm
+            .as_ref()
+            .expect("K must set pending_confirm");
+        assert_eq!(pc.kind, DockerActionKind::Kill);
+        assert_eq!(pc.container_id, "id-web");
+        assert_eq!(pc.container_name, "web");
+        assert!(
+            pc.deadline > Instant::now(),
+            "pending_confirm has a future deadline"
+        );
+    }
+
+    #[test]
+    fn capital_x_enters_pending_confirm_remove_without_dispatching() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"X".to_vec()));
+        let pc = app.docker.pending_confirm.as_ref().unwrap();
+        assert_eq!(pc.kind, DockerActionKind::Remove);
+    }
+
+    #[test]
+    fn y_during_confirm_dispatches_docker_action_and_clears_pending() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        assert!(app.docker.pending_confirm.is_some());
+        let actions = app.handle_event(AppEvent::StdinChunk(b"y".to_vec()));
+        assert!(
+            app.docker.pending_confirm.is_none(),
+            "y must clear pending_confirm"
+        );
+        let req = find_docker_action(&actions);
+        assert_eq!(req.kind, DockerActionKind::Kill);
+        assert_eq!(req.container_id, "id-web");
+        assert!(app.pending_actions.contains_key(&req.request_id));
+    }
+
+    #[test]
+    fn n_during_confirm_cancels_without_dispatching() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        let actions = app.handle_event(AppEvent::StdinChunk(b"n".to_vec()));
+        assert!(app.docker.pending_confirm.is_none());
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(&env.payload, Payload::DockerAction(_))
+            )),
+            0
+        );
+        assert!(app.pending_actions.is_empty());
+    }
+
+    #[test]
+    fn esc_during_confirm_cancels() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        // Bare ESC byte (0x1b) on its own — the scope key parser emits
+        // ScopeKey::Escape for a lone ESC at end of chunk.
+        app.handle_event(AppEvent::StdinChunk(b"\x1b".to_vec()));
+        assert!(app.docker.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn random_char_during_confirm_cancels() {
+        // Any non-y key cancels. Pick 'z' arbitrarily.
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"z".to_vec()));
+        assert!(app.docker.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn focus_away_from_docker_cancels_pending_confirm() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        assert!(app.docker.pending_confirm.is_some());
+        // Ctrl-b k → focus up (PTY).
+        app.handle_event(AppEvent::StdinChunk(b"\x02k".to_vec()));
+        assert_eq!(app.view.focused, TileId::Pty);
+        assert!(
+            app.docker.pending_confirm.is_none(),
+            "leaving Docker must cancel the confirm"
+        );
+    }
+
+    #[test]
+    fn pending_confirm_10s_timeout_clears_state() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        assert!(app.docker.pending_confirm.is_some());
+        // Simulate the sweep 11 s in the future — past the 10 s
+        // pending-confirm deadline.
+        let mut actions: Vec<AppAction> = Vec::new();
+        app.sweep_expired(Instant::now() + Duration::from_secs(11), &mut actions);
+        assert!(
+            app.docker.pending_confirm.is_none(),
+            "sweep past deadline must drop pending_confirm"
+        );
+    }
+
+    #[test]
+    fn r_with_pty_focused_sends_input_not_docker_action() {
+        // When PTY is focused, r is just a character the user typed
+        // into their shell.
+        let mut app = test_app();
+        let actions = app.handle_event(AppEvent::StdinChunk(b"r".to_vec()));
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(
+                    &env.payload,
+                    Payload::SendInput { data, .. } if data == b"r"
+                )
+            )),
+            1
+        );
+        assert!(app.pending_actions.is_empty());
+    }
+
+    #[test]
+    fn r_noop_when_docker_unavailable() {
+        let mut app = test_app();
+        // Put Docker into Unavailable.
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.docker.sub_id,
+                event: Event::DockerUnavailable {
+                    reason: "no engine".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        let actions = app.handle_event(AppEvent::StdinChunk(b"r".to_vec()));
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(&env.payload, Payload::DockerAction(_))
+            )),
+            0
+        );
+        assert!(app.pending_actions.is_empty());
+    }
+
+    #[test]
+    fn r_noop_when_container_list_empty() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, Vec::new());
+        let actions = app.handle_event(AppEvent::StdinChunk(b"r".to_vec()));
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(&env.payload, Payload::DockerAction(_))
+            )),
+            0
+        );
+        assert!(app.pending_actions.is_empty());
+        assert!(app.docker.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn docker_action_result_failure_toasts_with_description_and_reason() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"r".to_vec()));
+        let request_id = *app.pending_actions.keys().next().unwrap();
+
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerActionResult(DockerActionResult {
+                request_id,
+                container_id: "id-web".into(),
+                kind: DockerActionKind::Restart,
+                outcome: DockerActionOutcome::Failure {
+                    reason: "container not running".into(),
+                },
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+
+        assert!(app.pending_actions.is_empty());
+        let err = count(&actions, |a| {
+            matches!(
+                a,
+                AppAction::ShowToast { kind: ToastKind::Error, message }
+                    if message.contains("Restart")
+                       && message.contains("web")
+                       && message.contains("failed")
+                       && message.contains("container not running")
+            )
+        });
+        assert_eq!(err, 1, "expected one Error toast; got {actions:?}");
+    }
+
+    #[test]
+    fn docker_action_result_without_pending_uses_fallback_description() {
+        // Stale / unexpected result — no pending_action entry. We still
+        // surface the outcome so the user isn't in the dark, but the
+        // description falls back to the container id.
+        let mut app = test_app();
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerActionResult(DockerActionResult {
+                request_id: 9_999,
+                container_id: "ghost-id".into(),
+                kind: DockerActionKind::Kill,
+                outcome: DockerActionOutcome::Failure {
+                    reason: "not found".into(),
+                },
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        let err = count(&actions, |a| {
+            matches!(
+                a,
+                AppAction::ShowToast { kind: ToastKind::Error, message }
+                    if message.contains("Kill") && message.contains("ghost-id") && message.contains("not found")
+            )
+        });
+        assert_eq!(err, 1);
+    }
+
+    #[test]
+    fn pending_action_30s_timeout_emits_error_toast() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"r".to_vec()));
+        assert_eq!(app.pending_actions.len(), 1);
+        let mut actions = Vec::new();
+        app.sweep_expired(Instant::now() + Duration::from_secs(31), &mut actions);
+        assert!(
+            app.pending_actions.is_empty(),
+            "sweep past 30 s must drop the pending action"
+        );
+        let timeout_toast = count(&actions, |a| {
+            matches!(
+                a,
+                AppAction::ShowToast { kind: ToastKind::Error, message }
+                    if message.contains("timed out") && message.contains("Restart")
+            )
+        });
+        assert_eq!(timeout_toast, 1);
+        assert_eq!(
+            app.toasts.back().map(|t| t.kind),
+            Some(ToastKind::Error),
+            "timeout toast must land in the overlay queue"
+        );
+    }
+
+    #[test]
+    fn pending_action_timeout_event_expires_that_action() {
+        // The runtime may synthesize PendingActionTimeout(id) for a
+        // single action (e.g. if it ever adds a dedicated sweeper). We
+        // support that wire by treating it as equivalent to the Tick
+        // sweep for that id.
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"r".to_vec()));
+        let request_id = *app.pending_actions.keys().next().unwrap();
+        let actions = app.handle_event(AppEvent::PendingActionTimeout(request_id));
+        assert!(app.pending_actions.is_empty());
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::ShowToast {
+                    kind: ToastKind::Error,
+                    ..
+                }
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn pending_action_timeout_event_for_unknown_id_is_noop() {
+        let mut app = test_app();
+        let actions = app.handle_event(AppEvent::PendingActionTimeout(777));
+        assert!(actions.is_empty(), "unknown id must silently no-op");
+    }
+
+    #[test]
+    fn fourth_toast_drops_oldest_silently() {
+        let mut app = test_app();
+        let mut actions = Vec::new();
+        for i in 0..4 {
+            app.push_toast(ToastKind::Success, format!("msg-{i}"), &mut actions);
+        }
+        assert_eq!(app.toasts.len(), MAX_TOASTS);
+        // Newest three remain (msg-1, msg-2, msg-3); oldest (msg-0) dropped.
+        let messages: Vec<String> = app.toasts.iter().map(|t| t.message.clone()).collect();
+        assert_eq!(messages, vec!["msg-1", "msg-2", "msg-3"]);
+    }
+
+    #[test]
+    fn toast_sweep_drops_expired_toasts() {
+        let mut app = test_app();
+        let mut actions = Vec::new();
+        app.push_toast(ToastKind::Success, "ok".into(), &mut actions);
+        app.push_toast(ToastKind::Error, "err".into(), &mut actions);
+        assert_eq!(app.toasts.len(), 2);
+
+        // Success is 3 s; Error is 8 s. Sweep at 4 s: Success gone,
+        // Error still present.
+        let mut a = Vec::new();
+        app.sweep_expired(Instant::now() + Duration::from_secs(4), &mut a);
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts.back().unwrap().kind, ToastKind::Error);
+
+        // Sweep at 9 s: Error also gone.
+        let mut a = Vec::new();
+        app.sweep_expired(Instant::now() + Duration::from_secs(9), &mut a);
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn daemon_error_also_lands_in_app_toasts() {
+        let mut app = test_app();
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Error(tepegoz_proto::ErrorInfo {
+                kind: tepegoz_proto::ErrorKind::Internal,
+                message: "disk full".into(),
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts.back().unwrap().kind, ToastKind::Error);
+        assert!(app.toasts.back().unwrap().message.contains("disk full"));
+        let show = count(&actions, |a| {
+            matches!(
+                a,
+                AppAction::ShowToast { kind: ToastKind::Error, message }
+                    if message.contains("disk full")
+            )
+        });
+        assert_eq!(show, 1);
     }
 }

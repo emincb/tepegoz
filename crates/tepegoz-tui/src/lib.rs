@@ -26,6 +26,7 @@ mod scope;
 mod session;
 mod terminal;
 mod tile;
+mod toast;
 mod tracing_setup;
 
 pub use config::TuiConfig;
