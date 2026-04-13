@@ -60,6 +60,8 @@ Tepegöz is a cyclops from the *Book of Dede Korkut*, the foundational epic of t
 
 ## License
 
-[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE-APACHE)
+
+Licensed under either of MIT or Apache-2.0 at your option.
 
 Built in Rust. No telemetry. No auto-update. Everything local.
