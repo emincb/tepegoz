@@ -19,9 +19,16 @@ Workspace compiles on mac + linux × x86_64 + arm64. `tepegoz --help` works. CI 
 - `tepegoz-pty` crate: `PtyManager` owns a `HashMap<PaneId, Arc<Pane>>`. Each pane wraps a portable-pty master, a blocking reader thread, a waiter thread, and a `tokio::sync::broadcast` channel.
 - Per-pane ring buffer (2 MiB default): `VecDeque<Bytes>` with total-byte accounting; oldest chunks drop on overflow.
 - Wire protocol extended (`PROTOCOL_VERSION` = 2): `OpenPane`, `AttachPane`, `ClosePane`, `ListPanes`, `SendInput`, `ResizePane`; daemon events `PaneSnapshot`, `PaneOutput`, `PaneExit`, `PaneLagged`; responses `PaneOpened`, `PaneList`.
-- TUI is now a raw-passthrough attacher: enters raw mode + alt screen, pipes stdin → `SendInput`, pipes `PaneOutput` → stdout verbatim, handles SIGWINCH → `ResizePane`. Detach via `Ctrl-b` then `d` or `q`.
+- TUI is a raw-passthrough attacher: enters raw mode + alt screen, pipes stdin → `SendInput`, pipes `PaneOutput` → stdout verbatim, handles SIGWINCH → `ResizePane`. Detach via `Ctrl-b` then `d` or `q`.
 - Daemon client session uses a single writer task draining an mpsc channel — every outgoing frame is serialized without per-write locks. Each `AttachPane` spawns a forwarder task that translates pane broadcast events into protocol events keyed by subscription id.
-- **Test:** `pty_persistence.rs` — client #1 opens pane, sends `echo MARKER_ALPHA\n`, verifies output. Client #1 disconnects. Client #2 connects, sees the same pane via `ListPanes`, re-attaches, receives `PaneSnapshot` containing `MARKER_ALPHA` from the ring buffer. Passes green in ~240 ms.
+- **Correctness**:
+  - Reader holds the scrollback lock across both append and broadcast — a subscriber sees each byte in exactly one of {snapshot, live stream}, never both. Prevents duplicated output on attach (was visible as doubled prompts/lines).
+  - New panes start in the TUI's current working directory, not `$HOME`. portable-pty defaults to `$HOME` when cwd is unset; the TUI now passes `std::env::current_dir()`.
+  - Daemon stamps `TEPEGOZ_PANE_ID=<id>` into every pty's env. The TUI refuses to run if that var is set, preventing a recursive `tepegoz tui` inside an already-attached pane (would feed output back into itself infinitely).
+- **Tests** (all green):
+  - `pty_persistence.rs`: client #1 opens pane, sends `echo MARKER_ALPHA\n`, verifies output; drops; client #2 reconnects, re-attaches, receives `PaneSnapshot` containing `MARKER_ALPHA` from the ring buffer.
+  - `tepegoz-pty::tests::subscribe_does_not_duplicate_bytes`: drives 50 markers mid-stream, asserts each appears exactly once across snapshot + live.
+  - `tepegoz-pty::tests::pane_honors_cwd_and_exposes_pane_id_env`: shell starts in requested cwd and `$TEPEGOZ_PANE_ID` is exported.
 
 ### Demo commands
 ```sh

@@ -85,14 +85,20 @@ async fn ensure_pane(
         return Ok(alive);
     }
 
-    // No live pane — open one.
+    // No live pane — open one. Pass the current working directory so the
+    // shell starts where the user invoked `tepegoz tui` from, matching
+    // tmux/screen expectations. (portable-pty's `CommandBuilder` defaults
+    // to `$HOME` when cwd is unset, which is not what anyone wants.)
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok());
     write_envelope(
         writer,
         &Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::OpenPane(OpenPaneSpec {
                 shell: None,
-                cwd: None,
+                cwd,
                 env: Vec::new(),
                 rows,
                 cols,

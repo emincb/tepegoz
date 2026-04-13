@@ -80,6 +80,11 @@ impl PtyManager {
             pixel_height: 0,
         };
 
+        // Reserve the pane id up front so it can be stamped into the
+        // child's environment as `TEPEGOZ_PANE_ID`. Clients use that var
+        // to refuse a recursive `tepegoz tui` inside an existing pane.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+
         let pty_system = NativePtySystem::default();
         let pair = pty_system.openpty(size)?;
 
@@ -92,6 +97,9 @@ impl PtyManager {
             "TERM",
             std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
         );
+        // Stamp the pane id so tools inside the shell (notably `tepegoz tui`)
+        // can detect they're already inside a managed pane.
+        cmd.env("TEPEGOZ_PANE_ID", id.to_string());
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
@@ -104,7 +112,6 @@ impl PtyManager {
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let created_at_unix_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -436,5 +443,55 @@ mod tests {
                  duplicated bytes across snapshot and live stream."
             );
         }
+    }
+
+    /// Verifies (a) the pane's shell starts in the cwd we requested, not
+    /// `$HOME` (portable-pty's default), and (b) `TEPEGOZ_PANE_ID` is
+    /// exported into the shell environment so that recursive
+    /// `tepegoz tui` inside a pane can detect and refuse itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pane_honors_cwd_and_exposes_pane_id_env() {
+        let cwd = std::env::current_dir().expect("current_dir");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+
+        let manager = PtyManager::new();
+        let pane = manager
+            .open(OpenSpec {
+                shell: Some("/bin/sh".into()),
+                cwd: Some(cwd.clone()),
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .expect("open pane");
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        pane.send_input(b"stty -echo; pwd; printf 'PANE_ID=%s\\n' \"$TEPEGOZ_PANE_ID\"; exit\n")
+            .expect("send_input");
+
+        let (snap, mut rx) = pane.subscribe();
+        let mut all = snap.to_vec();
+        loop {
+            match rx.recv().await {
+                Ok(PaneUpdate::Bytes(b)) => all.extend_from_slice(&b),
+                Ok(PaneUpdate::Exit { .. }) => break,
+                Err(_) => break,
+            }
+        }
+
+        let output = String::from_utf8_lossy(&all);
+        // macOS symlinks /tmp → /private/tmp, but the cargo-test cwd lives
+        // under /Users which is not symlinked — substring match is safe.
+        assert!(
+            output.contains(cwd_str.as_str()),
+            "expected pwd output to include {cwd_str}. Actual output:\n{output}"
+        );
+        let expected = format!("PANE_ID={}", pane.id);
+        assert!(
+            output.contains(expected.as_str()),
+            "expected {expected} in shell env. Actual output:\n{output}"
+        );
     }
 }

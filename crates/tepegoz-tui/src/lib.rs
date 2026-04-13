@@ -26,6 +26,18 @@ pub use config::TuiConfig;
 use tepegoz_proto::socket::default_socket_path;
 
 pub async fn run(config: TuiConfig) -> anyhow::Result<()> {
+    // Refuse to recursively attach from inside a tepegoz-managed pane.
+    // The daemon stamps `TEPEGOZ_PANE_ID` into every pty it spawns; if that
+    // var is present, running another `tepegoz tui` here would feed the
+    // pane's output back into itself via two subscribers on the same
+    // broadcast — infinite loop, scrambled stdin, garbled terminal.
+    if let Ok(pane_id) = std::env::var("TEPEGOZ_PANE_ID") {
+        anyhow::bail!(
+            "this shell is already inside tepegoz pane {pane_id}. \
+             Detach first (Ctrl-b d) and run `tepegoz tui` from your outer terminal."
+        );
+    }
+
     tracing_setup::init(&config.log_level)?;
 
     let socket_path = config
