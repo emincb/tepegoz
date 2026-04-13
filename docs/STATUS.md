@@ -1,52 +1,58 @@
 # Status
 
-## Current phase
-**Phase 2 — Complete.** Next: Phase 3 (Docker scope).
+## Current state
 
-## Demonstrable state
+**Phase 2 tests pass; one user-visible acceptance bug under diagnosis.** Phase 3 blocked on Phase 2 clearance.
 
-### Phase 0 — Scaffold (complete)
-Workspace compiles on mac + linux × x86_64 + arm64. `tepegoz --help` works. CI runs fmt, clippy `-D warnings`, native tests, and cross-build matrix via `cargo-zigbuild`.
+Last commit: `f12d194` (diagnostic tracing shipped for the Phase 2 bug). See `docs/ISSUES.md#active` for the active issue.
 
-### Phase 1 — Daemon ↔ TUI wire protocol (complete)
-- Daemon binds a per-user Unix socket (`$XDG_RUNTIME_DIR/tepegoz-$uid/daemon.sock`, fallback `$TMPDIR` or `/tmp`). Default-path parent chmod 0700; socket 0600. Override paths leave parent perms alone.
-- Wire protocol: rkyv-archived `Envelope { version, payload }` with length-prefix framing and `bytecheck` validation on every read.
-- `Hello/Welcome/Ping/Pong/Subscribe/Unsubscribe/Event/Error` messages; status subscription streams `StatusSnapshot` at 1 Hz.
-- Graceful SIGINT shutdown; stale-socket detection refuses startup under an existing daemon.
-- **Test:** `daemon_persistence.rs` — `clients_total` increments across reconnect, `uptime_seconds` doesn't regress, pid stable.
+## Phase matrix
 
-### Phase 2 — Local pty multiplex + persistence (complete)
-- `tepegoz-pty` crate: `PtyManager` owns a `HashMap<PaneId, Arc<Pane>>`. Each pane wraps a portable-pty master, a blocking reader thread, a waiter thread, and a `tokio::sync::broadcast` channel.
-- Per-pane ring buffer (2 MiB default): `VecDeque<Bytes>` with total-byte accounting; oldest chunks drop on overflow.
-- Wire protocol extended (`PROTOCOL_VERSION` = 2): `OpenPane`, `AttachPane`, `ClosePane`, `ListPanes`, `SendInput`, `ResizePane`; daemon events `PaneSnapshot`, `PaneOutput`, `PaneExit`, `PaneLagged`; responses `PaneOpened`, `PaneList`.
-- TUI is a raw-passthrough attacher: enters raw mode + alt screen, pipes stdin → `SendInput`, pipes `PaneOutput` → stdout verbatim, handles SIGWINCH → `ResizePane`. Detach via `Ctrl-b` then `d` or `q`.
-- Daemon client session uses a single writer task draining an mpsc channel — every outgoing frame is serialized without per-write locks. Each `AttachPane` spawns a forwarder task that translates pane broadcast events into protocol events keyed by subscription id.
-- **Correctness**:
-  - Reader holds the scrollback lock across both append and broadcast — a subscriber sees each byte in exactly one of {snapshot, live stream}, never both. Prevents duplicated output on attach (was visible as doubled prompts/lines).
-  - New panes start in the TUI's current working directory, not `$HOME`. portable-pty defaults to `$HOME` when cwd is unset; the TUI now passes `std::env::current_dir()`.
-  - Daemon stamps `TEPEGOZ_PANE_ID=<id>` into every pty's env. The TUI refuses to run if that var is set, preventing a recursive `tepegoz tui` inside an already-attached pane (would feed output back into itself infinitely).
-- **Tests** (all green):
-  - `pty_persistence.rs`: client #1 opens pane, sends `echo MARKER_ALPHA\n`, verifies output; drops; client #2 reconnects, re-attaches, receives `PaneSnapshot` containing `MARKER_ALPHA` from the ring buffer.
-  - `tepegoz-pty::tests::subscribe_does_not_duplicate_bytes`: drives 50 markers mid-stream, asserts each appears exactly once across snapshot + live.
-  - `tepegoz-pty::tests::pane_honors_cwd_and_exposes_pane_id_env`: shell starts in requested cwd and `$TEPEGOZ_PANE_ID` is exported.
+| # | Name | Status | Commit(s) | Acceptance test(s) |
+|---|---|---|---|---|
+| 0 | Scaffold | ✅ | `81c7731` | `tepegoz --help`, green CI |
+| 1 | Proto + daemon + TUI round-trip | ✅ | `3715bf9` | `daemon_persistence.rs` |
+| 2 | Local pty multiplex + persistence | 🟡 tests green, UX bug | `eab274c`, `321ed5e`, `f12d194` | `pty_persistence.rs`, `subscribe_does_not_duplicate_bytes`, `pane_honors_cwd_and_exposes_pane_id_env` |
+| 3 | Docker scope panel | ⚪ blocked | — | — |
+| 4 | Ports + processes panels (local) | ⚪ | — | — |
+| 5 | SSH transport + remote pty | ⚪ | — | — |
+| 6 | Agent binary + remote scopes | ⚪ | — | — |
+| 7 | Port scanner | ⚪ | — | — |
+| 8 | Recording + replay | ⚪ | — | — |
+| 9 | Claude Code pane awareness | ⚪ | — | — |
+| 10 | QUIC hot path + release 0.1.0 | ⚪ | — | — |
 
-### Demo commands
-```sh
-cargo build
-# terminal 1
-./target/debug/tepegoz daemon
-# terminal 2
-./target/debug/tepegoz tui     # opens a shell, you land in it
-# type anything, run commands
-# detach: Ctrl-b then d         (daemon + shell keep running)
-./target/debug/tepegoz tui     # reattach — scrollback replays, you keep going
-# pane exits on its own (e.g. `exit`) → TUI shows "[pane N exited]"
-```
+Status key: ✅ complete · 🟡 code+tests green, user acceptance pending · 🟠 in progress · ⚪ not started.
 
-Daemon logs to stdout. TUI logs to `${XDG_CACHE_HOME:-$HOME/.cache}/tepegoz/tui.log` (or `$TEPEGOZ_LOG_FILE`) to avoid corrupting the display.
+## What works end-to-end (as of `f12d194`)
+
+- Daemon binds user-scoped Unix socket at `$XDG_RUNTIME_DIR/tepegoz-$uid/daemon.sock` (fallback `$TMPDIR` or `/tmp`). Parent dir `0700` when default path (we own it), socket `0600`. Override paths leave parent perms alone.
+- Stale-socket eviction on startup. Refuses to start under another live daemon. Graceful SIGINT shutdown with socket cleanup.
+- Wire protocol v2: rkyv-archived `Envelope { version, payload }`, 4-byte big-endian length prefix, bytecheck validation on every read. Messages:
+  - Commands: `Hello`, `Ping`, `Subscribe(Status)`, `Unsubscribe`, `OpenPane`, `AttachPane`, `ClosePane`, `ListPanes`, `SendInput`, `ResizePane`
+  - Responses: `Welcome`, `Pong`, `PaneOpened`, `PaneList`, `Error`
+  - Events (in `Event(EventFrame)`): `Status`, `PaneSnapshot`, `PaneOutput`, `PaneExit`, `PaneLagged`
+- PTY manager owns panes; per-pane 2 MiB ring buffer (`VecDeque<Bytes>` with total-byte accounting, oldest-chunks-evict on overflow); per-pane reader + waiter threads; `tokio::sync::broadcast` channel for subscribers.
+- Daemon client session: single dedicated writer task drains an mpsc of outgoing envelopes — no per-write locks. Each `AttachPane` spawns a forwarder task.
+- TUI is a raw-passthrough attacher: raw mode + alternate screen; stdin → `SendInput`; `PaneOutput` → stdout verbatim; `SIGWINCH` → `ResizePane`. Detach via `Ctrl-b d` or `Ctrl-b q`.
+- Panes inherit `TEPEGOZ_PANE_ID=<id>` in env. TUI refuses to run if its own env has that var (prevents recursive attach feedback loop).
+- Shells spawn in the TUI's `current_dir()` rather than `$HOME` (portable-pty's default).
+
+## Test coverage (15 tests, all green)
+
+- `tepegoz-proto::codec` — 3 (envelope roundtrip, status roundtrip, frame-too-large guard)
+- `tepegoz-pty` — 4 (scrollback eviction, scrollback snapshot, subscribe-no-duplicates, cwd+pane_id env)
+- `tepegoz-tui::input` — 7 (InputFilter: pass-through, detach-d, detach-q, non-detach, split-across-chunks, double-Ctrl-B)
+- `crates/tepegoz-core/tests/daemon_persistence.rs` — 1 (phase-1 acceptance)
+- `crates/tepegoz-core/tests/pty_persistence.rs` — 1 (phase-2 acceptance)
+
+## Pending to clear Phase 2
+
+1. Diagnose the TUI immediate-detach bug (see `docs/ISSUES.md#active`). Diagnostic tracing in `f12d194` logs every stdin read and filter action to `~/.cache/tepegoz/tui.log`.
+2. Land root-cause fix + regression test.
+3. Revert or demote diagnostic tracing to `debug` level.
+4. Mark Phase 2 ✅; unblock Phase 3.
 
 ## Next phase
-**Phase 3 — Docker scope panel.** `bollard` integration, socket discovery (Docker Desktop, Colima, Rancher, Linux native), container list + log tail + exec-into-pane + lifecycle actions. This is the first scope panel; its UX pattern will set the template for ports/processes/logs in Phase 4.
 
-## Full roadmap
-See `CLAUDE.md` for the phase list. Target release 0.1.0 at end of Phase 10.
+**Phase 3 — Docker scope panel.** Details in `docs/ROADMAP.md#phase-3--docker-scope-panel`.
