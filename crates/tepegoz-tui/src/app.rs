@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use ratatui::layout::Rect;
 use tepegoz_proto::{
     DockerActionKind, DockerActionOutcome, DockerActionRequest, DockerContainer, Envelope, Event,
-    EventFrame, PROTOCOL_VERSION, PaneId, Payload, Subscription,
+    EventFrame, LogStream, PROTOCOL_VERSION, PaneId, Payload, Subscription,
 };
 use vt100::Parser;
 
@@ -53,6 +53,15 @@ const PENDING_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// walks away and forgets the prompt, we don't leave stale modal state
 /// sitting on the tile forever.
 const PENDING_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Rolling cap on the LogsView transcript buffer. Past this the
+/// oldest line is dropped silently on each append. 10 000 lines
+/// ≈ 1–2 MiB in practice; bounded memory for a live follow stream
+/// on a talkative container.
+pub(crate) const MAX_LOG_LINES: usize = 10_000;
+
+/// PgUp / PgDn step inside the LogsView.
+const LOGS_PAGE_LINES: usize = 10;
 
 /// Scrollback budget for the vt100 parser, in rows. Mirrors the daemon's
 /// 2 MiB scrollback ring in terms of practical replay depth; `1000` rows
@@ -156,23 +165,95 @@ pub(crate) enum DetachReason {
 #[derive(Debug)]
 pub(crate) struct DockerScope {
     pub(crate) state: DockerScopeState,
+    /// Which Docker-tile view is active. `List` is the container
+    /// table (default); `Logs(...)` is a sub-state following one
+    /// container's log stream. The sub-state lives *inside* the
+    /// Docker tile — other tiles (PTY, placeholders) keep rendering
+    /// and receiving input throughout (Decision #7, UX clarification
+    /// #1 for C3b).
+    pub(crate) view: DockerView,
     /// Index into the visible (filter-respecting) row set. Clamped on
-    /// every `ContainerList` update.
+    /// every `ContainerList` update. Ignored while `view == Logs`.
     pub(crate) selection: usize,
     pub(crate) filter: String,
     /// True while the filter bar has focus (user typed `/`). While
     /// active: chars append, backspace trims, Esc clears + deactivates,
     /// Enter deactivates but keeps the filter applied.
     pub(crate) filter_active: bool,
-    /// Subscription id for `Subscribe(Docker)`. Allocated once at
-    /// [`App::new`] and never cleared — the tile is always subscribed.
+    /// Subscription id for `Subscribe(Docker)` (the always-on list
+    /// subscription). Allocated once at [`App::new`] and never
+    /// cleared. Distinct from a logs-view `sub_id`, which lives on
+    /// [`LogsView`] and comes + goes with the sub-state.
     pub(crate) sub_id: u64,
     /// Inline confirm prompt for destructive actions (Kill / Remove).
     /// Rendered as a centered bordered box inside the Docker tile's
-    /// Rect while set. Any key other than `y`/`Y` cancels; focus
-    /// moving away from the Docker tile cancels; a 10 s idle timeout
-    /// cancels. See C3a UX clarification #3.
+    /// Rect while set. Only reachable while `view == List`. Any key
+    /// other than `y`/`Y` cancels (with `K`/`X` absorbed so a second
+    /// press can't switch the target mid-prompt); focus moving away
+    /// from the Docker tile cancels; a 10 s idle timeout cancels.
     pub(crate) pending_confirm: Option<PendingConfirm>,
+}
+
+/// Docker tile view state. C3a had a single implicit "list" view;
+/// C3b adds the `Logs` sub-state.
+#[derive(Debug)]
+pub(crate) enum DockerView {
+    /// Container list + filter + confirm-modal. The default.
+    List,
+    /// Following one container's log stream. Lives inside the Docker
+    /// tile's `Rect` (not a modal overlay); other tiles continue to
+    /// render and take input.
+    Logs(LogsView),
+}
+
+/// Transcript state while a logs sub-state is active. Holds the
+/// rolling buffer, the per-stream partial-line accumulators, the
+/// scroll position, and the `at_tail` auto-follow flag.
+#[derive(Debug)]
+pub(crate) struct LogsView {
+    /// Container id the sub is following. Renderer shows the
+    /// display name; the id is kept as the authoritative identity
+    /// for tests, diagnostics, and any future "reopen logs after
+    /// reconnect" flow.
+    #[allow(dead_code)]
+    pub(crate) container_id: String,
+    /// Display name captured on entry. Cached so renames or filter
+    /// changes on the list don't retitle the logs view while we're
+    /// inside it.
+    pub(crate) container_name: String,
+    /// Subscription id for the per-container `Subscribe(DockerLogs)`.
+    /// Unsubscribed on exit.
+    pub(crate) sub_id: u64,
+    /// Assembled lines, newest at the back. Capped at
+    /// [`MAX_LOG_LINES`]; oldest drops on append past the cap.
+    pub(crate) lines: VecDeque<LogLine>,
+    /// Partial-line byte accumulators. Log chunks may split
+    /// mid-line; the bytes after the last `\n` in a chunk wait here
+    /// until the rest of the line arrives. Per-stream so a stdout
+    /// line in progress isn't corrupted by an interleaved stderr
+    /// line.
+    pub(crate) pending_stdout: Vec<u8>,
+    pub(crate) pending_stderr: Vec<u8>,
+    /// Number of lines above the buffer tail the visible top row
+    /// sits. `0` = rendered at the tail (newest). Increments on
+    /// scroll-up; decrements on scroll-down.
+    pub(crate) scroll_offset: usize,
+    /// Auto-follow flag. `true` when the user wants new lines to
+    /// appear in the visible window as they arrive. Set `false` on
+    /// any upward scroll; `G` resets to `true`. `DockerStreamEnded`
+    /// also disables it so the final messages don't scroll off.
+    pub(crate) at_tail: bool,
+    /// Terminal reason from `DockerStreamEnded`, if the stream has
+    /// ended. Rendered as a dimmed "— log stream ended: `<reason>` —"
+    /// line at the tail.
+    pub(crate) stream_ended: Option<String>,
+}
+
+/// One fully-assembled log line.
+#[derive(Debug, Clone)]
+pub(crate) struct LogLine {
+    pub(crate) stream: LogStream,
+    pub(crate) text: String,
 }
 
 impl DockerScope {
@@ -182,12 +263,20 @@ impl DockerScope {
             // Connecting rather than Idle — there's no "haven't
             // subscribed yet" moment the user can observe.
             state: DockerScopeState::Connecting,
+            view: DockerView::List,
             selection: 0,
             filter: String::new(),
             filter_active: false,
             sub_id,
             pending_confirm: None,
         }
+    }
+
+    /// True if the logs sub-state is active AND the given sub id
+    /// matches it. Used to route `ContainerLog` / `DockerStreamEnded`
+    /// events to the logs handler.
+    pub(crate) fn is_current_logs_sub(&self, sub_id: u64) -> bool {
+        matches!(&self.view, DockerView::Logs(l) if l.sub_id == sub_id)
     }
 
     /// True if `c` passes the current filter (name or image contains
@@ -249,6 +338,115 @@ pub(crate) struct PendingConfirm {
     pub(crate) deadline: Instant,
 }
 
+impl LogsView {
+    fn new(container_id: String, container_name: String, sub_id: u64) -> Self {
+        Self {
+            container_id,
+            container_name,
+            sub_id,
+            lines: VecDeque::new(),
+            pending_stdout: Vec::new(),
+            pending_stderr: Vec::new(),
+            scroll_offset: 0,
+            at_tail: true,
+            stream_ended: None,
+        }
+    }
+
+    /// Absorb a `ContainerLog` chunk: append bytes to the per-stream
+    /// pending buffer and flush every complete (`\n`-terminated) line
+    /// into [`Self::lines`]. Tail bytes without a trailing `\n` wait
+    /// in the pending buffer for the next chunk.
+    pub(crate) fn ingest(&mut self, stream: LogStream, data: &[u8]) {
+        // Drain complete lines into a local Vec first so the `pending`
+        // borrow drops before we call `push_line` (which also borrows
+        // `&mut self`).
+        let mut completed: Vec<String> = Vec::new();
+        {
+            let pending = match stream {
+                LogStream::Stdout => &mut self.pending_stdout,
+                LogStream::Stderr => &mut self.pending_stderr,
+            };
+            pending.extend_from_slice(data);
+            while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = pending.drain(..=nl).collect();
+                // Strip the trailing `\n` (and a `\r` before it for
+                // CRLF-style output from some Windows containers).
+                let mut end = raw.len().saturating_sub(1);
+                if end > 0 && raw[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                completed.push(String::from_utf8_lossy(&raw[..end]).into_owned());
+            }
+        }
+        for text in completed {
+            self.push_line(LogLine { stream, text });
+        }
+    }
+
+    fn push_line(&mut self, line: LogLine) {
+        if self.lines.len() >= MAX_LOG_LINES {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    /// Move the visible top-of-window up by `n` lines (toward older
+    /// history). Disables `at_tail` since the user chose to scroll
+    /// away from the tail.
+    pub(crate) fn scroll_up(&mut self, n: usize) {
+        let max_offset = self.lines.len().saturating_sub(1);
+        self.scroll_offset = (self.scroll_offset + n).min(max_offset);
+        if self.scroll_offset > 0 {
+            self.at_tail = false;
+        }
+    }
+
+    /// Move the visible top-of-window down by `n` lines (toward
+    /// newer content). When the offset reaches 0 the view is back at
+    /// the tail, so `at_tail` flips true (auto-follow resumes).
+    pub(crate) fn scroll_down(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+        if self.scroll_offset == 0 {
+            self.at_tail = true;
+        }
+    }
+
+    /// Jump to the buffer tail + re-enable auto-follow. Bound to `G`
+    /// / `End` / `Bottom` in the logs-view keybind map.
+    pub(crate) fn jump_to_tail(&mut self) {
+        self.scroll_offset = 0;
+        self.at_tail = true;
+    }
+
+    /// Finalize the transcript on stream termination. Flushes any
+    /// non-newline-terminated pending bytes as a last line, records
+    /// the reason, and disables `at_tail` so the final context stays
+    /// visible without being scrolled off by… nothing, but defensive
+    /// anyway: a future "stream resumed" path would need to
+    /// re-engage the tail explicitly.
+    pub(crate) fn end_stream(&mut self, reason: String) {
+        let stdout_tail = std::mem::take(&mut self.pending_stdout);
+        if !stdout_tail.is_empty() {
+            let text = String::from_utf8_lossy(&stdout_tail).into_owned();
+            self.push_line(LogLine {
+                stream: LogStream::Stdout,
+                text,
+            });
+        }
+        let stderr_tail = std::mem::take(&mut self.pending_stderr);
+        if !stderr_tail.is_empty() {
+            let text = String::from_utf8_lossy(&stderr_tail).into_owned();
+            self.push_line(LogLine {
+                stream: LogStream::Stderr,
+                text,
+            });
+        }
+        self.stream_ended = Some(reason);
+        self.at_tail = false;
+    }
+}
+
 /// Three-state lifecycle for the docker scope panel. Distinct visual
 /// states — don't conflate "haven't heard yet" with "engine said no
 /// containers" with "engine unreachable".
@@ -297,8 +495,10 @@ pub(crate) struct Toast {
 }
 
 /// Semantic key events parsed from raw stdin bytes when the Docker
-/// tile is focused. C3 adds `Char` variants for `r`/`s`/`K`/`X`/`l`
-/// lifecycle actions.
+/// tile is focused. C3a adds `Char` variants for `r`/`s`/`K`/`X`
+/// lifecycle actions; C3b adds `PgUp` / `PgDn` for the logs-view
+/// scroll and threads `Char(b'l')` through for entering the logs
+/// sub-state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScopeKey {
     Up,
@@ -307,6 +507,8 @@ pub(crate) enum ScopeKey {
     Bottom,
     Home,
     End,
+    PgUp,
+    PgDn,
     FilterStart,
     Escape,
     Enter,
@@ -371,6 +573,8 @@ impl ScopeKeyParser {
                     b'~' => match accum.as_slice() {
                         b"1" | b"7" => out.push(ScopeKey::Home),
                         b"4" | b"8" => out.push(ScopeKey::End),
+                        b"5" => out.push(ScopeKey::PgUp),
+                        b"6" => out.push(ScopeKey::PgDn),
                         _ => {}
                     },
                     b'0'..=b'9' | b';' => {
@@ -546,9 +750,20 @@ impl App {
     }
 
     fn handle_scope_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
-        // Confirm modal takes priority: while visible, every key either
-        // confirms (`y` / `Y`) or cancels (anything else, per
-        // UX clarification #3).
+        // Logs sub-state has its own keybind map. Confirm modal is
+        // unreachable while logs are showing (both live in the
+        // Docker tile's Rect; logs has higher priority and
+        // suppresses the list).
+        if matches!(self.docker.view, DockerView::Logs(_)) {
+            self.handle_logs_key(key, actions);
+            return;
+        }
+
+        // Confirm modal takes priority: while visible, `y`/`Y`
+        // confirms + dispatches; a repeat of the destructive keys
+        // (`K` / `X`) is absorbed so the second press never silently
+        // switches the modal's target mid-prompt; anything else
+        // cancels (UX clarification #3).
         if let Some(pending) = self.docker.pending_confirm.clone() {
             match key {
                 ScopeKey::Char(b'y') | ScopeKey::Char(b'Y') => {
@@ -559,6 +774,10 @@ impl App {
                         pending.kind,
                         actions,
                     );
+                }
+                ScopeKey::Char(b'K') | ScopeKey::Char(b'X') => {
+                    // Absorb — modal stays showing the original kind.
+                    // No state change, no redraw needed.
                 }
                 _ => {
                     self.docker.pending_confirm = None;
@@ -597,6 +816,8 @@ impl App {
                 | ScopeKey::Down
                 | ScopeKey::Home
                 | ScopeKey::End
+                | ScopeKey::PgUp
+                | ScopeKey::PgDn
                 | ScopeKey::Top
                 | ScopeKey::Bottom
                 | ScopeKey::FilterStart => {}
@@ -634,18 +855,111 @@ impl App {
             ScopeKey::Char(b'g') => self.handle_scope_key(ScopeKey::Top, actions),
             ScopeKey::Char(b'G') => self.handle_scope_key(ScopeKey::Bottom, actions),
             ScopeKey::Char(b'/') => self.handle_scope_key(ScopeKey::FilterStart, actions),
-            ScopeKey::Char(b'r') | ScopeKey::Char(b'R') => {
+            // Lowercase-only for non-destructive actions — matches the
+            // capital-only rule for destructive K/X and the
+            // lowercase-only rule for navigation (h/j/k/l). One
+            // consistent convention: capital = destructive, lowercase
+            // = safe.
+            ScopeKey::Char(b'r') => {
                 self.issue_selected_docker_action(DockerActionKind::Restart, actions);
             }
-            ScopeKey::Char(b's') | ScopeKey::Char(b'S') => {
+            ScopeKey::Char(b's') => {
                 self.issue_selected_docker_action(DockerActionKind::Stop, actions);
             }
             ScopeKey::Char(b'K') => self.begin_confirm(DockerActionKind::Kill, actions),
             ScopeKey::Char(b'X') => self.begin_confirm(DockerActionKind::Remove, actions),
+            ScopeKey::Char(b'l') => self.try_enter_logs_view(actions),
             ScopeKey::Escape => {}
             ScopeKey::Enter => {} // Slice D uses this for DockerExec.
+            ScopeKey::PgUp | ScopeKey::PgDn => {} // List view has no paging.
             ScopeKey::Backspace | ScopeKey::Char(_) => {}
         }
+    }
+
+    /// Logs sub-state key map. Narrow — only scrolling + exit, since
+    /// the Docker tile's logs view is a read-only transcript.
+    fn handle_logs_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
+        // Exit path must read the sub_id before mutating
+        // `self.docker.view` (dropping the LogsView also drops its
+        // fields), so pull the id up front for the Esc/q arms.
+        let current_logs_sub = match &self.docker.view {
+            DockerView::Logs(l) => Some(l.sub_id),
+            _ => return,
+        };
+
+        match key {
+            ScopeKey::Escape | ScopeKey::Char(b'q') => {
+                if let Some(sub_id) = current_logs_sub {
+                    self.docker.view = DockerView::List;
+                    actions.push(AppAction::SendEnvelope(envelope(Payload::Unsubscribe {
+                        id: sub_id,
+                    })));
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::Up | ScopeKey::Char(b'k') => {
+                if let DockerView::Logs(logs) = &mut self.docker.view {
+                    logs.scroll_up(1);
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::Down | ScopeKey::Char(b'j') => {
+                if let DockerView::Logs(logs) = &mut self.docker.view {
+                    logs.scroll_down(1);
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::PgUp => {
+                if let DockerView::Logs(logs) = &mut self.docker.view {
+                    logs.scroll_up(LOGS_PAGE_LINES);
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::PgDn => {
+                if let DockerView::Logs(logs) = &mut self.docker.view {
+                    logs.scroll_down(LOGS_PAGE_LINES);
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::Char(b'G') | ScopeKey::Bottom | ScopeKey::End => {
+                if let DockerView::Logs(logs) = &mut self.docker.view {
+                    logs.jump_to_tail();
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            // Everything else (filter slash, arrow keys not covered,
+            // Enter, Backspace, any other char) is dropped — the
+            // logs view is read-only.
+            _ => {}
+        }
+    }
+
+    /// `l` on the list view: if a container is selected, allocate a
+    /// sub_id, send `Subscribe(DockerLogs { follow: true, tail_lines:
+    /// 0 })`, and transition into the logs sub-state. No-op when
+    /// nothing is selected (Unavailable or empty list).
+    fn try_enter_logs_view(&mut self, actions: &mut Vec<AppAction>) {
+        let Some(container) = self.docker.selected_container() else {
+            return;
+        };
+        let container_id = container.id.clone();
+        let container_name = display_name_for(container);
+        let sub_id = self.alloc_sub_id();
+        self.docker.view =
+            DockerView::Logs(LogsView::new(container_id.clone(), container_name, sub_id));
+        actions.push(AppAction::SendEnvelope(envelope(Payload::Subscribe(
+            Subscription::DockerLogs {
+                id: sub_id,
+                container_id,
+                follow: true,
+                // "all history" per Slice B's wire contract. For
+                // chatty long-lived containers this could dump
+                // megabytes on entry; revisit with a bounded default
+                // as a Phase-3 polish item.
+                tail_lines: 0,
+            },
+        ))));
+        actions.push(AppAction::DrawFrame);
     }
 
     /// Dispatch a DockerAction against the currently selected
@@ -808,6 +1122,8 @@ impl App {
                     self.handle_pane_event(event, actions);
                 } else if subscription_id == self.docker.sub_id {
                     self.handle_docker_event(event, actions);
+                } else if self.docker.is_current_logs_sub(subscription_id) {
+                    self.handle_logs_event(event, actions);
                 }
                 // Unknown sub id: stale event from a sub we've closed.
                 // Drop silently.
@@ -889,8 +1205,35 @@ impl App {
                 actions.push(AppAction::DrawFrame);
             }
             Event::DockerStreamEnded { .. } => {
-                // Per-container logs/stats streams — C3 consumes these.
+                // Main Docker subscription — the daemon doesn't emit
+                // DockerStreamEnded on the list sub, but if some
+                // future version does, drop silently here. The
+                // per-container logs/stats streams route to
+                // handle_logs_event via is_current_logs_sub instead.
             }
+            _ => {}
+        }
+    }
+
+    /// Route events arriving on the current `LogsView.sub_id`.
+    fn handle_logs_event(&mut self, event: Event, actions: &mut Vec<AppAction>) {
+        let DockerView::Logs(logs) = &mut self.docker.view else {
+            return;
+        };
+        match event {
+            Event::ContainerLog { stream, data } => {
+                logs.ingest(stream, &data);
+                actions.push(AppAction::DrawFrame);
+            }
+            Event::DockerStreamEnded { reason } => {
+                logs.end_stream(reason);
+                actions.push(AppAction::DrawFrame);
+            }
+            // ContainerList / DockerUnavailable / PaneSnapshot /
+            // PaneOutput / PaneExit / PaneLagged / Status /
+            // ContainerStats are never delivered on a DockerLogs sub
+            // id — they go to their own subs. Drop silently if the
+            // daemon ever misroutes.
             _ => {}
         }
     }
@@ -1776,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_confirm_10s_timeout_clears_state() {
+    fn pending_confirm_10s_timeout_clears_state_without_dispatching() {
         let mut app = test_app();
         populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
         app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
@@ -1788,6 +2131,95 @@ mod tests {
         assert!(
             app.docker.pending_confirm.is_none(),
             "sweep past deadline must drop pending_confirm"
+        );
+        // Silent auto-cancel — no DockerAction may leak.
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(&env.payload, Payload::DockerAction(_))
+            )),
+            0,
+            "10 s auto-cancel must never dispatch the pending action"
+        );
+        assert!(
+            app.pending_actions.is_empty(),
+            "no pending_action should have been recorded by the auto-cancel path"
+        );
+    }
+
+    #[test]
+    fn second_k_while_kill_pending_is_absorbed_not_switched_or_cancelled() {
+        // K → Kill modal. Another K while modal is open must absorb
+        // (modal stays showing Kill with the same container). The
+        // next `y` then confirms Kill as expected.
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        let first_deadline = app.docker.pending_confirm.as_ref().unwrap().deadline;
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        let pc = app
+            .docker
+            .pending_confirm
+            .as_ref()
+            .expect("modal must stay open after repeat K");
+        assert_eq!(
+            pc.kind,
+            DockerActionKind::Kill,
+            "absorbed K must not switch the modal's target"
+        );
+        assert_eq!(
+            pc.container_id, "id-web",
+            "absorbed K must not switch container"
+        );
+        assert_eq!(
+            pc.deadline, first_deadline,
+            "absorbed K must not refresh the 10 s deadline"
+        );
+        let actions = app.handle_event(AppEvent::StdinChunk(b"y".to_vec()));
+        let req = find_docker_action(&actions);
+        assert_eq!(
+            req.kind,
+            DockerActionKind::Kill,
+            "y after absorbed K must confirm Kill"
+        );
+    }
+
+    #[test]
+    fn x_while_kill_pending_is_absorbed_not_switched() {
+        // K (Kill pending) → X must not switch the modal to Remove.
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"X".to_vec()));
+        let pc = app
+            .docker
+            .pending_confirm
+            .as_ref()
+            .expect("modal must stay open after X during Kill confirm");
+        assert_eq!(pc.kind, DockerActionKind::Kill);
+    }
+
+    #[test]
+    fn capital_r_is_noop_when_docker_focused_after_case_discipline_lock() {
+        // Rule: capitals are reserved for destructive actions
+        // (K / X). Lowercase is safe (r / s). Capital R must not
+        // silently dispatch Restart — it falls through the match as
+        // an unknown key and is dropped.
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"R".to_vec()));
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(&env.payload, Payload::DockerAction(_))
+            )),
+            0,
+            "capital R must not dispatch — reserved pattern is 'caps = destructive'"
+        );
+        assert!(app.pending_actions.is_empty());
+        assert!(
+            app.docker.pending_confirm.is_none(),
+            "capital R must not enter a confirm either"
         );
     }
 
@@ -2028,5 +2460,481 @@ mod tests {
             )
         });
         assert_eq!(show, 1);
+    }
+
+    // ───────────────────── C3b — logs sub-state ─────────────────────
+
+    /// Inject a `ContainerLog` on the currently-active logs sub id.
+    /// Panics if no logs view is active — call after
+    /// `try_enter_logs_view` succeeded.
+    fn inject_container_log(app: &mut App, stream: LogStream, data: &[u8]) {
+        let sub_id = match &app.docker.view {
+            DockerView::Logs(l) => l.sub_id,
+            _ => panic!("inject_container_log: no logs view active"),
+        };
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: sub_id,
+                event: Event::ContainerLog {
+                    stream,
+                    data: data.to_vec(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+    }
+
+    fn inject_stream_ended(app: &mut App, reason: &str) {
+        let sub_id = match &app.docker.view {
+            DockerView::Logs(l) => l.sub_id,
+            _ => panic!("inject_stream_ended: no logs view active"),
+        };
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: sub_id,
+                event: Event::DockerStreamEnded {
+                    reason: reason.into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+    }
+
+    #[test]
+    fn l_with_selected_container_enters_logs_view_and_subscribes() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        let (sub_id, container_id_envelope) = actions
+            .iter()
+            .find_map(|a| match a {
+                AppAction::SendEnvelope(env) => match &env.payload {
+                    Payload::Subscribe(Subscription::DockerLogs {
+                        id,
+                        container_id,
+                        follow,
+                        tail_lines,
+                    }) => {
+                        assert!(*follow, "logs must follow on entry");
+                        assert_eq!(
+                            *tail_lines, 0,
+                            "C3b enters with full history (tail_lines=0)"
+                        );
+                        Some((*id, container_id.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("l must send Subscribe(DockerLogs)");
+        assert_eq!(container_id_envelope, "id-web");
+        match &app.docker.view {
+            DockerView::Logs(logs) => {
+                assert_eq!(logs.sub_id, sub_id, "stored sub id must match envelope");
+                assert_eq!(logs.container_id, "id-web");
+                assert_eq!(logs.container_name, "web");
+                assert!(logs.at_tail, "logs view opens tailing");
+                assert_eq!(logs.scroll_offset, 0);
+                assert!(logs.lines.is_empty());
+                assert!(logs.stream_ended.is_none());
+            }
+            DockerView::List => panic!("l must transition to Logs view"),
+        }
+    }
+
+    #[test]
+    fn l_is_noop_when_no_container_selected() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, Vec::new());
+        let actions = app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(
+                    &env.payload,
+                    Payload::Subscribe(Subscription::DockerLogs { .. })
+                )
+            )),
+            0,
+            "l must not subscribe when nothing is selected"
+        );
+        assert!(matches!(app.docker.view, DockerView::List));
+    }
+
+    #[test]
+    fn l_is_noop_when_docker_unavailable() {
+        let mut app = test_app();
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.docker.sub_id,
+                event: Event::DockerUnavailable {
+                    reason: "no engine".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        let actions = app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(
+                    &env.payload,
+                    Payload::Subscribe(Subscription::DockerLogs { .. })
+                )
+            )),
+            0
+        );
+        assert!(matches!(app.docker.view, DockerView::List));
+    }
+
+    #[test]
+    fn esc_in_logs_view_unsubscribes_and_returns_to_list() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        let logs_sub_id = match &app.docker.view {
+            DockerView::Logs(l) => l.sub_id,
+            _ => unreachable!(),
+        };
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x1b".to_vec()));
+        assert!(matches!(app.docker.view, DockerView::List));
+        let unsub = count(&actions, |a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(
+                    &env.payload,
+                    Payload::Unsubscribe { id } if *id == logs_sub_id
+                )
+            )
+        });
+        assert_eq!(unsub, 1, "Esc must Unsubscribe the logs sub");
+    }
+
+    #[test]
+    fn q_in_logs_view_also_unsubscribes_and_returns_to_list() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        let logs_sub_id = match &app.docker.view {
+            DockerView::Logs(l) => l.sub_id,
+            _ => unreachable!(),
+        };
+        let actions = app.handle_event(AppEvent::StdinChunk(b"q".to_vec()));
+        assert!(matches!(app.docker.view, DockerView::List));
+        assert_eq!(
+            count(&actions, |a| matches!(
+                a,
+                AppAction::SendEnvelope(env) if matches!(
+                    &env.payload,
+                    Payload::Unsubscribe { id } if *id == logs_sub_id
+                )
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn container_log_chunks_assemble_into_lines_at_newlines() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+
+        inject_container_log(&mut app, LogStream::Stdout, b"fo");
+        inject_container_log(&mut app, LogStream::Stdout, b"o\nbar");
+        // After this we expect one line "foo" and a pending "bar".
+        {
+            let DockerView::Logs(logs) = &app.docker.view else {
+                panic!();
+            };
+            assert_eq!(logs.lines.len(), 1);
+            assert_eq!(logs.lines[0].text, "foo");
+            assert_eq!(logs.lines[0].stream, LogStream::Stdout);
+        }
+
+        inject_container_log(&mut app, LogStream::Stdout, b"\nbaz\n");
+        let DockerView::Logs(logs) = &app.docker.view else {
+            panic!();
+        };
+        let texts: Vec<&str> = logs.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn crlf_terminated_lines_strip_both_bytes() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        inject_container_log(&mut app, LogStream::Stdout, b"hello\r\nworld\n");
+        let DockerView::Logs(logs) = &app.docker.view else {
+            panic!();
+        };
+        let texts: Vec<&str> = logs.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["hello", "world"],
+            "CRLF must strip both bytes; bare LF strips just the LF"
+        );
+    }
+
+    #[test]
+    fn stdout_and_stderr_pending_buffers_stay_separate() {
+        // A half-line on stdout must not be corrupted by a complete
+        // line arriving on stderr.
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+
+        inject_container_log(&mut app, LogStream::Stdout, b"foo");
+        inject_container_log(&mut app, LogStream::Stderr, b"bar\n");
+        // After: stderr produced one "bar" line; stdout still holds
+        // pending "foo".
+        {
+            let DockerView::Logs(logs) = &app.docker.view else {
+                panic!();
+            };
+            assert_eq!(logs.lines.len(), 1);
+            assert_eq!(logs.lines[0].stream, LogStream::Stderr);
+            assert_eq!(logs.lines[0].text, "bar");
+        }
+
+        inject_container_log(&mut app, LogStream::Stdout, b"baz\n");
+        let DockerView::Logs(logs) = &app.docker.view else {
+            panic!();
+        };
+        let lines: Vec<(LogStream, &str)> = logs
+            .lines
+            .iter()
+            .map(|l| (l.stream, l.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![(LogStream::Stderr, "bar"), (LogStream::Stdout, "foobaz"),],
+            "cross-stream interleave must not mix bytes"
+        );
+    }
+
+    #[test]
+    fn j_k_pgup_pgdn_move_scroll_offset_and_toggle_at_tail() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        // Populate 30 lines so scrolling is meaningful.
+        for i in 0..30 {
+            inject_container_log(
+                &mut app,
+                LogStream::Stdout,
+                format!("line-{i}\n").as_bytes(),
+            );
+        }
+        // Fresh logs view opens at tail.
+        {
+            let DockerView::Logs(logs) = &app.docker.view else {
+                panic!();
+            };
+            assert!(logs.at_tail);
+            assert_eq!(logs.scroll_offset, 0);
+        }
+
+        // k (up) scrolls once, disables at_tail.
+        app.handle_event(AppEvent::StdinChunk(b"k".to_vec()));
+        {
+            let DockerView::Logs(logs) = &app.docker.view else {
+                panic!();
+            };
+            assert_eq!(logs.scroll_offset, 1);
+            assert!(!logs.at_tail);
+        }
+        // PgUp adds LOGS_PAGE_LINES.
+        app.handle_event(AppEvent::StdinChunk(b"\x1b[5~".to_vec()));
+        {
+            let DockerView::Logs(logs) = &app.docker.view else {
+                panic!();
+            };
+            assert_eq!(logs.scroll_offset, 1 + LOGS_PAGE_LINES);
+            assert!(!logs.at_tail);
+        }
+        // j (down) once.
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
+        {
+            let DockerView::Logs(logs) = &app.docker.view else {
+                panic!();
+            };
+            assert_eq!(logs.scroll_offset, LOGS_PAGE_LINES);
+            assert!(!logs.at_tail);
+        }
+        // PgDn drops all the way to 0 → at_tail flips back on.
+        app.handle_event(AppEvent::StdinChunk(b"\x1b[6~".to_vec()));
+        {
+            let DockerView::Logs(logs) = &app.docker.view else {
+                panic!();
+            };
+            assert_eq!(logs.scroll_offset, 0);
+            assert!(logs.at_tail, "reaching 0 on scroll-down re-enables at_tail");
+        }
+    }
+
+    #[test]
+    fn capital_g_jumps_to_tail_and_resets_at_tail() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        for i in 0..20 {
+            inject_container_log(&mut app, LogStream::Stdout, format!("l-{i}\n").as_bytes());
+        }
+        // Scroll far up.
+        for _ in 0..10 {
+            app.handle_event(AppEvent::StdinChunk(b"k".to_vec()));
+        }
+        {
+            let DockerView::Logs(logs) = &app.docker.view else {
+                panic!();
+            };
+            assert!(!logs.at_tail);
+            assert_eq!(logs.scroll_offset, 10);
+        }
+        app.handle_event(AppEvent::StdinChunk(b"G".to_vec()));
+        let DockerView::Logs(logs) = &app.docker.view else {
+            panic!();
+        };
+        assert!(logs.at_tail);
+        assert_eq!(logs.scroll_offset, 0);
+    }
+
+    #[test]
+    fn docker_stream_ended_flushes_pending_sets_marker_and_disables_tail() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        inject_container_log(&mut app, LogStream::Stdout, b"final-line-without-newline");
+        inject_stream_ended(&mut app, "container exited");
+
+        let DockerView::Logs(logs) = &app.docker.view else {
+            panic!();
+        };
+        assert_eq!(
+            logs.lines.len(),
+            1,
+            "pending bytes must flush on stream end"
+        );
+        assert_eq!(logs.lines[0].text, "final-line-without-newline");
+        assert_eq!(
+            logs.stream_ended.as_deref(),
+            Some("container exited"),
+            "reason must be recorded verbatim"
+        );
+        assert!(!logs.at_tail, "at_tail disables on stream end");
+    }
+
+    #[test]
+    fn max_log_lines_drops_oldest() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        // Push MAX_LOG_LINES + 5 lines; assert len caps and newest
+        // survive.
+        for i in 0..(MAX_LOG_LINES + 5) {
+            inject_container_log(
+                &mut app,
+                LogStream::Stdout,
+                format!("line-{i}\n").as_bytes(),
+            );
+        }
+        let DockerView::Logs(logs) = &app.docker.view else {
+            panic!();
+        };
+        assert_eq!(logs.lines.len(), MAX_LOG_LINES);
+        // Oldest ("line-0" through "line-4") dropped.
+        for i in 0..5 {
+            assert!(
+                logs.lines.iter().all(|l| l.text != format!("line-{i}")),
+                "line-{i} must have been dropped"
+            );
+        }
+        // Newest still present.
+        assert_eq!(
+            logs.lines.back().unwrap().text,
+            format!("line-{}", MAX_LOG_LINES + 4)
+        );
+    }
+
+    #[test]
+    fn stale_logs_events_after_unsubscribe_are_dropped() {
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        let old_sub_id = match &app.docker.view {
+            DockerView::Logs(l) => l.sub_id,
+            _ => unreachable!(),
+        };
+        // Leave logs view.
+        app.handle_event(AppEvent::StdinChunk(b"q".to_vec()));
+        assert!(matches!(app.docker.view, DockerView::List));
+
+        // A stale ContainerLog arrives on the now-unsubscribed id.
+        // Must not panic and must not mutate DockerScope.
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: old_sub_id,
+                event: Event::ContainerLog {
+                    stream: LogStream::Stdout,
+                    data: b"ghost\n".to_vec(),
+                },
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert!(
+            actions.is_empty(),
+            "stale log chunks after Unsubscribe must drop silently"
+        );
+        assert!(matches!(app.docker.view, DockerView::List));
+    }
+
+    #[test]
+    fn logs_view_ignores_r_s_k_x_and_l_keybinds() {
+        // Read-only transcript: none of the list-view action keys
+        // should do anything while logs are showing.
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        for byte in [b'r', b's', b'K', b'X', b'l', b'/'] {
+            let actions = app.handle_event(AppEvent::StdinChunk(vec![byte]));
+            assert_eq!(
+                count(&actions, |a| matches!(
+                    a,
+                    AppAction::SendEnvelope(env) if matches!(
+                        &env.payload,
+                        Payload::DockerAction(_) | Payload::Subscribe(_)
+                    )
+                )),
+                0,
+                "byte {byte:?} must be ignored in logs view"
+            );
+        }
+        // Still in logs view, no pending confirm or action spawned.
+        assert!(matches!(app.docker.view, DockerView::Logs(_)));
+        assert!(app.docker.pending_confirm.is_none());
+        assert!(app.pending_actions.is_empty());
+    }
+
+    #[test]
+    fn focus_away_from_docker_does_not_cancel_logs_view() {
+        // Unlike pending_confirm (which auto-cancels on focus-away),
+        // the logs view must persist: the user can focus the pty tile
+        // and come back to find the stream still live.
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("web", "nginx", "running")]);
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        assert!(matches!(app.docker.view, DockerView::Logs(_)));
+        app.handle_event(AppEvent::StdinChunk(b"\x02k".to_vec())); // focus PTY
+        assert_eq!(app.view.focused, TileId::Pty);
+        assert!(
+            matches!(app.docker.view, DockerView::Logs(_)),
+            "logs view must persist across focus moves"
+        );
     }
 }

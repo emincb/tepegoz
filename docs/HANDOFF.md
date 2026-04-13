@@ -61,45 +61,47 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## Engineer section
 
-**Last updated:** 2026-04-14, post-C3a land.
+**Last updated:** 2026-04-14, post-C3b land.
 
 ### Where I left off
 
-C3a shipped. One commit, 143 tests green, fmt + clippy clean. Committed and pushed to `main`. Covers:
+C3a + C3b shipped. Two commits on `main`. C3b is one commit: CTO push-back cleanup (R/S aliases removed; K/X absorption during confirm; strengthened 10 s test; capital-R no-op test) + logs panel body. 164 tests green, fmt + clippy clean.
 
-- `r`/`R` → `DockerAction::Restart`; `s`/`S` → `Stop`. Immediate dispatch on the focused Docker tile, each inserting a `PendingAction { deadline: now + 30s, description }` keyed by `request_id`.
-- `K` → pending-confirm for `Kill`; `X` → pending-confirm for `Remove`. `y`/`Y` dispatches; any other key cancels. Focus-away from Docker cancels. 10 s idle auto-cancel.
-- Inline confirm modal rendered inside the Docker tile's `Rect` (not full-screen; preserves Decision #7 all-scopes-visible). Other tiles keep rendering + receiving input throughout.
-- Toast overlay in a new `toast.rs` module, rendered as a 1-line strip directly above the Claude Code tile. `App::toasts: VecDeque<Toast>`, bounded to `MAX_TOASTS = 3`, drop-oldest on overflow. Per-kind auto-dismiss (Success 3 s, Error 8 s, Info 4 s). Never blocks keystrokes.
-- Pending-action 30 s timeout sweep runs on every 30 Hz Tick via `App::sweep_expired(Instant::now(), ...)`. Expired entries emit an "`<verb> <name>` timed out — check engine" Error toast and are removed from `pending_actions`.
-- `DockerActionResult::Success`/`Failure` now correlate against `pending_actions` via `request_id`; Success emits green "`<verb> <name>` — succeeded" toast, Failure emits red "`<verb> <name>` failed: `<reason>`" (reason verbatim from dockerd). Stale results (no matching pending) fall back to `<verb> <container_id>`.
-- `Payload::Error` daemon error lands in the toast overlay queue (previously log-only).
-- `AppEvent::PendingActionTimeout(id)` wire retained on the event surface for a future dedicated sweeper. Exercised by tests.
+C3b body covers:
 
-Test count: 143 (up from 114). Lib tests in `tepegoz-tui`: 109 (app 51, tile 13, input 22, pty_tile 3, scope::docker 11, scope::placeholder 3, toast 5, helpers 1).
+- `DockerScope.view: DockerView::{List, Logs(LogsView)}`. `LogsView` carries container_id, container_name, sub_id, `lines: VecDeque<LogLine>` capped at `MAX_LOG_LINES = 10_000` (drop-oldest), per-stream `pending_stdout/pending_stderr: Vec<u8>` for chunks that split mid-line, `scroll_offset`, `at_tail`, `stream_ended: Option<String>`.
+- `l` on the focused list view with a selected container sends `Subscribe(DockerLogs { id, container_id, follow: true, tail_lines: 0 })` and transitions to `Logs(...)`. No-op when nothing selected, empty list, or Docker Unavailable.
+- `ContainerLog { stream, data }` on the logs sub feeds `LogsView::ingest`, which appends to the per-stream pending buffer and flushes every `\n`-terminated line into the capped ring. CRLF detected and both bytes stripped. stdout/stderr stay separate so an interleaved stderr line doesn't corrupt a stdout half-line.
+- `DockerStreamEnded { reason }` flushes trailing pending bytes as a final line, records the reason on `stream_ended`, disables `at_tail`. Renderer paints a dimmed "— log stream ended: `<reason>` —" line.
+- Scroll: `j`/`k`/Down/Up by 1; PgUp/PgDn by `LOGS_PAGE_LINES = 10`; `G`/End/Bottom jump-to-tail + re-enable `at_tail`. Scrolling up sets `at_tail=false`; reaching offset 0 via scroll-down re-enables it. `Esc`/`q` unsubscribe + return to List.
+- Logs view persists across focus moves (unlike `pending_confirm`). Action keybinds (`r`/`s`/`K`/`X`/`l`/filter) are all ignored while logs are showing.
+- Stale `ContainerLog`/`DockerStreamEnded` events on the now-unsubscribed sub id drop silently via `DockerScope::is_current_logs_sub(id)`.
+- `ScopeKey::PgUp` + `PgDn` added; CSI parser extended (`~5` → PgUp, `~6` → PgDn).
+- Render: scope::docker::render dispatches on view. Logs view layout is `[status(1), body(Min), help(1)]`. Status shows line count + tail on/off + stream live/ended[:reason]. Body paints each `LogLine` with stream-colored text (stdout gray `" "` prefix, stderr yellow `"!"` prefix). Help bar swaps to `[j/k] scroll · [PgUp/PgDn] page · [G] tail · [Esc/q] back`. Confirm modal is suppressed while in logs view (guarded in `render_list_view`).
+
+Test count: 164 (up from 143). tepegoz-tui lib tests: 130 (app 69, scope::docker 14, input 22, tile 13, toast 5, pty_tile 3, scope::placeholder 3, helpers 1).
 
 ### What I'm mid-flight on
 
-_Nothing._ Waiting on CTO review of C3a before starting C3b.
+_Nothing._ Waiting on CTO review of C3b before starting C3c.
 
 ### What I'm expecting from the CTO next
 
-- Sign-off on C3a or redirect.
-- If signed off: authorize C3b (logs panel as Docker-tile sub-state per UX clarification #1). My implementation sketch:
-  - Add a `LogsView { container_id, sub_id, log_lines: Vec<LogLine>, scroll_offset: usize, at_tail: bool }` variant to `DockerScope` alongside the current container-list view (introduce a `DockerView` enum: `List | Logs(LogsView)`).
-  - `l` on list view → allocate sub id, send `Subscribe(DockerLogs { id, container_id, follow: true, tail_lines: 0 })`, transition to `Logs(...)`. Help bar swaps to logs-mode hint.
-  - `ContainerLog { stream, data }` events on the logs sub id append to the transcript with stream-colored formatting (stdout neutral, stderr yellow). Each newline is a `LogLine`; chunked writes buffer until newline or tile redraw.
-  - `j`/`k`/`PgUp`/`PgDn` scroll; `G` jumps to bottom + sets `at_tail = true`. `at_tail` stays true until the user scrolls up, which sets it false; new lines only auto-scroll when `at_tail`.
-  - `Esc` or `q` → `Unsubscribe { id }`, drop back to `List`.
-  - `DockerStreamEnded { reason }` renders a terminal "— log stream ended: `<reason>` —" Line and disables auto-tail.
-- For C3c: end-to-end test in `crates/tepegoz-core/tests/` (opt-in `TEPEGOZ_DOCKER_TEST=1`) that provisions alpine, drives Restart through the daemon wire, asserts Success + follow-up `ContainerList` reflects the change. Plus `docs/OPERATIONS.md` manual demo script.
+- Sign-off on C3b or redirect.
+- If signed off: authorize C3c (end-to-end integration test + manual demo script). My implementation sketch:
+  - New opt-in test `crates/tepegoz-core/tests/docker_action_e2e.rs` or extension to `docker_scope.rs`: gated on `TEPEGOZ_DOCKER_TEST=1`, provisions a unique-per-PID alpine container (reusing the existing `sleep 120` pattern from Slice B's end-to-end), opens a daemon, connects a client, sends `Payload::DockerAction(DockerActionRequest { kind: Restart, ... })`, awaits `DockerActionResult::Success` with matching request_id, then awaits the next `ContainerList` and asserts the provisioned container shows the expected state (still `running`, but with an updated `status` timestamp reflecting the restart). Force-remove on Drop so panics don't leak.
+  - Add the C3 manual-demo script to `docs/OPERATIONS.md`: cover (1) r/s immediate dispatch + Success toast; (2) K/X confirm flow including K→K absorption (new test case for the user to eyeball); (3) Failure toast verbatim text (stop a docker container, then `r` to trigger an error); (4) Timeout toast by killing docker mid-action; (5) Toast stacking + drop-oldest visual; (6) Logs panel: `l` enters, see tail update live, `k`/`PgUp` scrolls, `G` returns; (7) Stream-ended marker by stopping a container while in logs view.
 
 ### Anything that would surprise a fresh-me
 
-- **`push_toast` has a `push_toast_at(now, ...)` variant for the sweep.** Toast `expires_at` is computed from an explicit `Instant` rather than always `Instant::now()` so the `sweep_expired(now)` code path doesn't evict a freshly-pushed timeout toast in the same pass. Tests pass synthetic "31 s in the future" nows to simulate time travel; the renderer + state don't care, they just respect the stored `expires_at`.
-- **The `next_sub_id` allocator is shared across subscription ids and DockerAction request ids.** The daemon correlates each response by the id embedded in the payload, so collision between namespaces is a non-issue. One monotonic counter keeps `alloc_sub_id` simple.
+- **`push_toast` has a `push_toast_at(now, ...)` variant for the sweep.** Toast `expires_at` is computed from an explicit `Instant` rather than always `Instant::now()` so the `sweep_expired(now)` code path doesn't evict a freshly-pushed timeout toast in the same pass. Tests pass synthetic "31 s in the future" nows to simulate time travel.
+- **The `next_sub_id` allocator is shared across subscription ids and DockerAction request ids and the per-container DockerLogs sub id.** The daemon correlates by id embedded in the payload, so collision between namespaces is a non-issue. One monotonic counter keeps everything simple.
 - **Focus-away cancellation fires *before* the focus mutation** in `handle_focus_direction`, so the old focus (`TileId::Docker`) is still observable when we clear `pending_confirm`. Order matters.
-- **Confirm modal takes priority in `handle_scope_key` over the filter branch.** If both could be active simultaneously (they can't today — begin_confirm no-ops when list is empty + filter-active means the user was narrowing the list, but a pending_confirm can still stick around if the filter is typed mid-prompt), confirm wins.
-- **Toast rendering lives in `toast.rs`, not `session.rs`.** Pulled into its own module so render tests can verify overlay positioning against a real `TileLayout` without dragging the full runtime in. `session::render_tiles` calls it after all normal tiles render.
-- **CI will need `TEPEGOZ_DOCKER_TEST=1` off by default** — all C3a tests are hermetic unit tests (no daemon, no docker engine). The opt-in integration tests in `docker_scope.rs` are unchanged and still `#[ignore]` behind the env var.
-- **The `docker_action_result_success_does_not_toast_yet` test was rewritten in place**, not deleted, as `docker_action_result_success_toasts_with_description`. Old semantics (no toast yet) are gone.
+- **Confirm modal takes priority in `handle_scope_key` over the filter branch.** Logs view takes priority over *both* — if `view == Logs`, handle_logs_key runs and returns before confirm/filter even get checked. (Can't actually coexist today — `l` fails while a confirm is pending, because confirm absorbs or cancels `l`. But the handler order is the right defense.)
+- **K/X during an already-open confirm are absorbed, not cancels.** If you press K then K again, the modal stays showing Kill (does not toggle off, does not switch to a second Kill with fresh deadline, does not switch target). Per CTO push-back on C3a. The old "any non-y cancels" rule is replaced: y/Y confirms, K/X absorb, anything else cancels.
+- **R and S (capitals) are now no-ops on the list view.** Only lowercase `r`/`s` dispatch actions. Rule: capital = destructive (K/X); lowercase = safe/navigation (r/s/j/k/h/l). Previously C3a had `r|R` and `s|S` as case-insensitive aliases; removed per CTO push-back to unify the convention.
+- **Toast rendering lives in `toast.rs`, not `session.rs`.** Pulled into its own module so render tests verify overlay positioning against a real `TileLayout` without dragging the full runtime in. Same pattern should apply to Phase 4/5/7 scope panels.
+- **`LogsView::container_id` is `#[allow(dead_code)]`-marked.** The renderer displays `container_name` instead (shorter + readable); the id is kept for tests and any future "reopen logs after reconnect" flow. Fully intentional.
+- **CRLF handling in `LogsView::ingest`.** A trailing `\r` before the `\n` is stripped along with the `\n` so Windows-container logs render cleanly. Tested (`crlf_terminated_lines_strip_both_bytes`).
+- **`tail_lines: 0` on `Subscribe(DockerLogs)` means "all history"** per Slice B's wire contract. For a chatty long-lived container this dumps megabytes on `l` press. Flagged to CTO as a Phase-3-polish candidate; not added to C3b scope. If you're adding it, `1000` is the sensible default with a way to grab "more" later.
+- **`MAX_LOG_LINES = 10_000` is the buffer cap.** Oldest drops on overflow. Memory ≈ 1–2 MiB for typical lines. Testable via `max_log_lines_drops_oldest`.

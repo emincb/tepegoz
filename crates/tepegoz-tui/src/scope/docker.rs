@@ -21,9 +21,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
-use tepegoz_proto::{DockerActionKind, DockerContainer};
+use tepegoz_proto::{DockerActionKind, DockerContainer, LogStream};
 
-use crate::app::{DockerScope, DockerScopeState, PendingConfirm, action_verb};
+use crate::app::{
+    DockerScope, DockerScopeState, DockerView, LogsView, PendingConfirm, action_verb,
+};
 
 pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect, focused: bool) {
     let border_color = if focused {
@@ -36,9 +38,13 @@ pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect, foc
     } else {
         Modifier::DIM
     };
+    let title = match &scope.view {
+        DockerView::List => "docker".to_string(),
+        DockerView::Logs(logs) => format!("docker · logs · {}", logs.container_name),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("docker")
+        .title(title)
         .title_style(
             Style::default()
                 .fg(border_color)
@@ -52,6 +58,13 @@ pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect, foc
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    match &scope.view {
+        DockerView::List => render_list_view(scope, frame, inner),
+        DockerView::Logs(logs) => render_logs_view(scope, logs, frame, inner),
+    }
+}
+
+fn render_list_view(scope: &DockerScope, frame: &mut Frame<'_>, inner: Rect) {
     let show_filter_bar = scope.filter_active || !scope.filter.is_empty();
 
     let constraints = if show_filter_bar {
@@ -118,9 +131,110 @@ pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect, foc
     // is awaiting confirmation (per C3a UX clarification #3). It's
     // drawn last so it paints over the table/help bar, but stays
     // inside the tile's Rect so other tiles keep rendering.
+    // Unreachable from the logs view (handled by the outer match).
     if let Some(pending) = &scope.pending_confirm {
         render_confirm_modal(frame, inner, pending);
     }
+}
+
+fn render_logs_view(scope: &DockerScope, logs: &LogsView, frame: &mut Frame<'_>, inner: Rect) {
+    let constraints = vec![
+        Constraint::Length(1), // status bar
+        Constraint::Min(1),    // body (transcript)
+        Constraint::Length(1), // help bar
+    ];
+    let chunks = Layout::vertical(constraints).split(inner);
+
+    // Status bar: line count, tail state, stream state.
+    let tail_label = if logs.at_tail { "on" } else { "off" };
+    let stream_label = match &logs.stream_ended {
+        None => "live".to_string(),
+        Some(reason) if reason.is_empty() => "ended".to_string(),
+        Some(reason) => format!("ended: {reason}"),
+    };
+    let status = Line::from(vec![
+        Span::styled(
+            format!("{} lines", logs.lines.len()),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(" · tail: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            tail_label,
+            if logs.at_tail {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
+        ),
+        Span::styled(" · stream: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            stream_label,
+            match logs.stream_ended {
+                None => Style::default().fg(Color::Green),
+                Some(_) => Style::default().fg(Color::Red),
+            },
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(status), chunks[0]);
+
+    render_transcript(logs, frame, chunks[1]);
+
+    render_help_bar(scope, frame, chunks[2]);
+}
+
+/// Render the log transcript into `area`, honoring `scroll_offset`
+/// and appending a terminal "stream ended" line when applicable.
+fn render_transcript(logs: &LogsView, frame: &mut Frame<'_>, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let visible_height = area.height as usize;
+
+    // Build the full line set including the terminal stream-ended
+    // marker so scroll math treats it as part of the transcript.
+    let mut total = logs.lines.len();
+    let has_ended_marker = logs.stream_ended.is_some();
+    if has_ended_marker {
+        total += 1;
+    }
+
+    // Slice [start, end) is what we render, top-to-bottom. `end` is
+    // exclusive; `scroll_offset` is how many lines above the tail the
+    // *bottom* of the visible window sits.
+    let end = total.saturating_sub(logs.scroll_offset);
+    let start = end.saturating_sub(visible_height);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        let line = if has_ended_marker && i == logs.lines.len() {
+            let reason = logs.stream_ended.as_deref().unwrap_or("");
+            Line::from(Span::styled(
+                format!("— log stream ended: {reason} —"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ))
+        } else {
+            let log = &logs.lines[i];
+            line_for_log(log)
+        };
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn line_for_log(log: &crate::app::LogLine) -> Line<'_> {
+    let (color, prefix) = match log.stream {
+        LogStream::Stdout => (Color::Gray, " "),
+        LogStream::Stderr => (Color::Yellow, "!"),
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{prefix} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(log.text.as_str(), Style::default().fg(color)),
+    ])
 }
 
 /// Inline confirm prompt for `Kill` / `Remove` (the destructive
@@ -376,12 +490,17 @@ fn render_unavailable(frame: &mut Frame<'_>, area: Rect, reason: &str) {
 }
 
 fn render_help_bar(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect) {
-    let help = if scope.pending_confirm.is_some() {
-        "[y] confirm · any other key cancels"
-    } else if scope.filter_active {
-        "[Enter] apply · [Esc] clear · [Backspace] delete"
-    } else {
-        "[j/k] nav · [/] filter · [r] restart · [s] stop · [K] kill · [X] remove"
+    let help = match (
+        &scope.view,
+        scope.pending_confirm.is_some(),
+        scope.filter_active,
+    ) {
+        (DockerView::Logs(_), _, _) => "[j/k] scroll · [PgUp/PgDn] page · [G] tail · [Esc/q] back",
+        (_, true, _) => "[y] confirm · any other key cancels",
+        (_, _, true) => "[Enter] apply · [Esc] clear · [Backspace] delete",
+        (_, _, _) => {
+            "[j/k] nav · [/] filter · [l] logs · [r] restart · [s] stop · [K] kill · [X] remove"
+        }
     };
     frame.render_widget(
         Paragraph::new(Span::styled(help, Style::default().fg(Color::DarkGray))),
@@ -415,6 +534,7 @@ mod tests {
     fn scope_with(state: DockerScopeState, filter: &str, filter_active: bool) -> DockerScope {
         DockerScope {
             state,
+            view: crate::app::DockerView::List,
             selection: 0,
             filter: filter.to_string(),
             filter_active,
@@ -689,6 +809,152 @@ mod tests {
         );
         assert!(any_row_contains(&rows, "[K] kill"));
         assert!(any_row_contains(&rows, "[X] remove"));
+    }
+
+    #[test]
+    fn logs_view_renders_status_bar_transcript_and_help() {
+        use crate::app::{LogLine, LogsView};
+        use std::collections::VecDeque;
+        let mut scope = scope_with(
+            DockerScopeState::Available {
+                containers: vec![make_container("web", "nginx", "running", "Up")],
+                engine_source: "test".into(),
+            },
+            "",
+            false,
+        );
+        let mut lines = VecDeque::new();
+        lines.push_back(LogLine {
+            stream: LogStream::Stdout,
+            text: "started server on :8080".into(),
+        });
+        lines.push_back(LogLine {
+            stream: LogStream::Stderr,
+            text: "WARN: connection refused from 10.0.0.5".into(),
+        });
+        let logs = LogsView {
+            container_id: "id-web".into(),
+            container_name: "web".into(),
+            sub_id: 99,
+            lines,
+            pending_stdout: Vec::new(),
+            pending_stderr: Vec::new(),
+            scroll_offset: 0,
+            at_tail: true,
+            stream_ended: None,
+        };
+        scope.view = crate::app::DockerView::Logs(logs);
+
+        let rows = draw_and_rows(&scope, 120, 20);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("docker · logs · web"),
+            "tile title must show container name; got {joined}"
+        );
+        assert!(joined.contains("2 lines"));
+        assert!(joined.contains("tail: on"));
+        assert!(joined.contains("stream: live"));
+        assert!(
+            joined.contains("started server on :8080"),
+            "stdout line rendered"
+        );
+        assert!(
+            joined.contains("WARN: connection refused from 10.0.0.5"),
+            "stderr line rendered"
+        );
+        // Help bar swaps to logs keybinds.
+        assert!(
+            any_row_contains(&rows, "[j/k] scroll") && any_row_contains(&rows, "[Esc/q] back"),
+            "logs help bar must list scroll + back keys; got {rows:?}"
+        );
+        assert!(
+            !any_row_contains(&rows, "[r] restart"),
+            "list-view help must NOT show while logs are displayed"
+        );
+    }
+
+    #[test]
+    fn logs_view_renders_stream_ended_marker() {
+        use crate::app::{LogLine, LogsView};
+        use std::collections::VecDeque;
+        let mut scope = scope_with(
+            DockerScopeState::Available {
+                containers: vec![make_container("web", "nginx", "running", "Up")],
+                engine_source: "test".into(),
+            },
+            "",
+            false,
+        );
+        let mut lines = VecDeque::new();
+        lines.push_back(LogLine {
+            stream: LogStream::Stdout,
+            text: "bye".into(),
+        });
+        let logs = LogsView {
+            container_id: "id-web".into(),
+            container_name: "web".into(),
+            sub_id: 99,
+            lines,
+            pending_stdout: Vec::new(),
+            pending_stderr: Vec::new(),
+            scroll_offset: 0,
+            at_tail: false,
+            stream_ended: Some("container exited".into()),
+        };
+        scope.view = crate::app::DockerView::Logs(logs);
+
+        let rows = draw_and_rows(&scope, 120, 20);
+        let joined = rows.join("\n");
+        assert!(joined.contains("bye"));
+        assert!(
+            joined.contains("— log stream ended: container exited —"),
+            "stream-ended marker renders verbatim; got {joined}"
+        );
+        assert!(joined.contains("tail: off"));
+        assert!(
+            joined.contains("stream: ended: container exited"),
+            "status bar shows ended + reason; got {joined}"
+        );
+    }
+
+    #[test]
+    fn logs_view_confirm_modal_is_suppressed() {
+        // Pending confirm state should not paint over the logs view
+        // (it's a list-view-only modal).
+        use crate::app::{LogsView, PendingConfirm};
+        use std::collections::VecDeque;
+        use std::time::{Duration, Instant};
+        let mut scope = scope_with(
+            DockerScopeState::Available {
+                containers: vec![make_container("web", "nginx", "running", "Up")],
+                engine_source: "test".into(),
+            },
+            "",
+            false,
+        );
+        scope.pending_confirm = Some(PendingConfirm {
+            kind: DockerActionKind::Kill,
+            container_id: "id-web".into(),
+            container_name: "web".into(),
+            deadline: Instant::now() + Duration::from_secs(10),
+        });
+        scope.view = crate::app::DockerView::Logs(LogsView {
+            container_id: "id-web".into(),
+            container_name: "web".into(),
+            sub_id: 99,
+            lines: VecDeque::new(),
+            pending_stdout: Vec::new(),
+            pending_stderr: Vec::new(),
+            scroll_offset: 0,
+            at_tail: true,
+            stream_ended: None,
+        });
+        let rows = draw_and_rows(&scope, 120, 20);
+        let joined = rows.join("\n");
+        assert!(
+            !joined.contains("Kill container web?"),
+            "confirm modal must not render over logs view; got {joined}"
+        );
     }
 
     #[test]
