@@ -209,7 +209,7 @@ async fn docker_action_against_unreachable_engine_returns_failure_with_reason() 
 }
 
 /// `Subscribe(DockerLogs)` against an unreachable engine must terminate
-/// cleanly with `Event::DockerLogStreamEnded` — without that signal a UI
+/// cleanly with `Event::DockerStreamEnded` — without that signal a UI
 /// would spin forever waiting for log chunks that won't come.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn docker_logs_against_unreachable_engine_emits_stream_ended() {
@@ -249,21 +249,21 @@ async fn docker_logs_against_unreachable_engine_emits_stream_ended() {
 
     let event = read_event_for(&mut r, LOGS_SUB_ID).await;
     match event {
-        Event::DockerLogStreamEnded { reason } => {
+        Event::DockerStreamEnded { reason } => {
             assert!(!reason.is_empty());
             assert!(
                 reason.to_lowercase().contains("engine") || reason.contains("docker"),
                 "reason should mention the engine being unavailable, got: {reason:?}"
             );
         }
-        other => panic!("expected DockerLogStreamEnded, got {other:?}"),
+        other => panic!("expected DockerStreamEnded, got {other:?}"),
     }
 
     daemon_handle.abort();
 }
 
 /// Same shape as the logs failure path: stats subscription against an
-/// unreachable engine must reach a terminal `DockerLogStreamEnded` event.
+/// unreachable engine must reach a terminal `DockerStreamEnded` event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn docker_stats_against_unreachable_engine_emits_stream_ended() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -300,10 +300,10 @@ async fn docker_stats_against_unreachable_engine_emits_stream_ended() {
 
     let event = read_event_for(&mut r, STATS_SUB_ID).await;
     match event {
-        Event::DockerLogStreamEnded { reason } => {
+        Event::DockerStreamEnded { reason } => {
             assert!(!reason.is_empty());
         }
-        other => panic!("expected DockerLogStreamEnded, got {other:?}"),
+        other => panic!("expected DockerStreamEnded, got {other:?}"),
     }
 
     daemon_handle.abort();

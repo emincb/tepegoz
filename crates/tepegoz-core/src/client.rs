@@ -61,10 +61,41 @@ async fn session(
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Envelope>();
     let writer_handle = spawn_writer_task(writer, event_rx, Arc::clone(&state));
 
-    // Handshake
+    // Handshake. Validate the wire framing version (`Envelope.version`) AND
+    // the application-level `Hello.client_version` before we start dispatching
+    // commands. Architecture commitment: peers reject mismatches with a
+    // structured `Error(VersionMismatch)`. Without this guard the daemon
+    // would silently accept a v3 client and later trip a rkyv decode error
+    // when an unknown variant arrives — opaque to the user.
     let hello = read_envelope(&mut reader).await?;
+    if hello.version != PROTOCOL_VERSION {
+        let _ = event_tx.send(error_envelope(
+            ErrorKind::VersionMismatch,
+            &format!(
+                "envelope protocol v{} is not supported (daemon speaks v{PROTOCOL_VERSION}); upgrade your client",
+                hello.version
+            ),
+        ));
+        // Let the writer flush, then drop tx so the writer task ends and
+        // the client sees a clean close.
+        drop(event_tx);
+        let _ = writer_handle.await;
+        return Ok(());
+    }
     match &hello.payload {
         Payload::Hello(h) => {
+            if h.client_version != PROTOCOL_VERSION {
+                let _ = event_tx.send(error_envelope(
+                    ErrorKind::VersionMismatch,
+                    &format!(
+                        "client v{} not supported (daemon speaks v{PROTOCOL_VERSION}); upgrade your client",
+                        h.client_version
+                    ),
+                ));
+                drop(event_tx);
+                let _ = writer_handle.await;
+                return Ok(());
+            }
             debug!(client = %h.client_name, version = h.client_version, "client hello");
         }
         other => anyhow::bail!("expected Hello, got {other:?}"),
@@ -518,12 +549,12 @@ fn docker_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope
     }
 }
 
-fn log_stream_ended_envelope(subscription_id: u64, reason: String) -> Envelope {
+fn stream_ended_envelope(subscription_id: u64, reason: String) -> Envelope {
     Envelope {
         version: PROTOCOL_VERSION,
         payload: Payload::Event(EventFrame {
             subscription_id,
-            event: Event::DockerLogStreamEnded { reason },
+            event: Event::DockerStreamEnded { reason },
         }),
     }
 }
@@ -558,7 +589,7 @@ async fn run_docker_action(req: DockerActionRequest) -> DockerActionResult {
 ///
 /// Connects to the engine, opens the bollard log stream, and forwards each
 /// chunk as a `ContainerLog` event. Always emits a final
-/// `DockerLogStreamEnded` (even on connect failure or if the container
+/// `DockerStreamEnded` (even on connect failure or if the container
 /// doesn't exist) so the client knows the stream is terminal — without it
 /// a UI would be left "spinning" with no signal that the docker side is
 /// gone. After that event the task exits; client may unsubscribe to free
@@ -573,7 +604,7 @@ async fn forward_docker_logs(
     let engine = match tepegoz_docker::Engine::connect().await {
         Ok(e) => e,
         Err(e) => {
-            let _ = event_tx.send(log_stream_ended_envelope(
+            let _ = event_tx.send(stream_ended_envelope(
                 subscription_id,
                 format!("engine unavailable: {e}"),
             ));
@@ -597,13 +628,13 @@ async fn forward_docker_logs(
             }
         }
     }
-    let _ = event_tx.send(log_stream_ended_envelope(subscription_id, end_reason));
+    let _ = event_tx.send(stream_ended_envelope(subscription_id, end_reason));
 }
 
 /// Per-`Subscribe(DockerStats)` forwarder.
 ///
 /// Same shape as `forward_docker_logs`: stream samples until the container
-/// or engine goes away, then emit `DockerLogStreamEnded` with the reason.
+/// or engine goes away, then emit `DockerStreamEnded` with the reason.
 async fn forward_docker_stats(
     subscription_id: u64,
     container_id: String,
@@ -612,7 +643,7 @@ async fn forward_docker_stats(
     let engine = match tepegoz_docker::Engine::connect().await {
         Ok(e) => e,
         Err(e) => {
-            let _ = event_tx.send(log_stream_ended_envelope(
+            let _ = event_tx.send(stream_ended_envelope(
                 subscription_id,
                 format!("engine unavailable: {e}"),
             ));
@@ -636,7 +667,7 @@ async fn forward_docker_stats(
             }
         }
     }
-    let _ = event_tx.send(log_stream_ended_envelope(subscription_id, end_reason));
+    let _ = event_tx.send(stream_ended_envelope(subscription_id, end_reason));
 }
 
 fn log_chunk_envelope(subscription_id: u64, stream: LogStream, data: Vec<u8>) -> Envelope {

@@ -24,7 +24,7 @@ pub mod socket;
 /// - **v4 (Phase 3 Slice B)**: `Subscription::DockerLogs` /
 ///   `Subscription::DockerStats`, `Payload::DockerAction` +
 ///   `Payload::DockerActionResult`, `Event::ContainerLog` /
-///   `Event::ContainerStats` / `Event::DockerLogStreamEnded`, plus
+///   `Event::ContainerStats` / `Event::DockerStreamEnded`, plus
 ///   `DockerActionKind`, `DockerActionOutcome`, `LogStream`, `DockerStats`.
 pub const PROTOCOL_VERSION: u32 = 4;
 
@@ -119,7 +119,7 @@ pub enum Subscription {
     /// Stream a single container's logs. `tail_lines = 0` means "all". When
     /// `follow = true` the subscription stays live until cancelled, the
     /// container exits, or the engine becomes unreachable; on terminal
-    /// conditions the daemon emits `Event::DockerLogStreamEnded`.
+    /// conditions the daemon emits `Event::DockerStreamEnded`.
     DockerLogs {
         id: u64,
         container_id: String,
@@ -128,9 +128,7 @@ pub enum Subscription {
     },
     /// Stream a single container's stats (CPU%, memory). Periodic events
     /// every ~1 s while the container is alive. Like docker logs, the
-    /// stream terminates with `DockerLogStreamEnded` (reused for stats —
-    /// the name is generic enough that adding a separate `DockerStatsEnded`
-    /// would just be churn).
+    /// stream terminates with `DockerStreamEnded`.
     DockerStats {
         id: u64,
         container_id: String,
@@ -191,7 +189,7 @@ pub enum Event {
     /// After this event the daemon will not emit further events on this
     /// subscription id (it's effectively closed; client may unsubscribe to
     /// free local state, but doesn't have to).
-    DockerLogStreamEnded {
+    DockerStreamEnded {
         reason: String,
     },
 }

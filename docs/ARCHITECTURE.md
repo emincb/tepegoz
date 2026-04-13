@@ -77,7 +77,7 @@ Events (inside `Event(EventFrame)`):
 - `DockerUnavailable { reason }` — emitted on availability *transitions* (subscribe-time or after the engine goes away). `reason` lists every connect candidate the daemon tried; the daemon keeps retrying every 5 s and follows up with `ContainerList` once a connection comes back
 - `ContainerLog { stream: Stdout|Stderr, data }` — one chunk of container log output (under a `DockerLogs` subscription)
 - `ContainerStats(DockerStats { cpu_percent, mem_bytes, mem_limit_bytes })` — one resource sample (under a `DockerStats` subscription); `cpu_percent` from cpu/precpu deltas, `0.0` on first sample
-- `DockerLogStreamEnded { reason }` — terminal event for `DockerLogs`/`DockerStats` subscriptions (container exit, removal, engine going away, connect failure). After this event no further events arrive on the subscription id; client may unsubscribe to free local state
+- `DockerStreamEnded { reason }` — terminal event for `DockerLogs`/`DockerStats` subscriptions (container exit, removal, engine going away, connect failure). After this event no further events arrive on the subscription id; client may unsubscribe to free local state
 
 ### Validation
 
@@ -214,7 +214,7 @@ Broadcast channel capacity is 1024 `PaneUpdate`s. Slow subscribers get `RecvErro
   - Per-client writer task owning the socket's write half, drains an unbounded mpsc of `Envelope`s.
   - Per-subscription forwarder task for each active AttachPane.
   - Per-`Subscribe(Docker)` poll task. Tracked in a `HashMap<id, AbortHandle>` so `Unsubscribe { id }` can cancel just that subscription. Refresh interval 2 s, reconnect interval 5 s; tolerates `dockerd` restarts and engine swaps without re-subscription.
-  - Per-`Subscribe(DockerLogs)` and `Subscribe(DockerStats)` forwarder task. Same `HashMap<id, AbortHandle>` registry. Both forwarders open a bollard stream against a freshly-connected `Engine`, translate to wire types, and always emit a terminal `Event::DockerLogStreamEnded` on stream end (engine unreachable, container exit, container removal, network error). UI never spins waiting for events that won't come.
+  - Per-`Subscribe(DockerLogs)` and `Subscribe(DockerStats)` forwarder task. Same `HashMap<id, AbortHandle>` registry. Both forwarders open a bollard stream against a freshly-connected `Engine`, translate to wire types, and always emit a terminal `Event::DockerStreamEnded` on stream end (engine unreachable, container exit, container removal, network error). UI never spins waiting for events that won't come.
   - Per-`DockerAction` action task (transient). Spawned so a slow dockerd doesn't stall the session loop; the task always sends back `DockerActionResult` whether the engine was reachable or not.
 - TUI: single task with `tokio::select!` over `stdin.read`, `read_envelope`, `winch.recv`. No ratatui rendering in v1 (raw passthrough).
 

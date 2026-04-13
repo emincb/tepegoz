@@ -10,7 +10,8 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 
 use tepegoz_proto::{
-    Envelope, Event, EventFrame, Hello, PROTOCOL_VERSION, Payload, StatusSnapshot, Subscription,
+    Envelope, ErrorKind, Event, EventFrame, Hello, PROTOCOL_VERSION, Payload, StatusSnapshot,
+    Subscription,
     codec::{read_envelope, write_envelope},
 };
 
@@ -74,6 +75,84 @@ async fn wait_for_socket(path: &Path, timeout: Duration) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("daemon socket never appeared at {}", path.display());
+}
+
+/// A v3 client connecting to a v4 daemon must be rejected at handshake time
+/// with a structured `Error(VersionMismatch)`, NOT silently accepted (which
+/// would later trip an opaque rkyv decode error when an unknown enum variant
+/// arrives over the wire).
+///
+/// Architecture commitment: peers reject mismatches. This test enforces it
+/// against both version fields (envelope-level + Hello-level).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_rejects_protocol_version_mismatch() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock_path = tmp.path().join("daemon.sock");
+
+    let config = tepegoz_core::DaemonConfig {
+        socket_path: Some(sock_path.clone()),
+    };
+    let daemon_handle = tokio::spawn(async move {
+        tepegoz_core::run_daemon(config).await.expect("daemon ran");
+    });
+    wait_for_socket(&sock_path, Duration::from_secs(5)).await;
+
+    // Send a Hello pretending to be v1 in BOTH version fields. Daemon must
+    // reply Error(VersionMismatch) and close.
+    let stale_version: u32 = 1;
+    assert_ne!(
+        stale_version, PROTOCOL_VERSION,
+        "test must use a version that's actually different from the current daemon"
+    );
+
+    let stream = tokio::net::UnixStream::connect(&sock_path)
+        .await
+        .expect("connect");
+    let (mut reader, mut writer) = stream.into_split();
+
+    let hello = Envelope {
+        version: stale_version,
+        payload: Payload::Hello(Hello {
+            client_version: stale_version,
+            client_name: "stale-client".into(),
+        }),
+    };
+    write_envelope(&mut writer, &hello).await.expect("write");
+
+    // Daemon should respond with a single Error envelope, then close.
+    let env = tokio::time::timeout(Duration::from_secs(2), read_envelope(&mut reader))
+        .await
+        .expect("daemon must respond within 2s — silent acceptance is the bug")
+        .expect("read");
+
+    match env.payload {
+        Payload::Error(info) => {
+            assert!(
+                matches!(info.kind, ErrorKind::VersionMismatch),
+                "expected VersionMismatch, got {:?}",
+                info.kind
+            );
+            // Reason should mention both the client's version and the
+            // daemon's, so the user can act on it.
+            assert!(
+                info.message.contains("v1"),
+                "error message should mention the client's version, got: {:?}",
+                info.message
+            );
+            assert!(
+                info.message.contains(&format!("v{PROTOCOL_VERSION}")),
+                "error message should mention the daemon's version, got: {:?}",
+                info.message
+            );
+        }
+        Payload::Welcome(_) => panic!(
+            "daemon accepted v{stale_version} client! that's the bug — version mismatch must be \
+             rejected at handshake before any further dispatch."
+        ),
+        other => panic!("expected Error(VersionMismatch), got {other:?}"),
+    }
+
+    daemon_handle.abort();
 }
 
 async fn connect_and_capture_first_snapshot(path: &Path) -> StatusSnapshot {
