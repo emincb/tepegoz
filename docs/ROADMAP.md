@@ -74,7 +74,7 @@ Per-phase: goal, delivered (or scope), acceptance test, explicit non-goals, risk
 
 ---
 
-## Phase 3 — Docker scope panel · 🟠 (Slices A + B + C1 + C2 landed; C1.5 tiling foundation in progress — Decision #7 supersedes the C1 `View::{Pane, Scope}` mode enum; C2 Docker renderer being re-plumbed into a tile `Rect`)
+## Phase 3 — Docker scope panel · 🟠 (A + B + C1 + C2 + C1.5a + C1.5b landed per Decision #7; C1.5c manual demo pending user; C3 action keybinds + toasts + logs panel outstanding)
 
 **Goal.** First scope panel. Lists containers; tails logs; execs into container (opens a new pane); lifecycle actions. Sets the UX template for Ports/Processes/Logs in Phase 4.
 
@@ -133,7 +133,7 @@ A prior revision of this slice shipped C1 as a `View::{Pane, Scope}` two-mode ap
 
 **Not in this slice.** Scope rendering (table widget, three-state lifecycle visuals), `Subscribe(Docker)` wiring, navigation/filter, action keybinds. All in C2.
 
-#### Slice C1.5 — Tiling foundation · 🟠 (in progress)
+#### Slice C1.5 — Tiling foundation · 🟡 (C1.5a + C1.5b landed; C1.5c manual demo pending user)
 
 **Goal.** Replace the C1 mode-switch `View` model with the tiled-layout substrate per Decision #7. The god-view default layout renders on first run; scopes not yet implemented show labeled placeholder tiles.
 
@@ -165,9 +165,23 @@ A prior revision of this slice shipped C1 as a `View::{Pane, Scope}` two-mode ap
 
 **Gate.** CTO reads Decision #7 + this roadmap slice in tree. No C1.5b code until sign-off.
 
-##### C1.5b — Tiling-foundation code
+##### C1.5b — Tiling-foundation code · ✅
 
-Per plan above. Starts after C1.5a sign-off. Ping when green on both-OS CI and pushed.
+**Delivered.**
+- `vt100` 0.16 added to `tepegoz-tui` deps; also as dev-dep to `tepegoz-core` for the repurposed vim_preservation test.
+- New `tile` module: `TileId { Pty, Docker, Ports, Fleet, ClaudeCode, TooSmall }`, `TileKind { Pty, Scope(ScopeKind), Placeholder { label, eta_phase }, TooSmall }`, `FocusDir`, `TileLayout` with `default_for(area)` producing the god-view Rect arrangement + `MIN_COLS × MIN_ROWS` (80×24) tiny-terminal fallback. Spatial adjacency via `next_focus(from, dir)` with left-align tiebreak so `Ctrl-b j` from full-width PTY lands on Docker (live) rather than Ports (placeholder).
+- Rewritten `app.rs`: `View { layout, focused }`; `pty_parser: vt100::Parser` sized to the pty tile; `pane_sub` + `docker.sub_id` both stable u64s allocated once in `App::new` (no more Option-nullable transitions); `initial_actions` emits AttachPane + ResizePane (pty-tile dims, NOT terminal dims) + Subscribe(Docker) + DrawFrame; `handle_forward_bytes` routes by focused tile (Pty → SendInput; Scope(Docker) → scope key parser; Placeholder/TooSmall → drop); `handle_focus_direction` moves focus via `layout.next_focus`; `handle_resize` recomputes layout + resizes vt100 parser + sends ResizePane with new pty-tile dims. Docker opens at `DockerScopeState::Connecting` (Subscribe is already in-flight); `Idle` variant kept for completeness but unreachable. Deleted: `View::{Pane, Scope}`, `switch_to_scope`/`switch_to_pane`, the synthetic re-attach, `AppAction::{EnterPaneMode, EnterScopeMode, WriteStdout}`, `InputAction::{SwitchToScope, SwitchToPane}`. Renamed: `AppAction::DrawScope` → `DrawFrame`. Added: `AppAction::FocusTile(TileId)` (observational; runtime logs at debug).
+- Rewritten `input.rs`: `InputAction::FocusDirection(FocusDir)` replaces `SwitchToScope`/`SwitchToPane`. State-machine filter recognizes `Ctrl-b` + `h/j/k/l` AND `Ctrl-b` + CSI arrow sequences (`ESC [ A/B/C/D`), with split-across-chunks resilience. `Ctrl-b ESC X` where `X` isn't `[` forwards the raw bytes rather than swallowing the ESC.
+- New `pty_tile.rs`: `render(parser, frame, area, focused)` projects `vt100::Screen` cells into ratatui, translating fg/bg/bold/italic/underline/reverse attrs. Cursor rendered as reversed cell only when focused (unfocused tiles show buffer without a misleading caret). Bordered block with focus-aware style (bright cyan when focused; dim gray otherwise).
+- New `scope::placeholder::render(label, eta_phase, frame, area, focused)`: bordered block with dimmed border, centered label ("Ports — Phase 4" style), + focused "Phase N — not yet implemented" hint.
+- Re-plumbed `scope::docker::render(state, frame, area, focused)`: content preserved from C2c2 (three-state lifecycle, `▶` selection marker, filter bar, help bar, port column formatting), signature adjusted to draw into a sub-`Rect`. Help bar updated to reference `Ctrl-b h/j/k/l` focus keys. Focus-aware border color.
+- Rewritten `session.rs` runtime: always-on ratatui (no mode gating); 30 Hz tick always active; `render_tiles(app, frame)` walks the tile layout and dispatches per `TileKind`; single-tile fallback for the too-small layout.
+- Repurposed `crates/tepegoz-core/tests/vim_preservation.rs` as a vt100 reconstruction test: spawns daemon, opens `/bin/sh`, shell emits alt-screen entry + cursor positioning + marker via printf, accumulated PaneSnapshot/PaneOutput bytes are fed to a `vt100::Parser`, assertion is `parser.screen().cell(row, col)` contains the marker at the expected position plus the full marker string reads correctly across a row substring. This is the automated proxy for "vim will render correctly inside the pty tile."
+- Kept unchanged: daemon-side `pane_subs` HashMap fix (`43b28eb`), handshake version-mismatch guard (`e4d2113`), printf hotfix (`56a8a4f`), C2c3 latency-pin test, `pane_unsubscribe.rs`. All decoupled from TUI shape.
+
+**Acceptance tests.** 114 workspace-wide (+34 from C2c3): `tile` 13, `input` 22 (up from 12), `app` 29 (up from 27), `pty_tile` 3 new, `scope::placeholder` 3 new, `scope::docker` 8 (up from 7), `vim_preservation` 1 (repurposed). `cargo fmt --all` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**Gate.** CI green on macOS + ubuntu-latest. Then user runs C1.5c.
 
 ##### C1.5c — Manual demo gate
 

@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Tepegöz TUI client: raw-passthrough attach to a daemon-owned pty."
+description = "Tepegöz TUI client: god-view tiled layout over a daemon-owned pty."
 
 [dependencies]
 tokio = { workspace = true }
@@ -15,4 +15,5 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 crossterm = "0.28"
 ratatui = "0.30"
+vt100 = "0.16"
 tepegoz-proto = { workspace = true }

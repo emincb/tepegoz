@@ -1,21 +1,30 @@
-//! Session entry point + I/O glue.
+//! Session entry point + I/O runtime for the god-view TUI.
 //!
-//! [`run`] connects to the daemon, performs the handshake, ensures a pty
-//! pane exists, then hands off to [`AppRuntime::run`]. The runtime owns
-//! the event loop: stdin → daemon → SIGWINCH → tick all funnel into
-//! [`crate::app::App::handle_event`], whose [`crate::app::AppAction`]s are
-//! executed here against real I/O.
+//! [`run`] connects to the daemon, performs the handshake, ensures a
+//! pty pane exists, then hands off to [`AppRuntime::run`]. The runtime
+//! owns the event loop (stdin, daemon envelopes, SIGWINCH, 30 Hz tick)
+//! and executes whatever [`AppAction`]s [`App::handle_event`] emits.
 //!
-//! The runtime is intentionally thin — every interesting state transition
-//! lives in [`crate::app`] and is unit-tested there. This file's job is to
-//! correctly wire bytes between sockets, terminals, and ratatui.
+//! The runtime is intentionally thin — every interesting state
+//! transition lives in [`crate::app`] and is unit-tested there. This
+//! file's job is to correctly wire bytes between sockets, terminals,
+//! and ratatui.
+//!
+//! Per Decision #7: always-on ratatui. No mode switching. The runtime
+//! always draws the tile grid on every `DrawFrame` and clears on exit.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -27,14 +36,18 @@ use tepegoz_proto::{
     codec::{read_envelope, write_envelope},
 };
 
-use crate::app::{App, AppAction, AppEvent, DetachReason, ToastKind};
+use crate::app::{App, AppAction, AppEvent, DetachReason, ScopeKind, ToastKind};
+use crate::pty_tile;
 use crate::scope;
 use crate::terminal;
+use crate::tile::{TileDef, TileId, TileKind};
 
-/// Coalesced redraw cadence in scope mode (~30 Hz). The runtime emits
-/// `AppEvent::Tick` at this rate; the App responds with `DrawScope` only
-/// when the active view actually needs it.
-const SCOPE_TICK_INTERVAL: Duration = Duration::from_millis(33);
+/// Redraw cadence. `DrawFrame` actions from the App coalesce through
+/// ratatui's buffer diff, but the tick also drives the pty tile
+/// redraw when bytes arrive between ticks — without it a steady
+/// stream of small PaneOutputs would drive the screen at whatever
+/// pace the daemon produces them.
+const TICK_INTERVAL: Duration = Duration::from_millis(33);
 
 pub(crate) async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     let stream = UnixStream::connect(&socket_path).await?;
@@ -47,7 +60,7 @@ pub(crate) async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     let pane = ensure_pane(&mut reader, &mut writer, rows, cols).await?;
     info!(pane_id = pane.id, alive = pane.alive, "attaching to pane");
 
-    terminal::enter_raw(&format!("tepegoz · pane {}", pane.id))?;
+    terminal::enter_raw(&format!("tepegoz · god view (pane {})", pane.id))?;
     let _guard = terminal::TerminalGuard;
 
     let exit_reason = AppRuntime::new(reader, writer, pane.id, (rows, cols))?
@@ -90,7 +103,6 @@ async fn handshake(
     }
 }
 
-/// Reuse the first live pane if any; otherwise open a new one.
 async fn ensure_pane(
     reader: &mut tokio::net::unix::OwnedReadHalf,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
@@ -116,9 +128,6 @@ async fn ensure_pane(
         return Ok(alive);
     }
 
-    // No live pane — open one. Pass the current working directory so the
-    // shell starts where the user invoked `tepegoz tui` from, matching
-    // tmux/screen expectations.
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.into_os_string().into_string().ok());
@@ -145,17 +154,15 @@ async fn ensure_pane(
     }
 }
 
-/// Owns the I/O machinery the App needs: socket halves, a writer mpsc, the
-/// stdin reader, the SIGWINCH stream, and the ratatui Terminal.
+/// Owns the I/O machinery the App needs: socket halves, a writer
+/// mpsc, the stdin reader, the SIGWINCH stream, and the ratatui
+/// Terminal.
 struct AppRuntime {
     app: App,
     reader: tokio::net::unix::OwnedReadHalf,
     cmd_tx: mpsc::UnboundedSender<Envelope>,
     writer_handle: tokio::task::JoinHandle<()>,
     terminal: ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
-    /// `true` while the App is in scope mode; gates the redraw ticker so
-    /// pane mode doesn't burn CPU on no-op ticks.
-    in_scope_mode: bool,
 }
 
 #[derive(Debug)]
@@ -188,12 +195,10 @@ impl AppRuntime {
             cmd_tx,
             writer_handle,
             terminal,
-            in_scope_mode: false,
         })
     }
 
     async fn run(mut self) -> ExitReason {
-        // Bootstrap: AttachPane + ResizePane.
         let bootstrap = self.app.initial_actions();
         if let Err(reason) = self.dispatch(bootstrap) {
             return reason;
@@ -205,7 +210,7 @@ impl AppRuntime {
             Ok(s) => s,
             Err(e) => return ExitReason::AppError(format!("signal install: {e}")),
         };
-        let mut tick = tokio::time::interval(SCOPE_TICK_INTERVAL);
+        let mut tick = tokio::time::interval(TICK_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
@@ -223,7 +228,7 @@ impl AppRuntime {
                     let (cols, rows) = terminal_size_fallback();
                     AppEvent::Resize { rows, cols }
                 },
-                _ = tick.tick(), if self.in_scope_mode => AppEvent::Tick,
+                _ = tick.tick() => AppEvent::Tick,
             };
 
             let actions = self.app.handle_event(event);
@@ -241,37 +246,19 @@ impl AppRuntime {
                         return Err(ExitReason::DaemonError("writer closed".into()));
                     }
                 }
-                AppAction::WriteStdout(bytes) => {
-                    let mut out = std::io::stdout();
-                    if let Err(e) = out.write_all(&bytes) {
-                        return Err(ExitReason::AppError(format!("stdout write: {e}")));
-                    }
-                    if let Err(e) = out.flush() {
-                        return Err(ExitReason::AppError(format!("stdout flush: {e}")));
-                    }
-                }
-                AppAction::EnterScopeMode => {
-                    self.in_scope_mode = true;
-                    if let Err(e) = self.terminal.clear() {
-                        return Err(ExitReason::AppError(format!("terminal clear: {e}")));
-                    }
-                }
-                AppAction::EnterPaneMode => {
-                    self.in_scope_mode = false;
-                    if let Err(e) = self.terminal.clear() {
-                        return Err(ExitReason::AppError(format!("terminal clear: {e}")));
-                    }
-                }
-                AppAction::DrawScope => {
-                    let scope_state = &self.app.docker;
-                    if let Err(e) = self
-                        .terminal
-                        .draw(|frame| scope::docker::render(scope_state, frame))
-                    {
+                AppAction::DrawFrame => {
+                    let app = &self.app;
+                    if let Err(e) = self.terminal.draw(|frame| render_tiles(app, frame)) {
                         return Err(ExitReason::AppError(format!("ratatui draw: {e}")));
                     }
                 }
+                AppAction::FocusTile(id) => {
+                    debug!(tile = ?id, "focus");
+                }
                 AppAction::Detach(reason) => {
+                    // Flush the terminal so the last draw is visible
+                    // before we leave the alt-screen.
+                    let _ = std::io::stdout().flush();
                     return Err(match reason {
                         DetachReason::User => ExitReason::UserDetach,
                         DetachReason::PaneExited { exit_code } => {
@@ -280,10 +267,9 @@ impl AppRuntime {
                     });
                 }
                 AppAction::ShowToast { kind, message } => {
-                    // C3 implements the actual overlay. For C2, log and
-                    // move on — the user will at least see it in
-                    // `tui.log`. Severity is kept wired through so C3
-                    // can route colors / auto-dismiss off `kind`.
+                    // C3 implements the actual overlay. For now, log
+                    // and move on — the user will at least see it in
+                    // `tui.log`.
                     match kind {
                         ToastKind::Error => warn!(%message, "toast"),
                         ToastKind::Success | ToastKind::Info => info!(%message, "toast"),
@@ -297,11 +283,70 @@ impl AppRuntime {
 
 impl Drop for AppRuntime {
     fn drop(&mut self) {
-        // Closing cmd_tx makes the writer task exit. We don't await it
-        // here because Drop is sync; the small leak window is harmless
-        // (process is exiting too).
+        // Closing cmd_tx makes the writer task exit. We don't await
+        // because Drop is sync; the small leak window is harmless
+        // (process exiting).
         self.writer_handle.abort();
     }
+}
+
+/// Walk the tile layout and render each tile into its `Rect`.
+fn render_tiles(app: &App, frame: &mut Frame<'_>) {
+    // If the layout is the too-small fallback, render just that.
+    if app.view.layout.tiles.len() == 1 && app.view.layout.tiles[0].id == TileId::TooSmall {
+        render_too_small(frame, app.view.layout.tiles[0].rect);
+        return;
+    }
+
+    // Collect tile defs by value so we don't hold an immutable borrow
+    // on `app.view.layout.tiles` while also calling render functions
+    // that borrow `app` immutably (Rust-level convenience, not
+    // correctness — the iterators would just make borrow-checker
+    // output noisier).
+    let tiles: Vec<TileDef> = app.view.layout.tiles.clone();
+    for tile in tiles {
+        let focused = tile.id == app.view.focused;
+        match &tile.kind {
+            TileKind::Pty => {
+                pty_tile::render(&app.pty_parser, frame, tile.rect, focused);
+            }
+            TileKind::Scope(ScopeKind::Docker) => {
+                scope::docker::render(&app.docker, frame, tile.rect, focused);
+            }
+            TileKind::Placeholder { label, eta_phase } => {
+                scope::placeholder::render(label, *eta_phase, frame, tile.rect, focused);
+            }
+            TileKind::TooSmall => {
+                // Shouldn't appear outside the fallback layout; guard
+                // anyway so a stray variant doesn't panic.
+                render_too_small(frame, tile.rect);
+            }
+        }
+    }
+}
+
+fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let body = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Terminal too small for god view",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Resize to at least 80×24.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .alignment(Alignment::Center);
+    frame.render_widget(body, inner);
 }
 
 fn spawn_writer_task(

@@ -58,9 +58,11 @@ Tail live:
 tail -f ~/.cache/tepegoz/tui.log
 ```
 
-## Slice C manual demo prep (Phase 3)
+## Slice C1.5c manual demo prep (Phase 3)
 
-The TUI scope view is the part where eyeball-confirmation has historically diverged from test-passes (Phase 2 immediate-detach was exactly this). Acceptance for C2/C3 includes a manual demo against a standing fixture container. **Step 1 is make-or-break**: if vim-preservation across the Scope→Pane synthetic re-attach fails, stop and apply a fallback mitigation (see `docs/ISSUES.md`) before anything else.
+The TUI god view is the part where eyeball-confirmation has historically diverged from test-passes (Phase 2 immediate-detach was exactly this). C1.5c acceptance is a manual demo against a standing fixture container. The gating checks per CTO direction: god-view layout renders on first launch with no config; focus navigation (`Ctrl-b h/j/k/l` + arrows) feels natural; vim in the pty tile renders correctly and survives focus movement; Docker tile populates within ~2 s; placeholder tiles are clearly labeled and non-interactive; detach/reattach preserves state; engine-unavailable-mid-session recovers cleanly.
+
+Prior to C1.5 this section documented a Scope→Pane mode-switch demo with Ctrl-b s / Ctrl-b a. Those keys no longer exist — the tiled layout shows pty + scopes simultaneously. The victim-container prep below carries over unchanged from the earlier C2c3 version.
 
 ### Prep
 
@@ -81,85 +83,122 @@ cargo build
 
 Run `./target/debug/tepegoz tui` in terminal 2.
 
-**Step 1 — vim preservation (MAKE-OR-BREAK).** The byte-level proxy
-(`crates/tepegoz-core/tests/vim_preservation.rs`) passes in CI, but this
-is the real-terminal check. If it fails, apply the fallback from
-`docs/ISSUES.md` — Resize-after-attach first.
+**Step 1 — god-view layout on first launch.**
 
 ```
-# In the attached pane:
+# → expect on first launch with no setup:
+#     · PTY tile spanning the top (shell prompt visible, focused by default)
+#     · Docker tile bottom-left (populated within ~2 s with the victim
+#       container; state "running", the tick-N image, port column empty)
+#     · Ports tile bottom-middle — labeled placeholder "Ports — Phase 4",
+#       dimmed border
+#     · Fleet tile bottom-right — labeled placeholder "SSH Fleet — Phase 5"
+#     · Claude Code strip bottom-full-width — labeled placeholder
+#       "Claude Code — Phase 9"
+#   Focused tile has a bright cyan border; unfocused tiles are dim gray.
+```
+
+**Step 2 — focus navigation.**
+
+```
+Ctrl-b j              # PTY → Docker tile (border becomes bright on Docker)
+Ctrl-b l              # Docker → Ports (placeholder; focused dim-cyan,
+                      #   "Phase 4 — not yet implemented" hint appears below
+                      #   the label)
+Ctrl-b k              # Ports → PTY (same column, one row up — bright on PTY)
+Ctrl-b <Down arrow>   # same as Ctrl-b j — arrow equivalents
+Ctrl-b <Up arrow>     # back to PTY
+
+# → expect: movement feels natural; focused tile is visually distinct;
+#   unfocused tiles keep rendering (Docker table ticks through live,
+#   PTY shell continues to produce output).
+```
+
+**Step 3 — vim preservation in the pty tile (MAKE-OR-BREAK).**
+
+The automated proxy (`crates/tepegoz-core/tests/vim_preservation.rs`,
+now a vt100 reconstruction test) passes in CI; this is the real
+terminal check — vt100 output is what the user will actually see.
+
+```
+# Focus PTY if not already focused (Ctrl-b k from the scope row, or
+# default focus on fresh launch).
 vim /tmp/tepegoz-demo.txt
 # press `i` (insert mode)
-# type: HELLO FROM STEP 1
+# type: HELLO FROM STEP 3
 # press <Esc>
-# status line should read something like: "/tmp/tepegoz-demo.txt" [New File]
-# move cursor with h/l/j/k to some non-trivial position
+# Status line should read: "/tmp/tepegoz-demo.txt" [New File]
+# Move cursor with h/l/j/k to a non-trivial position.
 
-# Switch to scope view:
-Ctrl-b s
-# → expect: container table populated with tepegoz-slice-c-victim.
-#   state "running", the tick-N image, port column empty.
+Ctrl-b j              # focus Docker; vim stays on-screen in the pty tile
+Ctrl-b k              # focus PTY again
+# → expect: vim's screen intact (text, cursor, status line). The tile
+#   border changed cyan/gray but the vim buffer did not scramble.
 
-# Switch back to attached pane:
-Ctrl-b a
-# → expect: vim's screen intact. Status line still shows the file name.
-#   The text "HELLO FROM STEP 1" is visible in the buffer. Cursor
-#   position preserved. No garbled escape sequences.
+# Detach + reattach:
+Ctrl-b d              # detach
+./target/debug/tepegoz tui
+# → expect: vim's screen still visible in the pty tile on reattach.
 
-# If vim's screen is broken (blank screen, wrong cursor, garbled text):
-# STOP HERE. This is the case CTO §3 warned about. Apply mitigation (1)
-# from docs/ISSUES.md ("Resize-after-attach") and re-test. Escalate to
-# (2) only if (1) doesn't fix it.
+# If vim's screen is broken:
+# STOP. This is the vt100 rendering equivalent of CTO §3's concern.
+# Debug: check `tui.log` for ratatui draw errors; verify the vt100
+# crate is processing all received bytes (log PaneOutput byte counts
+# vs parser.screen() contents).
 
-# If vim is intact, exit vim:
+# Exit vim:
 # :q!
 ```
 
-**Step 2 — scope rendering, navigation, filter.**
+**Step 4 — docker tile navigation + filter.**
 
 ```
-Ctrl-b s                    # switch back to scope view
-j, k, or ↑/↓                # move selection (▶ marker tracks)
-g / G                       # jump to top / bottom
-/ tepegoz                   # open filter input, type "tepegoz"; list narrows
-<Enter>                     # commit filter (bar stays; caret disappears)
-<Esc>                       # clear filter entirely
+Ctrl-b j              # focus Docker tile
+j, k, or ↑/↓          # move selection (▶ marker tracks)
+g / G                 # jump to top / bottom
+/ tepegoz             # open filter input, type "tepegoz"; list narrows
+<Enter>               # commit filter (bar stays; caret disappears)
+<Esc>                 # clear filter entirely
+
+# → expect: while Docker is focused, plain j/k/g/G act on the list (not
+#   focus). Ctrl-b j/k/etc. continue to move focus between tiles.
+#   The PTY tile keeps rendering in the background.
 ```
 
-**Step 3 — engine-unavailable-mid-session recovery** (CTO §7 Step 10).
+**Step 5 — engine-unavailable-mid-session recovery** (CTO §7).
 
 ```
-# In scope view, still showing containers:
+# With the Docker tile showing containers (focused or not — the
+# subscription is always alive):
 # Kill the docker daemon from OUTSIDE tepegoz.
 #   macOS Docker Desktop: menu → Quit
 #   macOS Colima:          `colima stop`  (terminal 3)
 #   Linux:                 `sudo systemctl stop docker`  (terminal 3)
-# → expect: within ~5s the scope view swaps to the Unavailable panel
-#   (red border, "Docker engine unavailable", verbatim reason from the
-#   daemon). The TUI must NOT crash or hang.
+# → expect: within ~5 s the Docker tile swaps to the Unavailable state
+#   (red border, "Docker engine unavailable", verbatim reason). The
+#   TUI must NOT crash or hang; PTY tile + placeholder tiles continue
+#   rendering unchanged.
 
 # Restart docker:
 #   macOS Docker Desktop: launch the app
 #   macOS Colima:          `colima start`
 #   Linux:                 `sudo systemctl start docker`
-# → expect: within ~5s (daemon reconnect interval) the scope view swaps
-#   back to the container table. The victim container should reappear
-#   if still running, or the list may be empty if docker was stopped
-#   long enough that the container was removed.
+# → expect: within ~5 s (daemon reconnect interval) the Docker tile
+#   swaps back to the container table. The victim container reappears
+#   if still running.
 
-# (If `docker run` removed the container during the stop — e.g., with
-# --rm on SIGTERM — just `docker run -d --name tepegoz-slice-c-victim
-# alpine sh -c "..."` again.)
+# (If the stop removed the container, just `docker run -d --name
+# tepegoz-slice-c-victim alpine sh -c "..."` again.)
 ```
 
-**Step 4 — detach + reattach (Phase 2 invariant).**
+**Step 6 — tiny-terminal fallback (optional).**
 
-```
-Ctrl-b d                    # detach (daemon + pane still running)
-./target/debug/tepegoz tui  # reattach — scrollback replay visible
-```
+Resize the terminal window below 80×24. The entire layout collapses
+to a single bordered "Terminal too small for god view — Resize to at
+least 80×24" tile. Resize back up; the god view reappears with PTY
+focused and all state preserved.
 
-**Step 5 — C3 keybinds** (enabled only after Slice C3 lands):
+**Step 7 — C3 keybinds** (enabled only after Slice C3 lands):
 
 ```
 l       → open logs panel for selected row; tick-N output streams

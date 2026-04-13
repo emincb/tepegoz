@@ -19,3 +19,4 @@ tepegoz-docker = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+vt100 = "0.16"

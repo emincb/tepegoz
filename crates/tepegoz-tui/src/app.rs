@@ -1,50 +1,69 @@
 //! Pure state-machine for the TUI.
 //!
-//! [`App`] holds the entire client-side state (current view, active pane,
-//! pending subscriptions, scope-panel data) and exposes one mutator —
-//! [`App::handle_event`] — that takes an [`AppEvent`] and returns a list of
-//! [`AppAction`]s the I/O runtime ([`crate::session::AppRuntime`]) should
-//! execute.
+//! [`App`] holds every piece of client-side state: the tile layout + focus,
+//! the pty vt100 parser, the docker scope, subscription ids, and any
+//! in-flight one-shot requests. The single mutator [`App::handle_event`]
+//! takes an [`AppEvent`] and returns zero-or-more [`AppAction`]s the I/O
+//! runtime ([`crate::session::AppRuntime`]) executes.
 //!
-//! The pure-function shape (state, event → state', actions) is deliberate:
+//! View shape (per `docs/DECISIONS.md#7`): the god-view is a fixed tiled
+//! layout. All scopes render simultaneously; all subscriptions live
+//! concurrently for the life of the session. Focus moves between tiles
+//! via `Ctrl-b h/j/k/l` (+ arrow keys); the focused tile owns the
+//! keystroke stream, unfocused tiles continue to update live.
 //!
-//! - **Testability.** State-machine tests can drive arbitrary event
-//!   sequences without any sockets, terminal, or async runtime — see the
-//!   `tests` module at the bottom of this file.
-//! - **Inheritance.** Phases 4 (Ports/Processes), 5 (SSH remote pty), and 7
-//!   (port scanner) all add new scope panels that plug into this same
-//!   shape: extend [`ScopeKind`], add a per-scope state struct, route
-//!   subscription envelopes via [`App::handle_daemon_envelope`].
-//! - **Auditability.** Every side effect ([`AppAction`]) is enumerated in
-//!   one place; the I/O runtime only ever reacts to those, so it's easy
-//!   to see what the TUI can and can't do at a glance.
+//! The pure-function shape (state, event → state', actions) is kept
+//! from C1 for testability and for inheritance: Phase 4 (Ports/
+//! Processes), 5 (SSH remote pty), 7 (port scanner), and 9 (Claude Code)
+//! all plug into this same shape — add a `TileKind::Scope(ScopeKind::X)`,
+//! add a per-scope state struct, route subscription envelopes via
+//! [`App::handle_daemon_envelope`], and the tile slot already exists as
+//! a labeled placeholder during development.
 
 use std::collections::HashMap;
 
+use ratatui::layout::Rect;
 use tepegoz_proto::{
     DockerActionOutcome, DockerContainer, Envelope, ErrorInfo, Event, EventFrame, PROTOCOL_VERSION,
     PaneId, Payload, Subscription,
 };
+use vt100::Parser;
 
 use crate::input::{InputAction, InputFilter};
+use crate::tile::{FocusDir, TileId, TileLayout};
 
-/// Top-level UI mode. Determines which renderer runs and where stdin
-/// keystrokes are routed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum View {
-    /// Attached to a pty pane: stdin → daemon, PaneOutput → stdout (raw
-    /// passthrough; ratatui draw cycle is idle).
-    Pane,
-    /// Browsing a scope panel: ratatui owns rendering; navigation /
-    /// action keys are parsed locally.
-    Scope(ScopeKind),
-}
+/// Scrollback budget for the vt100 parser, in rows. Mirrors the daemon's
+/// 2 MiB scrollback ring in terms of practical replay depth; `1000` rows
+/// × ~200 bytes/row ≈ 200 KiB in parser memory, well under the daemon's
+/// 2 MiB.
+const VT100_SCROLLBACK_ROWS: usize = 1000;
 
-/// Which scope panel is active. Slice C ships only `Docker`. Phases 4/7
-/// add `Ports`, `Processes`, `Scan`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Fallback pty-tile dimensions when the layout has no `TileId::Pty`
+/// (tiny-terminal fallback). `vt100::Parser::new` panics on zero, so we
+/// need non-zero defaults even when the pty tile isn't rendered.
+const FALLBACK_PTY_ROWS: u16 = 24;
+const FALLBACK_PTY_COLS: u16 = 80;
+
+/// Which scope panel a tile hosts. Slice C1.5 has only `Docker`; Phases
+/// 4 / 5 / 7 / 9 extend this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScopeKind {
     Docker,
+}
+
+/// TUI view state: fixed tile layout + the id of the focused tile.
+#[derive(Debug)]
+pub(crate) struct View {
+    pub layout: TileLayout,
+    pub focused: TileId,
+}
+
+impl View {
+    fn new(area: Rect) -> Self {
+        let layout = TileLayout::default_for(area);
+        let focused = layout.default_focus;
+        Self { layout, focused }
+    }
 }
 
 /// Inputs to [`App::handle_event`]. Every external happening — keystroke,
@@ -57,12 +76,12 @@ pub(crate) enum AppEvent {
     DaemonEnvelope(Envelope),
     /// SIGWINCH; terminal reports new dimensions.
     Resize { rows: u16, cols: u16 },
-    /// Coalesced redraw tick (~30 Hz); meaningful only in scope mode.
+    /// 30 Hz redraw tick. Always-on in C1.5+ (no mode gating).
     Tick,
     /// A pending one-shot request (e.g. `DockerAction`) hit its deadline.
-    /// Slice C3 wires this; included now so the runtime's loop shape
-    /// doesn't need a second refactor when timeouts arrive.
-    #[allow(dead_code)] // emitted by C3's pending-action sweeper
+    /// C3 wires this; the variant exists now so the runtime's loop shape
+    /// doesn't need a second refactor when the sweeper arrives.
+    #[allow(dead_code)]
     PendingActionTimeout(u64),
 }
 
@@ -72,43 +91,26 @@ pub(crate) enum AppEvent {
 pub(crate) enum AppAction {
     /// Send an envelope to the daemon over the writer mpsc.
     SendEnvelope(Envelope),
-    /// Write bytes directly to stdout (pane-mode passthrough). Ignored if
-    /// the runtime knows it's in scope mode — defensive only; the App is
-    /// supposed to only emit this when the view is [`View::Pane`].
-    WriteStdout(Vec<u8>),
-    /// Mode-switch lifecycle: clear the screen and stop ratatui drawing.
-    /// The runtime no longer calls `terminal.draw()` until [`Self::DrawScope`]
-    /// arrives.
-    EnterPaneMode,
-    /// Mode-switch lifecycle: clear the screen and start the ratatui draw
-    /// cycle. The next [`Self::DrawScope`] paints the initial scope view.
-    EnterScopeMode,
-    /// Request a ratatui redraw of the current scope view.
-    DrawScope,
-    /// Detach gracefully — exit the runtime loop. The terminal guard
-    /// restores raw mode and alt-screen on the way out. Carries the
-    /// reason so the runtime can pick the right exit message (user
-    /// detach vs pane exit).
+    /// Request a ratatui redraw of the tile grid.
+    DrawFrame,
+    /// Focus moved to `TileId`. The App has already updated
+    /// `self.view.focused`; this action is observational — the runtime
+    /// may use it for debug logging or future side effects (e.g. OSC 0
+    /// title refresh). No-op at the runtime level in C1.5.
+    FocusTile(TileId),
+    /// Detach gracefully — exit the runtime loop.
     Detach(DetachReason),
-    /// Surface a one-line status/error to the user. In C2 the runtime
-    /// stubs this as `tracing::warn!`; C3 implements a proper overlay.
-    /// The action surface is defined now so handle_daemon_envelope can
-    /// route `Payload::Error` + `DockerActionResult::Failure` without a
-    /// second refactor when C3's overlay lands.
+    /// Surface a one-line status/error to the user. The runtime stubs
+    /// this as `tracing::warn!`/`info!` until C3 implements the overlay.
     ShowToast { kind: ToastKind, message: String },
 }
 
-/// Severity / classification for [`AppAction::ShowToast`]. C3 may use this
-/// to pick colors or auto-dismiss timings in the overlay.
+/// Severity / classification for [`AppAction::ShowToast`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Info/Success produced by C3 once actions exist
 pub(crate) enum ToastKind {
-    /// Neutral information (e.g. "subscription started"). C3 only.
     Info,
-    /// Action completed successfully (e.g. "restarted nginx"). C3 only.
     Success,
-    /// Something the user needs to see — daemon error, action failure.
-    /// C2 emits this for `Payload::Error` + `DockerActionResult::Failure`.
     Error,
 }
 
@@ -122,27 +124,39 @@ pub(crate) enum DetachReason {
 }
 
 /// Per-scope state for the docker panel.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct DockerScope {
     pub(crate) state: DockerScopeState,
     /// Index into the visible (filter-respecting) row set. Clamped on
-    /// every `ContainerList` update so it doesn't overshoot when the
-    /// filter narrows or containers disappear.
+    /// every `ContainerList` update.
     pub(crate) selection: usize,
     pub(crate) filter: String,
-    /// True while the filter bar has focus (user typed `/`). While active,
-    /// chars go into `filter`; backspace removes the last; Esc clears +
-    /// deactivates; Enter deactivates but keeps the filter applied.
+    /// True while the filter bar has focus (user typed `/`). While
+    /// active: chars append, backspace trims, Esc clears + deactivates,
+    /// Enter deactivates but keeps the filter applied.
     pub(crate) filter_active: bool,
-    /// Subscription id for `Subscribe(Docker)`. `Some(_)` while we're in
-    /// scope view and the daemon is streaming container lists; `None`
-    /// when idle or between view switches.
-    pub(crate) sub_id: Option<u64>,
+    /// Subscription id for `Subscribe(Docker)`. Allocated once at
+    /// [`App::new`] and never cleared — the tile is always subscribed.
+    pub(crate) sub_id: u64,
 }
 
 impl DockerScope {
-    /// True if `c` passes the current filter (name or image contains the
-    /// filter text, case-insensitive). Empty filter matches everything.
+    fn new(sub_id: u64) -> Self {
+        Self {
+            // Subscribe is sent in initial_actions, so we open at
+            // Connecting rather than Idle — there's no "haven't
+            // subscribed yet" moment the user can observe.
+            state: DockerScopeState::Connecting,
+            selection: 0,
+            filter: String::new(),
+            filter_active: false,
+            sub_id,
+        }
+    }
+
+    /// True if `c` passes the current filter (name or image contains
+    /// the filter text, case-insensitive). Empty filter matches
+    /// everything.
     pub(crate) fn matches_filter(&self, c: &DockerContainer) -> bool {
         if self.filter.is_empty() {
             return true;
@@ -151,8 +165,8 @@ impl DockerScope {
         c.names.iter().any(|n| n.to_lowercase().contains(&q)) || c.image.to_lowercase().contains(&q)
     }
 
-    /// Number of containers the renderer would show (respects the filter).
-    /// `0` when not in `Available` state.
+    /// Number of containers the renderer would show (respects the
+    /// filter). `0` when not in `Available` state.
     pub(crate) fn visible_count(&self) -> usize {
         match &self.state {
             DockerScopeState::Available { containers, .. } => {
@@ -163,7 +177,8 @@ impl DockerScope {
     }
 
     /// Clamp `selection` into `[0, visible_count)` (or `0` when empty).
-    /// Call after any state/filter change that can shrink the visible set.
+    /// Call after any state/filter change that can shrink the visible
+    /// set.
     fn clamp_selection(&mut self) {
         let n = self.visible_count();
         if n == 0 {
@@ -174,32 +189,30 @@ impl DockerScope {
     }
 }
 
-/// Three-state lifecycle for the docker scope panel. Per CTO §2: distinct
-/// visual states. Don't conflate "haven't heard yet" with "engine said no
+/// Three-state lifecycle for the docker scope panel. Distinct visual
+/// states — don't conflate "haven't heard yet" with "engine said no
 /// containers" with "engine unreachable".
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) enum DockerScopeState {
-    /// We've never subscribed (initial state, or after leaving scope view).
-    #[default]
+    /// Pre-subscription. Kept as an enum variant for completeness; in
+    /// practice the App opens at `Connecting` because Subscribe is in
+    /// `initial_actions`.
+    #[allow(dead_code)]
     Idle,
-    /// We sent `Subscribe(Docker)` but no event has arrived yet. Renderer
-    /// shows "Connecting to docker engine…".
+    /// We sent `Subscribe(Docker)` but no event has arrived yet.
     Connecting,
     /// First (or refreshed) `ContainerList` arrived. May still be empty
-    /// (no containers) — renderer distinguishes empty list from
-    /// unavailability.
+    /// (no containers) — renderer distinguishes empty from unavailable.
     Available {
         containers: Vec<DockerContainer>,
         engine_source: String,
     },
-    /// Engine is unreachable. `reason` is the structured explanation from
-    /// `Engine::connect`; renderer shows it verbatim.
+    /// Engine is unreachable. `reason` is verbatim from the daemon.
     Unavailable { reason: String },
 }
 
-/// Pending one-shot request awaiting a response from the daemon. Slice C3
-/// uses this for `DockerAction → DockerActionResult` correlation and
-/// timeout sweeps.
+/// Pending one-shot request awaiting a response from the daemon. Slice
+/// C3 uses this for `DockerAction → DockerActionResult` correlation.
 #[derive(Debug)]
 #[allow(dead_code)] // C3 fills in the consumers
 pub(crate) struct PendingAction {
@@ -207,11 +220,9 @@ pub(crate) struct PendingAction {
     pub(crate) description: String,
 }
 
-/// Semantic key events parsed out of raw stdin bytes in scope mode. Slice
-/// C3 will add `Char` variants for `r`/`s`/`K`/`X`/`l`/`Enter` lifecycle
-/// actions and treat these as higher-level events; for now any printable
-/// byte routes to filter input when the filter bar is focused and is
-/// dispatched by single-byte match otherwise.
+/// Semantic key events parsed from raw stdin bytes when the Docker
+/// tile is focused. C3 adds `Char` variants for `r`/`s`/`K`/`X`/`l`
+/// lifecycle actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScopeKey {
     Up,
@@ -224,14 +235,12 @@ pub(crate) enum ScopeKey {
     Escape,
     Enter,
     Backspace,
-    /// A single byte of raw input. In filter-input mode this feeds the
-    /// filter string; otherwise (currently) unused.
     Char(u8),
 }
 
-/// State-machine parser for stdin bytes → [`ScopeKey`]s. Escape sequences
-/// (arrows, Home/End) can span multiple reads, so the parser buffers
-/// partial sequences across calls.
+/// State-machine parser for stdin bytes → [`ScopeKey`]s inside a scope
+/// tile. CSI sequences (arrows, Home/End) can span multiple reads; the
+/// parser buffers across calls.
 #[derive(Debug, Default)]
 pub(crate) struct ScopeKeyParser {
     state: KeyParserState,
@@ -243,8 +252,8 @@ enum KeyParserState {
     Normal,
     /// Received ESC; next byte disambiguates standalone Escape vs CSI.
     Escape,
-    /// Received `ESC [`; accumulating CSI parameter bytes until a final
-    /// byte arrives.
+    /// Received `ESC [`; accumulating CSI parameter bytes until a
+    /// final byte arrives.
     Csi(Vec<u8>),
 }
 
@@ -262,15 +271,10 @@ impl ScopeKeyParser {
                 KeyParserState::Escape => match b {
                     b'[' => self.state = KeyParserState::Csi(Vec::new()),
                     0x1b => {
-                        // ESC ESC → first is a standalone Escape; second
-                        // starts a new pending escape.
                         out.push(ScopeKey::Escape);
                         self.state = KeyParserState::Escape;
                     }
                     other => {
-                        // ESC followed by an unrecognized byte — treat
-                        // ESC as standalone Escape, dispatch the other
-                        // byte as a normal key.
                         out.push(ScopeKey::Escape);
                         match other {
                             0x7f | 0x08 => out.push(ScopeKey::Backspace),
@@ -283,33 +287,27 @@ impl ScopeKeyParser {
                     b'A' => out.push(ScopeKey::Up),
                     b'B' => out.push(ScopeKey::Down),
                     b'C' | b'D' => {
-                        // Right/Left arrows: no horizontal navigation
-                        // for the docker list view; silently drop.
+                        // Left/Right arrows: no horizontal navigation
+                        // inside the docker list. Silently drop.
                     }
                     b'H' => out.push(ScopeKey::Home),
                     b'F' => out.push(ScopeKey::End),
                     b'~' => match accum.as_slice() {
                         b"1" | b"7" => out.push(ScopeKey::Home),
                         b"4" | b"8" => out.push(ScopeKey::End),
-                        _ => {} // unknown ~-terminated CSI
+                        _ => {}
                     },
                     b'0'..=b'9' | b';' => {
                         accum.push(b);
                         self.state = KeyParserState::Csi(accum);
                         continue;
                     }
-                    _ => {} // unknown final byte — abandon sequence
+                    _ => {} // unknown final — abandon sequence
                 },
             }
         }
 
-        // If we ended the chunk holding a lone ESC with nothing following,
-        // treat it as a standalone Escape press. Terminal chunking in
-        // practice delivers full `ESC [ A` etc. in a single read (crossterm's
-        // tokio::io::stdin returns as much as the kernel has; arrow-key
-        // sequences are 3 contiguous bytes from xterm and never split).
-        // The alternative — holding ESC forever pending — would swallow
-        // the user's Esc keypress until they typed another byte.
+        // Lone ESC at the end of a chunk → standalone Escape press.
         if matches!(self.state, KeyParserState::Escape) {
             out.push(ScopeKey::Escape);
             self.state = KeyParserState::Normal;
@@ -318,22 +316,23 @@ impl ScopeKeyParser {
     }
 }
 
-/// The pure state machine. Owns nothing that talks to the outside world.
+/// The pure state machine.
 pub(crate) struct App {
     pub(crate) view: View,
     pub(crate) pane: PaneId,
-    /// Subscription id for the active `AttachPane`. `None` between the
-    /// constructor and the first call to [`App::initial_actions`], or
-    /// briefly during a Scope→Pane synthetic re-attach.
-    pub(crate) pane_attach_sub: Option<u64>,
+    /// Stable subscription id for the pty. Allocated at [`App::new`];
+    /// the subscription lives for the entire session.
+    pub(crate) pane_sub: u64,
+    /// vt100 terminal parser for the pty. Bytes arriving via
+    /// `Event::PaneOutput` / `Event::PaneSnapshot` feed the parser; the
+    /// pty tile renderer reads `parser.screen()` and projects cells into
+    /// ratatui.
+    pub(crate) pty_parser: Parser,
     pub(crate) docker: DockerScope,
     pub(crate) terminal_size: (u16, u16),
-    /// Sub-id allocator. Client-chosen, monotonically increasing. The
-    /// daemon doesn't impose any structure on these — they're opaque
-    /// labels for routing events back to the correct subscription.
-    pub(crate) next_sub_id: u64,
-    /// In-flight one-shot requests. Slice C3 uses this for action
-    /// correlation + the 30 s timeout sweep.
+    /// Sub-id allocator. Client-chosen, monotonically increasing.
+    next_sub_id: u64,
+    /// In-flight one-shot requests. C3 uses this for action correlation.
     #[allow(dead_code)]
     pub(crate) pending_actions: HashMap<u64, PendingAction>,
     input_filter: InputFilter,
@@ -342,70 +341,67 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(pane: PaneId, terminal_size: (u16, u16)) -> Self {
+        let (rows, cols) = terminal_size;
+        let area = Rect::new(0, 0, cols, rows);
+        let view = View::new(area);
+
+        let (pty_rows, pty_cols) = pty_tile_dims(&view.layout);
+        let pty_parser = Parser::new(pty_rows, pty_cols, VT100_SCROLLBACK_ROWS);
+
+        let mut next_sub_id: u64 = 1;
+        let pane_sub = next_sub_id;
+        next_sub_id += 1;
+        let docker_sub = next_sub_id;
+        next_sub_id += 1;
+
         Self {
-            view: View::Pane,
+            view,
             pane,
-            pane_attach_sub: None,
-            docker: DockerScope::default(),
+            pane_sub,
+            pty_parser,
+            docker: DockerScope::new(docker_sub),
             terminal_size,
-            next_sub_id: 1,
+            next_sub_id,
             pending_actions: HashMap::new(),
             input_filter: InputFilter::new(),
             scope_key_parser: ScopeKeyParser::default(),
         }
     }
 
-    /// Bootstrap actions to issue once at session start, before the event
-    /// loop spins. Allocates the first pane subscription, sends
-    /// `AttachPane`, and tells the daemon our terminal size.
+    /// Bootstrap actions for a fresh session: AttachPane, ResizePane
+    /// (sized to the pty tile, not the whole terminal), Subscribe
+    /// (Docker). All subscriptions are always-on for the life of the
+    /// TUI; no mode switching.
     pub(crate) fn initial_actions(&mut self) -> Vec<AppAction> {
-        let sub_id = self.alloc_sub_id();
-        self.pane_attach_sub = Some(sub_id);
-        let (rows, cols) = self.terminal_size;
+        let (pty_rows, pty_cols) = pty_tile_dims(&self.view.layout);
         vec![
             AppAction::SendEnvelope(envelope(Payload::AttachPane {
                 pane_id: self.pane,
-                subscription_id: sub_id,
+                subscription_id: self.pane_sub,
             })),
             AppAction::SendEnvelope(envelope(Payload::ResizePane {
                 pane_id: self.pane,
-                rows,
-                cols,
+                rows: pty_rows,
+                cols: pty_cols,
             })),
+            AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Docker {
+                id: self.docker.sub_id,
+            }))),
+            AppAction::DrawFrame,
         ]
     }
 
-    /// Single mutator: take an event, evolve state, emit zero or more
+    /// Single mutator: take an event, evolve state, emit zero-or-more
     /// side-effect actions for the runtime to execute. Pure; no I/O.
     pub(crate) fn handle_event(&mut self, event: AppEvent) -> Vec<AppAction> {
         let mut actions = Vec::new();
         match event {
-            AppEvent::StdinChunk(bytes) => {
-                self.handle_stdin(&bytes, &mut actions);
-            }
-            AppEvent::DaemonEnvelope(env) => {
-                self.handle_daemon_envelope(env, &mut actions);
-            }
-            AppEvent::Resize { rows, cols } => {
-                self.terminal_size = (rows, cols);
-                actions.push(AppAction::SendEnvelope(envelope(Payload::ResizePane {
-                    pane_id: self.pane,
-                    rows,
-                    cols,
-                })));
-                if matches!(self.view, View::Scope(_)) {
-                    actions.push(AppAction::DrawScope);
-                }
-            }
-            AppEvent::Tick => {
-                if matches!(self.view, View::Scope(_)) {
-                    actions.push(AppAction::DrawScope);
-                }
-            }
+            AppEvent::StdinChunk(bytes) => self.handle_stdin(&bytes, &mut actions),
+            AppEvent::DaemonEnvelope(env) => self.handle_daemon_envelope(env, &mut actions),
+            AppEvent::Resize { rows, cols } => self.handle_resize(rows, cols, &mut actions),
+            AppEvent::Tick => actions.push(AppAction::DrawFrame),
             AppEvent::PendingActionTimeout(_id) => {
-                // Slice C3 wires this. Intentional empty arm so the event
-                // surface is locked in; runtime can already emit timeout
-                // ticks once the C3 sweeper exists.
+                // C3 wires this. Empty arm locks the event surface.
             }
         }
         actions
@@ -419,64 +415,70 @@ impl App {
                     actions.push(AppAction::Detach(DetachReason::User));
                     return;
                 }
-                InputAction::SwitchToScope => self.switch_to_scope(actions),
-                InputAction::SwitchToPane => self.switch_to_pane(actions),
+                InputAction::FocusDirection(dir) => self.handle_focus_direction(dir, actions),
                 InputAction::Help => {
-                    // Slice C3 implements the help overlay. In Pane mode the
-                    // C1 pinning test confirms this arm produces zero actions.
+                    // C3 implements the help overlay. C1.5 keeps
+                    // Ctrl-b ? as a no-op so C3 can wire the overlay
+                    // without renaming anything.
                 }
             }
         }
     }
 
     fn handle_forward_bytes(&mut self, bytes: Vec<u8>, actions: &mut Vec<AppAction>) {
-        match self.view {
-            View::Pane => {
-                actions.push(AppAction::SendEnvelope(envelope(Payload::SendInput {
-                    pane_id: self.pane,
-                    data: bytes,
-                })));
+        if self.view.layout.routes_to_pty(self.view.focused) {
+            actions.push(AppAction::SendEnvelope(envelope(Payload::SendInput {
+                pane_id: self.pane,
+                data: bytes,
+            })));
+            return;
+        }
+        if let Some(ScopeKind::Docker) = self.view.layout.routes_to_scope(self.view.focused) {
+            for key in self.scope_key_parser.parse(&bytes) {
+                self.handle_scope_key(key, actions);
             }
-            View::Scope(_) => {
-                for key in self.scope_key_parser.parse(&bytes) {
-                    self.handle_scope_key(key, actions);
-                }
+        }
+        // Placeholder or TooSmall fall through: drop the bytes. The
+        // tile renderer shows a "not yet implemented" hint; no action
+        // needed here.
+    }
+
+    fn handle_focus_direction(&mut self, dir: FocusDir, actions: &mut Vec<AppAction>) {
+        if let Some(next) = self.view.layout.next_focus(self.view.focused, dir) {
+            if next != self.view.focused {
+                self.view.focused = next;
+                actions.push(AppAction::FocusTile(next));
+                actions.push(AppAction::DrawFrame);
             }
         }
     }
 
     fn handle_scope_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
         if self.docker.filter_active {
-            // Filter input mode. Most bytes append to `filter`; Esc/Enter
-            // exit the mode; backspace trims.
             match key {
                 ScopeKey::Escape => {
                     self.docker.filter.clear();
                     self.docker.filter_active = false;
                     self.docker.clamp_selection();
-                    actions.push(AppAction::DrawScope);
+                    actions.push(AppAction::DrawFrame);
                 }
                 ScopeKey::Enter => {
-                    // Commit: keep the filter content applied, leave input mode.
                     self.docker.filter_active = false;
-                    actions.push(AppAction::DrawScope);
+                    actions.push(AppAction::DrawFrame);
                 }
                 ScopeKey::Backspace => {
                     if self.docker.filter.pop().is_some() {
                         self.docker.clamp_selection();
-                        actions.push(AppAction::DrawScope);
+                        actions.push(AppAction::DrawFrame);
                     }
                 }
                 ScopeKey::Char(b) => {
-                    // Only printable ASCII; control bytes dropped.
                     if (0x20..=0x7e).contains(&b) {
                         self.docker.filter.push(b as char);
                         self.docker.clamp_selection();
-                        actions.push(AppAction::DrawScope);
+                        actions.push(AppAction::DrawFrame);
                     }
                 }
-                // Navigation keys while typing a filter are dropped — the
-                // user is editing; let them commit (Enter) first.
                 ScopeKey::Up
                 | ScopeKey::Down
                 | ScopeKey::Home
@@ -488,45 +490,38 @@ impl App {
             return;
         }
 
-        // Non-filter mode: navigation + filter activation.
         match key {
             ScopeKey::Up => {
                 self.docker.selection = self.docker.selection.saturating_sub(1);
-                actions.push(AppAction::DrawScope);
+                actions.push(AppAction::DrawFrame);
             }
             ScopeKey::Down => {
                 let n = self.docker.visible_count();
                 if n > 0 && self.docker.selection + 1 < n {
                     self.docker.selection += 1;
                 }
-                actions.push(AppAction::DrawScope);
+                actions.push(AppAction::DrawFrame);
             }
             ScopeKey::Top | ScopeKey::Home => {
                 self.docker.selection = 0;
-                actions.push(AppAction::DrawScope);
+                actions.push(AppAction::DrawFrame);
             }
             ScopeKey::Bottom | ScopeKey::End => {
                 let n = self.docker.visible_count();
                 self.docker.selection = n.saturating_sub(1);
-                actions.push(AppAction::DrawScope);
+                actions.push(AppAction::DrawFrame);
             }
             ScopeKey::FilterStart => {
                 self.docker.filter_active = true;
-                actions.push(AppAction::DrawScope);
+                actions.push(AppAction::DrawFrame);
             }
-            // j / k / g / G map to Up / Down / Top / Bottom.
             ScopeKey::Char(b'j') => self.handle_scope_key(ScopeKey::Down, actions),
             ScopeKey::Char(b'k') => self.handle_scope_key(ScopeKey::Up, actions),
             ScopeKey::Char(b'g') => self.handle_scope_key(ScopeKey::Top, actions),
             ScopeKey::Char(b'G') => self.handle_scope_key(ScopeKey::Bottom, actions),
             ScopeKey::Char(b'/') => self.handle_scope_key(ScopeKey::FilterStart, actions),
-            // Esc outside filter mode: no-op for now. C3 may use it to
-            // dismiss overlays.
             ScopeKey::Escape => {}
-            // Enter in scope mode: Slice D uses this for "exec into
-            // container". Ignored in C2c2.
-            ScopeKey::Enter => {}
-            // Backspace / other Chars outside filter mode: dropped.
+            ScopeKey::Enter => {} // C3 (Slice D) uses this for exec.
             ScopeKey::Backspace | ScopeKey::Char(_) => {}
         }
     }
@@ -537,13 +532,13 @@ impl App {
                 subscription_id,
                 event,
             }) => {
-                if Some(subscription_id) == self.pane_attach_sub {
+                if subscription_id == self.pane_sub {
                     self.handle_pane_event(event, actions);
-                } else if Some(subscription_id) == self.docker.sub_id {
+                } else if subscription_id == self.docker.sub_id {
                     self.handle_docker_event(event, actions);
                 }
-                // Other subscription ids: a stale event from a sub we've
-                // already unsubscribed from. Drop silently.
+                // Unknown sub id: stale event from a sub we've closed.
+                // Drop silently.
             }
             Payload::Error(info) => {
                 actions.push(daemon_error_toast(&info));
@@ -555,13 +550,12 @@ impl App {
                         message: format!("{:?} failed: {reason}", result.kind),
                     });
                 }
-                // Success: Slice C3 wires success toasts tied to the
-                // pending_actions map (so the toast can reference the
-                // container the user acted on). In C2 we have no actions
-                // in flight from the TUI, so no success branch needed.
+                // Success toasts are C3 — they need pending_actions
+                // context ("Restarted nginx") rather than a bare
+                // "succeeded."
             }
             // Welcome, Pong, PaneOpened, PaneList — consumed by the
-            // handshake / inline response reads, not the event loop.
+            // handshake / ensure_pane reads, not the event loop.
             _ => {}
         }
     }
@@ -569,25 +563,21 @@ impl App {
     fn handle_pane_event(&mut self, event: Event, actions: &mut Vec<AppAction>) {
         match event {
             Event::PaneSnapshot { scrollback, .. } => {
-                if matches!(self.view, View::Pane) && !scrollback.is_empty() {
-                    actions.push(AppAction::WriteStdout(scrollback));
+                if !scrollback.is_empty() {
+                    self.pty_parser.process(&scrollback);
+                    actions.push(AppAction::DrawFrame);
                 }
             }
             Event::PaneOutput { data } => {
-                if matches!(self.view, View::Pane) {
-                    actions.push(AppAction::WriteStdout(data));
-                }
-                // Scope mode: drop. The synthetic re-attach on Scope→Pane
-                // emits a fresh PaneSnapshot — that replays whatever
-                // happened while we were away. Buffering here would
-                // duplicate the daemon's ring buffer.
+                self.pty_parser.process(&data);
+                actions.push(AppAction::DrawFrame);
             }
             Event::PaneExit { exit_code } => {
                 actions.push(AppAction::Detach(DetachReason::PaneExited { exit_code }));
             }
             Event::PaneLagged { .. } => {
-                // Visual lag indicator is future work; runtime currently
-                // logs warns. No action.
+                // Visual lag indicator is future work; runtime logs
+                // warn on the transport side.
             }
             _ => {}
         }
@@ -604,94 +594,54 @@ impl App {
                     engine_source,
                 };
                 self.docker.clamp_selection();
-                actions.push(AppAction::DrawScope);
+                actions.push(AppAction::DrawFrame);
             }
             Event::DockerUnavailable { reason } => {
                 self.docker.state = DockerScopeState::Unavailable { reason };
                 self.docker.selection = 0;
-                actions.push(AppAction::DrawScope);
+                actions.push(AppAction::DrawFrame);
             }
             Event::DockerStreamEnded { .. } => {
-                // Per-container logs/stats streams — not wired into
-                // DockerScope. Slice C3 consumes these for the logs panel.
+                // Per-container logs/stats streams — C3 consumes these.
             }
             _ => {}
         }
     }
 
-    fn switch_to_scope(&mut self, actions: &mut Vec<AppAction>) {
-        if matches!(self.view, View::Scope(_)) {
-            return;
-        }
-        self.view = View::Scope(ScopeKind::Docker);
-
-        // Subscribe to docker on enter. Starts the daemon-side container-
-        // list polling; first event transitions Connecting → Available or
-        // Unavailable.
-        let sub_id = self.alloc_sub_id();
-        self.docker.sub_id = Some(sub_id);
-        self.docker.state = DockerScopeState::Connecting;
-        self.docker.selection = 0;
-        actions.push(AppAction::SendEnvelope(envelope(Payload::Subscribe(
-            Subscription::Docker { id: sub_id },
-        ))));
-
-        actions.push(AppAction::EnterScopeMode);
-        actions.push(AppAction::DrawScope);
-    }
-
-    fn switch_to_pane(&mut self, actions: &mut Vec<AppAction>) {
-        if matches!(self.view, View::Pane) {
-            return;
+    fn handle_resize(&mut self, rows: u16, cols: u16, actions: &mut Vec<AppAction>) {
+        self.terminal_size = (rows, cols);
+        let area = Rect::new(0, 0, cols, rows);
+        self.view.layout = TileLayout::default_for(area);
+        // If the focused tile no longer exists in the new layout
+        // (common when falling across the MIN_COLS/MIN_ROWS boundary),
+        // drop back to the default focus.
+        if self.view.layout.tile(self.view.focused).is_none() {
+            self.view.focused = self.view.layout.default_focus;
         }
 
-        // Unsubscribe from docker on leave. The daemon's forwarder task is
-        // tracked in docker_subs; Unsubscribe { id } aborts it. (The pane
-        // Unsubscribe bug fix at `43b28eb` makes this actually work —
-        // before that commit, pane Unsubscribe silently no-op'd.)
-        if let Some(id) = self.docker.sub_id.take() {
-            actions.push(AppAction::SendEnvelope(envelope(Payload::Unsubscribe {
-                id,
-            })));
-        }
-        self.docker.state = DockerScopeState::Idle;
-        self.docker.filter.clear();
-        self.docker.filter_active = false;
-        self.docker.selection = 0;
-
-        self.view = View::Pane;
-        actions.push(AppAction::EnterPaneMode);
-
-        // Synthetic re-attach: cancel the old AttachPane subscription and
-        // send a fresh one so the daemon replays the current scrollback as
-        // a PaneSnapshot. Byte-level invariant verified by
-        // `tests/vim_preservation.rs`; real-terminal confirmation is the
-        // C2c3 manual demo's Step 1.
-        //
-        // If the eyeball demo reveals problems, see `docs/ISSUES.md` for
-        // the ranked fallback mitigations (Resize-after-attach first,
-        // keep-AttachPane-alive only if that doesn't fix it).
-        //
-        // TODO(phase-5): scrollback re-transfer cost will matter over SSH;
-        // revisit if SSH bandwidth becomes a concern.
-        if let Some(old_sub) = self.pane_attach_sub.take() {
-            actions.push(AppAction::SendEnvelope(envelope(Payload::Unsubscribe {
-                id: old_sub,
-            })));
-        }
-        let new_sub = self.alloc_sub_id();
-        self.pane_attach_sub = Some(new_sub);
-        actions.push(AppAction::SendEnvelope(envelope(Payload::AttachPane {
+        let (pty_rows, pty_cols) = pty_tile_dims(&self.view.layout);
+        self.pty_parser.screen_mut().set_size(pty_rows, pty_cols);
+        actions.push(AppAction::SendEnvelope(envelope(Payload::ResizePane {
             pane_id: self.pane,
-            subscription_id: new_sub,
+            rows: pty_rows,
+            cols: pty_cols,
         })));
+        actions.push(AppAction::DrawFrame);
     }
 
+    #[allow(dead_code)] // C3 allocates per-action sub ids via this
     fn alloc_sub_id(&mut self) -> u64 {
         let id = self.next_sub_id;
         self.next_sub_id += 1;
         id
     }
+}
+
+fn pty_tile_dims(layout: &TileLayout) -> (u16, u16) {
+    layout
+        .rect_of(TileId::Pty)
+        .map(|r| (r.height.max(1), r.width.max(1)))
+        .unwrap_or((FALLBACK_PTY_ROWS, FALLBACK_PTY_COLS))
 }
 
 fn envelope(payload: Payload) -> Envelope {
@@ -716,14 +666,11 @@ mod tests {
         ErrorKind,
     };
 
-    fn pane_app() -> App {
-        App::new(7, (24, 80))
-    }
-
-    fn pane_subscription_id_after_init(app: &mut App) -> u64 {
-        let _ = app.initial_actions();
-        app.pane_attach_sub
-            .expect("initial_actions allocates pane_attach_sub")
+    /// A 120×40 terminal fits the god-view layout cleanly: PTY top,
+    /// Docker/Ports/Fleet in the middle row, Claude Code strip at
+    /// bottom.
+    fn test_app() -> App {
+        App::new(7, (40, 120))
     }
 
     fn count<F: FnMut(&AppAction) -> bool>(actions: &[AppAction], mut pred: F) -> usize {
@@ -745,18 +692,18 @@ mod tests {
         }
     }
 
-    fn populate_docker_state(app: &mut App, containers: Vec<DockerContainer>) -> u64 {
-        // Puts the app in scope mode and delivers a ContainerList on the
-        // docker sub. Returns the docker sub_id.
-        app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
-        let sub_id = app
-            .docker
-            .sub_id
-            .expect("switch_to_scope must allocate docker sub_id");
+    /// Populate the docker scope with a ContainerList on the correct
+    /// sub id and then focus the docker tile so that scope keys (j/k/
+    /// filter) route correctly.
+    fn populate_docker_and_focus(app: &mut App, containers: Vec<DockerContainer>) {
+        // initial_actions sends Subscribe(Docker) — we don't need to
+        // actually call it for the state machine, but we do need the
+        // sub_id which was allocated in App::new. Inject a
+        // ContainerList on that sub.
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
-                subscription_id: sub_id,
+                subscription_id: app.docker.sub_id,
                 event: Event::ContainerList {
                     containers,
                     engine_source: "test".into(),
@@ -764,14 +711,21 @@ mod tests {
             }),
         };
         app.handle_event(AppEvent::DaemonEnvelope(env));
-        sub_id
+        // Focus Docker tile: Ctrl-b j from the default (PTY) focus.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
     }
 
     #[test]
-    fn initial_actions_attach_then_resize() {
-        let mut app = pane_app();
+    fn initial_actions_emit_attach_resize_with_pty_tile_dims_and_subscribe_docker() {
+        let mut app = test_app();
         let actions = app.initial_actions();
-        assert_eq!(actions.len(), 2, "AttachPane + ResizePane");
+        assert_eq!(
+            actions.len(),
+            4,
+            "initial actions: AttachPane + ResizePane + Subscribe(Docker) + DrawFrame"
+        );
+
+        // AttachPane with pane_sub.
         match &actions[0] {
             AppAction::SendEnvelope(env) => match &env.payload {
                 Payload::AttachPane {
@@ -779,12 +733,18 @@ mod tests {
                     subscription_id,
                 } => {
                     assert_eq!(*pane_id, 7);
-                    assert!(*subscription_id > 0);
+                    assert_eq!(*subscription_id, app.pane_sub);
                 }
                 other => panic!("expected AttachPane, got {other:?}"),
             },
             other => panic!("expected SendEnvelope, got {other:?}"),
         }
+
+        // ResizePane with the pty tile's rows/cols — NOT the terminal
+        // dims. This is the C1.5 invariant: the pane sized to fit its
+        // tile, not the full terminal, so vim et al. render inside the
+        // box.
+        let (expected_pty_rows, expected_pty_cols) = pty_tile_dims(&app.view.layout);
         match &actions[1] {
             AppAction::SendEnvelope(env) => match &env.payload {
                 Payload::ResizePane {
@@ -793,20 +753,42 @@ mod tests {
                     cols,
                 } => {
                     assert_eq!(*pane_id, 7);
-                    assert_eq!(*rows, 24);
-                    assert_eq!(*cols, 80);
+                    assert_eq!(*rows, expected_pty_rows);
+                    assert_eq!(*cols, expected_pty_cols);
+                    assert_ne!(
+                        (*rows, *cols),
+                        (40, 120),
+                        "must size pane to pty tile, not terminal"
+                    );
                 }
                 other => panic!("expected ResizePane, got {other:?}"),
             },
             other => panic!("expected SendEnvelope, got {other:?}"),
         }
-        assert!(app.pane_attach_sub.is_some());
-        assert_eq!(app.view, View::Pane);
+
+        // Subscribe(Docker) with the docker sub_id.
+        match &actions[2] {
+            AppAction::SendEnvelope(env) => match &env.payload {
+                Payload::Subscribe(Subscription::Docker { id }) => {
+                    assert_eq!(*id, app.docker.sub_id);
+                }
+                other => panic!("expected Subscribe(Docker), got {other:?}"),
+            },
+            other => panic!("expected SendEnvelope, got {other:?}"),
+        }
+
+        assert!(matches!(actions[3], AppAction::DrawFrame));
+
+        // Default view state: layout computed, PTY focused, docker
+        // opens at Connecting (not Idle) because Subscribe is already
+        // in-flight.
+        assert_eq!(app.view.focused, TileId::Pty);
+        assert!(matches!(app.docker.state, DockerScopeState::Connecting));
     }
 
     #[test]
     fn ctrl_b_d_emits_user_detach() {
-        let mut app = pane_app();
+        let mut app = test_app();
         let actions = app.handle_event(AppEvent::StdinChunk(b"\x02d".to_vec()));
         assert_eq!(
             count(&actions, |a| matches!(
@@ -818,9 +800,73 @@ mod tests {
     }
 
     #[test]
-    fn pane_keystrokes_forward_to_daemon_as_send_input() {
-        let mut app = pane_app();
-        app.initial_actions();
+    fn ctrl_b_j_from_pty_focuses_docker_and_emits_drawframe() {
+        let mut app = test_app();
+        assert_eq!(app.view.focused, TileId::Pty);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        assert_eq!(app.view.focused, TileId::Docker);
+        let focus_count = count(&actions, |a| {
+            matches!(a, AppAction::FocusTile(TileId::Docker))
+        });
+        assert_eq!(focus_count, 1);
+        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
+    }
+
+    #[test]
+    fn ctrl_b_k_from_docker_focuses_pty() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // PTY → Docker
+        assert_eq!(app.view.focused, TileId::Docker);
+        app.handle_event(AppEvent::StdinChunk(b"\x02k".to_vec())); // Docker → PTY
+        assert_eq!(app.view.focused, TileId::Pty);
+    }
+
+    #[test]
+    fn ctrl_b_l_from_docker_focuses_ports() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec())); // Docker → Ports
+        assert_eq!(app.view.focused, TileId::Ports);
+    }
+
+    #[test]
+    fn ctrl_b_up_arrow_from_docker_focuses_pty() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02\x1b[A".to_vec()));
+        assert_eq!(app.view.focused, TileId::Pty);
+        assert_eq!(
+            count(&actions, |a| matches!(a, AppAction::FocusTile(TileId::Pty))),
+            1
+        );
+    }
+
+    #[test]
+    fn ctrl_b_h_from_pty_is_noop() {
+        // PTY is full-width; nothing to the left.
+        let mut app = test_app();
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02h".to_vec()));
+        assert_eq!(app.view.focused, TileId::Pty);
+        assert_eq!(
+            count(&actions, |a| matches!(a, AppAction::FocusTile(_))),
+            0,
+            "no-op focus moves must not emit FocusTile"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_question_is_help_noop() {
+        // Help is a C3 overlay; C1.5 pins Ctrl-b ? as a no-op so C3
+        // can wire the overlay without renaming.
+        let mut app = test_app();
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn pty_focused_pane_keystrokes_forward_to_daemon_as_send_input() {
+        let mut app = test_app();
+        // Default focus is PTY.
         let actions = app.handle_event(AppEvent::StdinChunk(b"hello\n".to_vec()));
         let send_input_count = count(&actions, |a| {
             matches!(
@@ -834,159 +880,66 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_s_switches_to_scope_and_subscribes_docker() {
-        let mut app = pane_app();
-        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
-        assert_eq!(app.view, View::Scope(ScopeKind::Docker));
-        // Connecting state while we wait for the first event.
-        assert!(
-            matches!(app.docker.state, DockerScopeState::Connecting),
-            "state after switch_to_scope must be Connecting (not Idle or Available); \
-             the renderer distinguishes these three states"
+    fn docker_focused_stdin_routes_to_scope_key_parser() {
+        let mut app = test_app();
+        populate_docker_and_focus(
+            &mut app,
+            vec![
+                make_container("a", "a", "running"),
+                make_container("b", "b", "running"),
+                make_container("c", "c", "running"),
+            ],
         );
-        let docker_sub_id = app.docker.sub_id.expect("docker sub_id must be allocated");
-        let subscribe_count = count(&actions, |a| {
-            matches!(
-                a,
-                AppAction::SendEnvelope(env)
-                    if matches!(&env.payload, Payload::Subscribe(Subscription::Docker { id })
-                        if *id == docker_sub_id)
-            )
-        });
-        assert_eq!(subscribe_count, 1);
+        assert_eq!(app.view.focused, TileId::Docker);
+
+        // Bare `j` while Docker is focused: navigates the list, NOT
+        // focus movement (Ctrl-b j would be focus movement).
+        assert_eq!(app.docker.selection, 0);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
+        assert_eq!(app.docker.selection, 1);
+        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
+        // And NOT SendInput — `j` would otherwise be typed into the
+        // pty, but Docker owns the keystream while focused.
         assert_eq!(
-            count(&actions, |a| matches!(a, AppAction::EnterScopeMode)),
-            1
+            count(&actions, |a| matches!(a, AppAction::SendEnvelope(_))),
+            0
         );
-        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawScope)), 1);
     }
 
     #[test]
-    fn second_switch_to_scope_is_idempotent() {
-        let mut app = pane_app();
-        app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
-        let sub_before = app.docker.sub_id;
-        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
+    fn placeholder_focused_stdin_is_dropped() {
+        let mut app = test_app();
+        // Walk focus from PTY → Docker → Ports (placeholder).
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        assert_eq!(app.view.focused, TileId::Ports);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"hello".to_vec()));
+        // No SendInput (pty is not focused), no DrawFrame (placeholder
+        // doesn't re-render on typed input).
         assert_eq!(
-            count(&actions, |a| matches!(a, AppAction::EnterScopeMode)),
+            count(&actions, |a| matches!(a, AppAction::SendEnvelope(_))),
             0,
-            "switching to scope while already in scope must be a no-op"
-        );
-        let subscribe_count = count(&actions, |a| {
-            matches!(
-                a,
-                AppAction::SendEnvelope(env)
-                    if matches!(&env.payload, Payload::Subscribe(Subscription::Docker { .. }))
-            )
-        });
-        assert_eq!(
-            subscribe_count, 0,
-            "redundant switch must not re-subscribe to docker"
-        );
-        assert_eq!(
-            app.docker.sub_id, sub_before,
-            "sub_id must not change on redundant switch"
-        );
-    }
-
-    #[test]
-    fn second_switch_to_pane_is_idempotent() {
-        // Symmetric counterpart to second_switch_to_scope_is_idempotent.
-        // Catches a regression where a redundant switch_to_pane would
-        // emit Unsubscribe + AttachPane needlessly, burning bandwidth
-        // and making the daemon replay scrollback for no reason.
-        let mut app = pane_app();
-        pane_subscription_id_after_init(&mut app);
-        let pane_sub_before = app.pane_attach_sub;
-        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02a".to_vec()));
-        assert_eq!(
-            count(&actions, |a| matches!(a, AppAction::EnterPaneMode)),
-            0,
-            "switching to pane while already in pane must not re-enter pane mode"
-        );
-        let envelope_count = count(&actions, |a| matches!(a, AppAction::SendEnvelope(_)));
-        assert_eq!(
-            envelope_count, 0,
-            "redundant switch_to_pane must not re-send Unsubscribe/AttachPane — that \
-             would trigger a pointless scrollback replay on the daemon side"
-        );
-        assert_eq!(
-            app.pane_attach_sub, pane_sub_before,
-            "pane_attach_sub must not change on redundant switch"
-        );
-    }
-
-    #[test]
-    fn ctrl_b_question_in_pane_mode_is_dropped() {
-        // Help overlay is a C3 concern; C2 intentionally produces zero
-        // actions for Ctrl-b ?. Locking the current behavior as a
-        // regression test means C3's overlay implementation can't
-        // accidentally route help-key handling through the wrong arm.
-        let mut app = pane_app();
-        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
-        assert!(
-            actions.is_empty(),
-            "Ctrl-b ? in pane mode must not emit any actions (help overlay is C3)"
-        );
-    }
-
-    #[test]
-    fn ctrl_b_a_returns_to_pane_with_synthetic_reattach_and_unsubscribes_docker() {
-        let mut app = pane_app();
-        let prev_pane_sub = pane_subscription_id_after_init(&mut app);
-        app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
-        let docker_sub = app.docker.sub_id.expect("scope mode allocated docker sub");
-
-        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02a".to_vec()));
-
-        assert_eq!(app.view, View::Pane);
-        assert!(
-            matches!(app.docker.state, DockerScopeState::Idle),
-            "leaving scope view must reset DockerScope to Idle"
-        );
-        assert_eq!(
-            app.docker.sub_id, None,
-            "docker sub_id must be cleared on leave"
-        );
-
-        // Both subscriptions cancelled (docker AND old pane attach).
-        let docker_unsub = count(&actions, |a| {
-            matches!(a, AppAction::SendEnvelope(env)
-                if matches!(&env.payload, Payload::Unsubscribe { id } if *id == docker_sub))
-        });
-        assert_eq!(docker_unsub, 1, "docker subscription must be cancelled");
-
-        let pane_unsub = count(&actions, |a| {
-            matches!(a, AppAction::SendEnvelope(env)
-                if matches!(&env.payload, Payload::Unsubscribe { id } if *id == prev_pane_sub))
-        });
-        assert_eq!(
-            pane_unsub, 1,
-            "old pane subscription must also be cancelled (synthetic re-attach)"
-        );
-
-        let new_attach = count(&actions, |a| {
-            matches!(a, AppAction::SendEnvelope(env)
-                if matches!(&env.payload, Payload::AttachPane { pane_id: 7, .. }))
-        });
-        assert_eq!(new_attach, 1, "fresh AttachPane must be sent");
-        assert_ne!(
-            app.pane_attach_sub.expect("new sub allocated"),
-            prev_pane_sub
+            "placeholder tile must not route bytes to SendInput"
         );
     }
 
     #[test]
     fn container_list_transitions_state_to_available_and_clamps_selection() {
-        let mut app = pane_app();
-        let sub_id = populate_docker_state(
-            &mut app,
-            vec![
-                make_container("web", "nginx", "running"),
-                make_container("db", "postgres", "running"),
-            ],
-        );
-        let _ = sub_id; // silence unused
+        let mut app = test_app();
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.docker.sub_id,
+                event: Event::ContainerList {
+                    containers: vec![
+                        make_container("web", "nginx", "running"),
+                        make_container("db", "postgres", "running"),
+                    ],
+                    engine_source: "test".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
         match &app.docker.state {
             DockerScopeState::Available {
                 containers,
@@ -1002,13 +955,11 @@ mod tests {
 
     #[test]
     fn docker_unavailable_transitions_state() {
-        let mut app = pane_app();
-        app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
-        let sub_id = app.docker.sub_id.unwrap();
+        let mut app = test_app();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
-                subscription_id: sub_id,
+                subscription_id: app.docker.sub_id,
                 event: Event::DockerUnavailable {
                     reason: "no socket".into(),
                 },
@@ -1023,8 +974,8 @@ mod tests {
 
     #[test]
     fn j_and_k_move_selection_and_clamp_at_bounds() {
-        let mut app = pane_app();
-        populate_docker_state(
+        let mut app = test_app();
+        populate_docker_and_focus(
             &mut app,
             vec![
                 make_container("a", "a", "running"),
@@ -1037,20 +988,18 @@ mod tests {
         assert_eq!(app.docker.selection, 1);
         app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
         assert_eq!(app.docker.selection, 2);
-        // Clamp at bottom.
         app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
-        assert_eq!(app.docker.selection, 2);
+        assert_eq!(app.docker.selection, 2, "clamp at bottom");
         app.handle_event(AppEvent::StdinChunk(b"k".to_vec()));
         assert_eq!(app.docker.selection, 1);
-        // Clamp at top.
         app.handle_event(AppEvent::StdinChunk(b"kkk".to_vec()));
-        assert_eq!(app.docker.selection, 0);
+        assert_eq!(app.docker.selection, 0, "clamp at top");
     }
 
     #[test]
-    fn arrow_down_and_arrow_up_move_selection() {
-        let mut app = pane_app();
-        populate_docker_state(
+    fn arrow_down_and_up_move_selection_when_docker_focused() {
+        let mut app = test_app();
+        populate_docker_and_focus(
             &mut app,
             vec![
                 make_container("a", "a", "running"),
@@ -1065,8 +1014,8 @@ mod tests {
 
     #[test]
     fn capital_g_jumps_to_bottom_and_lowercase_g_to_top() {
-        let mut app = pane_app();
-        populate_docker_state(
+        let mut app = test_app();
+        populate_docker_and_focus(
             &mut app,
             vec![
                 make_container("a", "a", "running"),
@@ -1082,8 +1031,8 @@ mod tests {
 
     #[test]
     fn filter_narrows_visible_list_and_clamps_selection() {
-        let mut app = pane_app();
-        populate_docker_state(
+        let mut app = test_app();
+        populate_docker_and_focus(
             &mut app,
             vec![
                 make_container("web", "nginx", "running"),
@@ -1091,19 +1040,15 @@ mod tests {
                 make_container("cache", "redis", "running"),
             ],
         );
-        // Move selection to the last row.
-        app.handle_event(AppEvent::StdinChunk(b"GG".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"G".to_vec()));
         assert_eq!(app.docker.selection, 2);
 
-        // Open filter and type "we" — only "web" matches.
         app.handle_event(AppEvent::StdinChunk(b"/we".to_vec()));
         assert!(app.docker.filter_active);
         assert_eq!(app.docker.filter, "we");
         assert_eq!(app.docker.visible_count(), 1);
-        // Selection clamped to single visible row.
         assert_eq!(app.docker.selection, 0);
 
-        // Esc clears the filter AND exits input mode.
         app.handle_event(AppEvent::StdinChunk(b"\x1b".to_vec()));
         assert!(!app.docker.filter_active);
         assert_eq!(app.docker.filter, "");
@@ -1112,8 +1057,8 @@ mod tests {
 
     #[test]
     fn filter_enter_commits_without_clearing() {
-        let mut app = pane_app();
-        populate_docker_state(
+        let mut app = test_app();
+        populate_docker_and_focus(
             &mut app,
             vec![
                 make_container("web", "nginx", "running"),
@@ -1121,29 +1066,26 @@ mod tests {
             ],
         );
         app.handle_event(AppEvent::StdinChunk(b"/nginx\n".to_vec()));
-        assert!(!app.docker.filter_active, "Enter exits filter-input mode");
-        assert_eq!(
-            app.docker.filter, "nginx",
-            "Enter must keep the filter applied, unlike Esc which clears"
-        );
+        assert!(!app.docker.filter_active);
+        assert_eq!(app.docker.filter, "nginx");
         assert_eq!(app.docker.visible_count(), 1);
     }
 
     #[test]
     fn filter_backspace_removes_last_char() {
-        let mut app = pane_app();
-        populate_docker_state(&mut app, vec![make_container("a", "a", "running")]);
+        let mut app = test_app();
+        populate_docker_and_focus(&mut app, vec![make_container("a", "a", "running")]);
         app.handle_event(AppEvent::StdinChunk(b"/abc".to_vec()));
         assert_eq!(app.docker.filter, "abc");
         app.handle_event(AppEvent::StdinChunk(b"\x7f".to_vec()));
         assert_eq!(app.docker.filter, "ab");
-        app.handle_event(AppEvent::StdinChunk(b"\x08".to_vec())); // legacy backspace
+        app.handle_event(AppEvent::StdinChunk(b"\x08".to_vec()));
         assert_eq!(app.docker.filter, "a");
     }
 
     #[test]
     fn daemon_error_envelope_routes_to_show_toast() {
-        let mut app = pane_app();
+        let mut app = test_app();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Error(ErrorInfo {
@@ -1161,15 +1103,12 @@ mod tests {
                 } if message.contains("disk full")
             )
         });
-        assert_eq!(
-            toast_count, 1,
-            "Payload::Error must produce a ShowToast with ToastKind::Error carrying the message"
-        );
+        assert_eq!(toast_count, 1);
     }
 
     #[test]
     fn docker_action_result_failure_routes_to_show_toast() {
-        let mut app = pane_app();
+        let mut app = test_app();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::DockerActionResult(DockerActionResult {
@@ -1191,20 +1130,15 @@ mod tests {
                 } if message.contains("container not running")
             )
         });
-        assert_eq!(
-            toast_count, 1,
-            "DockerActionResult::Failure must surface as an error toast; \
-             silently dropping action failures would leave the user with no feedback"
-        );
+        assert_eq!(toast_count, 1);
     }
 
     #[test]
     fn docker_action_result_success_does_not_toast_yet() {
-        // Success toasts are wired in C3 (they need pending_actions to
-        // reference what the user acted on, e.g. "Restarted nginx").
-        // In C2 the App has no actions in flight, so Success must be a
-        // no-op rather than a bare "action succeeded" toast.
-        let mut app = pane_app();
+        // Success toasts are C3 — they need pending_actions to name
+        // what the user acted on ("Restarted nginx"). In C1.5 no
+        // success branch.
+        let mut app = test_app();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::DockerActionResult(DockerActionResult {
@@ -1218,42 +1152,44 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .all(|a| !matches!(a, AppAction::ShowToast { .. })),
-            "no ShowToast for Success in C2 — C3 wires this with pending_actions context"
+                .all(|a| !matches!(a, AppAction::ShowToast { .. }))
         );
     }
 
     #[test]
-    fn pane_output_in_pane_mode_emits_writestdout() {
-        let mut app = pane_app();
-        let pane_sub = pane_subscription_id_after_init(&mut app);
+    fn pane_output_feeds_vt100_parser_and_emits_drawframe() {
+        let mut app = test_app();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
-                subscription_id: pane_sub,
+                subscription_id: app.pane_sub,
                 event: Event::PaneOutput {
                     data: b"hello".to_vec(),
                 },
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        // vt100 received the bytes: first cell should now be 'h'.
+        let cell = app
+            .pty_parser
+            .screen()
+            .cell(0, 0)
+            .expect("cell (0,0) exists");
         assert_eq!(
-            count(
-                &actions,
-                |a| matches!(a, AppAction::WriteStdout(d) if d == b"hello")
-            ),
-            1
+            cell.contents(),
+            "h",
+            "PaneOutput bytes must flow into the vt100 parser"
         );
+        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
     }
 
     #[test]
-    fn pane_snapshot_in_pane_mode_emits_writestdout() {
-        let mut app = pane_app();
-        let pane_sub = pane_subscription_id_after_init(&mut app);
+    fn pane_snapshot_feeds_vt100_parser() {
+        let mut app = test_app();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
-                subscription_id: pane_sub,
+                subscription_id: app.pane_sub,
                 event: Event::PaneSnapshot {
                     scrollback: b"replayed".to_vec(),
                     rows: 24,
@@ -1262,46 +1198,18 @@ mod tests {
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
-        assert_eq!(
-            count(
-                &actions,
-                |a| matches!(a, AppAction::WriteStdout(d) if d == b"replayed")
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn pane_output_in_scope_mode_is_dropped() {
-        let mut app = pane_app();
-        let pane_sub = pane_subscription_id_after_init(&mut app);
-        app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
-        let env = Envelope {
-            version: PROTOCOL_VERSION,
-            payload: Payload::Event(EventFrame {
-                subscription_id: pane_sub,
-                event: Event::PaneOutput {
-                    data: b"in-scope-mode".to_vec(),
-                },
-            }),
-        };
-        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
-        assert_eq!(
-            count(&actions, |a| matches!(a, AppAction::WriteStdout(_))),
-            0,
-            "PaneOutput while in Scope mode must be dropped (no WriteStdout). \
-             The synthetic re-attach on Scope→Pane replays from the daemon's ring buffer."
-        );
+        let cell = app.pty_parser.screen().cell(0, 0).unwrap();
+        assert_eq!(cell.contents(), "r");
+        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
     }
 
     #[test]
     fn pane_exit_event_emits_pane_exited_detach() {
-        let mut app = pane_app();
-        let pane_sub = pane_subscription_id_after_init(&mut app);
+        let mut app = test_app();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
-                subscription_id: pane_sub,
+                subscription_id: app.pane_sub,
                 event: Event::PaneExit {
                     exit_code: Some(42),
                 },
@@ -1315,16 +1223,13 @@ mod tests {
                     exit_code: Some(42)
                 })
             )),
-            1,
-            "PaneExit must carry the exit code through DetachReason — \
-             without it, the user can't tell why the session ended."
+            1
         );
     }
 
     #[test]
     fn stale_subscription_event_is_dropped() {
-        let mut app = pane_app();
-        pane_subscription_id_after_init(&mut app);
+        let mut app = test_app();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
@@ -1335,54 +1240,58 @@ mod tests {
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
-        assert!(
-            actions.is_empty(),
-            "events for unknown subscription ids must be silently dropped"
-        );
-    }
-
-    #[test]
-    fn resize_forwards_to_daemon_and_redraws_only_in_scope() {
-        let mut app = pane_app();
-        let actions = app.handle_event(AppEvent::Resize {
-            rows: 30,
-            cols: 100,
-        });
-        assert_eq!(app.terminal_size, (30, 100));
-        let resize_count = count(&actions, |a| {
-            matches!(
-                a,
-                AppAction::SendEnvelope(env)
-                    if matches!(&env.payload, Payload::ResizePane { rows: 30, cols: 100, .. })
-            )
-        });
-        assert_eq!(resize_count, 1);
-        assert_eq!(
-            count(&actions, |a| matches!(a, AppAction::DrawScope)),
-            0,
-            "no DrawScope in pane mode"
-        );
-
-        app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
-        let actions = app.handle_event(AppEvent::Resize {
-            rows: 32,
-            cols: 120,
-        });
-        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawScope)), 1);
-    }
-
-    #[test]
-    fn tick_in_pane_mode_is_noop() {
-        let mut app = pane_app();
-        let actions = app.handle_event(AppEvent::Tick);
         assert!(actions.is_empty());
     }
 
     #[test]
-    fn tick_in_scope_mode_emits_drawscope() {
-        let mut app = pane_app();
-        app.handle_event(AppEvent::StdinChunk(b"\x02s".to_vec()));
+    fn resize_recomputes_layout_and_sends_resizepane_with_pty_tile_dims() {
+        let mut app = test_app();
+        let actions = app.handle_event(AppEvent::Resize {
+            rows: 50,
+            cols: 160,
+        });
+        assert_eq!(app.terminal_size, (50, 160));
+        // Layout must be recomputed for the new terminal size.
+        let pty_rect = app.view.layout.rect_of(TileId::Pty).unwrap();
+        assert_eq!(pty_rect.width, 160);
+
+        // ResizePane carries the NEW pty tile dims, not the terminal
+        // dims.
+        let (expected_rows, expected_cols) = pty_tile_dims(&app.view.layout);
+        let resize_count = count(&actions, |a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::ResizePane { rows, cols, .. }
+                        if *rows == expected_rows && *cols == expected_cols
+                    )
+            )
+        });
+        assert_eq!(resize_count, 1);
+        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
+    }
+
+    #[test]
+    fn resize_below_minimum_falls_back_to_too_small_layout() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::Resize { rows: 10, cols: 40 });
+        assert_eq!(app.view.focused, TileId::TooSmall);
+        assert_eq!(app.view.layout.tiles.len(), 1);
+    }
+
+    #[test]
+    fn tick_always_emits_drawframe() {
+        // C1.5 drops the mode-gating: the tile grid is always
+        // rendered, so every tick draws.
+        let mut app = test_app();
         let actions = app.handle_event(AppEvent::Tick);
-        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawScope)), 1);
+        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
+
+        // Focusing a scope tile doesn't change the cadence.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        let actions = app.handle_event(AppEvent::Tick);
+        assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
     }
 }

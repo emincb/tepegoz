@@ -2,19 +2,18 @@
 //!
 //! Three distinct visual states (per CTO §2 sign-off):
 //!
-//! - **Connecting** — "Connecting to docker engine…" centered. The moment
-//!   [`Subscription::Docker`] is sent, before the first event arrives.
-//! - **Available** — container table. If `containers.len() == 0` shows a
-//!   separate "No containers" empty-state (or "No containers match filter"
-//!   when the filter is narrowing nothing). Don't conflate "engine said no
-//!   containers" with "engine unavailable".
+//! - **Connecting** — "Connecting to docker engine…" centered. The
+//!   moment `Subscribe(Docker)` is sent, before the first event.
+//! - **Available** — container table. `containers.len() == 0` renders
+//!   a separate "No containers" empty-state (or "No containers match
+//!   filter" when the filter is narrowing nothing). Don't conflate
+//!   "engine said no containers" with "engine unavailable".
 //! - **Unavailable** — the structured reason from the daemon's
-//!   `DockerUnavailable` event, rendered verbatim. Multi-line; wraps.
+//!   `DockerUnavailable` event, verbatim. Multi-line; wraps.
 //!
-//! Layout: top status bar · optional filter bar · body · bottom help bar.
-//! Selected row is highlighted with reversed colors; at the table level a
-//! left marker `▶` replaces any column padding so selection is obvious
-//! even on monochrome terminals.
+//! Layout within the tile: optional filter bar · status bar · body ·
+//! help bar. The outer bordered block signals focus (bright cyan
+//! border when focused, dim gray when not).
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -26,8 +25,32 @@ use tepegoz_proto::DockerContainer;
 
 use crate::app::{DockerScope, DockerScopeState};
 
-pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>) {
-    let area = frame.area();
+pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect, focused: bool) {
+    let border_color = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let border_modifier = if focused {
+        Modifier::empty()
+    } else {
+        Modifier::DIM
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("docker")
+        .title_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(border_modifier),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
     let show_filter_bar = scope.filter_active || !scope.filter.is_empty();
 
@@ -45,7 +68,7 @@ pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>) {
             Constraint::Length(1),
         ]
     };
-    let chunks = Layout::vertical(constraints).split(area);
+    let chunks = Layout::vertical(constraints).split(inner);
 
     render_status_bar(scope, frame, chunks[0]);
 
@@ -58,10 +81,6 @@ pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>) {
 
     match &scope.state {
         DockerScopeState::Idle => {
-            // Transient: we just left scope view (switch_to_pane resets to
-            // Idle). The renderer shouldn't normally be invoked in Idle
-            // because the runtime enters Pane mode on switch_to_pane. But
-            // render something sensible in case of a race.
             render_centered(frame, body_area, "idle", Color::DarkGray);
         }
         DockerScopeState::Connecting => {
@@ -98,14 +117,14 @@ pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>) {
 
 fn render_status_bar(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect) {
     let (text, fg) = match &scope.state {
-        DockerScopeState::Idle => ("docker scope · idle".to_string(), Color::DarkGray),
-        DockerScopeState::Connecting => ("docker scope · connecting…".to_string(), Color::Yellow),
+        DockerScopeState::Idle => ("idle".to_string(), Color::DarkGray),
+        DockerScopeState::Connecting => ("connecting…".to_string(), Color::Yellow),
         DockerScopeState::Available {
             containers,
             engine_source,
         } => (
             format!(
-                "docker scope · {}/{} container(s){} · {engine_source}",
+                "{}/{} container(s){} · {engine_source}",
                 scope.visible_count(),
                 containers.len(),
                 if scope.filter.is_empty() {
@@ -116,9 +135,7 @@ fn render_status_bar(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect) {
             ),
             Color::Green,
         ),
-        DockerScopeState::Unavailable { .. } => {
-            ("docker scope · unavailable".to_string(), Color::Red)
-        }
+        DockerScopeState::Unavailable { .. } => ("unavailable".to_string(), Color::Red),
     };
     frame.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(fg))),
@@ -127,10 +144,6 @@ fn render_status_bar(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_filter_bar(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect) {
-    // "filter: <input>_" with a caret when editing; "filter: <input>" when
-    // applied but not editing. The caret is a literal underscore because
-    // ratatui's `show_cursor` relies on a full terminal cursor move that
-    // doesn't play nicely with our alt-screen setup.
     let mut spans = vec![
         Span::styled(
             "filter: ",
@@ -208,10 +221,10 @@ fn render_table(
         rows,
         [
             Constraint::Length(2),  // selection marker
-            Constraint::Length(30), // name
-            Constraint::Length(30), // image
+            Constraint::Length(20), // name
+            Constraint::Length(20), // image
             Constraint::Length(10), // state
-            Constraint::Length(22), // status
+            Constraint::Length(16), // status
             Constraint::Min(10),    // ports
         ],
     )
@@ -232,9 +245,6 @@ fn state_color(state: &str) -> Style {
 }
 
 fn format_ports(ports: &[tepegoz_proto::DockerPort]) -> String {
-    // "host:80->container:8080/tcp, 443->8443/tcp" — public mappings first,
-    // then internal-only. Keeps the table terse; the full list lives in
-    // the per-container detail view (C3).
     let mut bits: Vec<String> = Vec::new();
     for p in ports.iter().take(3) {
         if p.public_port != 0 {
@@ -263,15 +273,13 @@ fn render_centered(frame: &mut Frame<'_>, area: Rect, text: &str, color: Color) 
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )),
     ])
-    .alignment(Alignment::Center)
-    .block(Block::default().borders(Borders::ALL));
+    .alignment(Alignment::Center);
     frame.render_widget(widget, area);
 }
 
 fn render_unavailable(frame: &mut Frame<'_>, area: Rect, reason: &str) {
-    // Verbatim. The daemon's ConnectError lists every socket candidate it
-    // tried with the reason each failed — that's exactly what the user
-    // needs to see. Don't truncate, don't restyle the reason text.
+    // Verbatim. The daemon's ConnectError lists every socket
+    // candidate it tried; don't truncate — the user needs to see it.
     let widget = Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -290,12 +298,7 @@ fn render_unavailable(frame: &mut Frame<'_>, area: Rect, reason: &str) {
         )),
     ])
     .alignment(Alignment::Center)
-    .wrap(Wrap { trim: false })
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red)),
-    );
+    .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
 
@@ -303,7 +306,7 @@ fn render_help_bar(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect) {
     let help = if scope.filter_active {
         "[Enter] apply · [Esc] clear · [Backspace] delete"
     } else {
-        "[j/k] nav · [g/G] top/bot · [/] filter · [Ctrl-b a] pane · [Ctrl-b d] detach"
+        "[j/k] nav · [g/G] top/bot · [/] filter · [Ctrl-b h/j/k/l] focus · [Ctrl-b d] detach"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(help, Style::default().fg(Color::DarkGray))),
@@ -334,13 +337,25 @@ mod tests {
         }
     }
 
-    /// Helper: render and return the buffer as a `Vec<String>`, one entry
-    /// per row, with trailing whitespace trimmed so `contains` checks are
-    /// robust.
-    fn draw_and_rows(scope: &DockerScope) -> Vec<String> {
-        let backend = TestBackend::new(120, 30);
+    fn scope_with(state: DockerScopeState, filter: &str, filter_active: bool) -> DockerScope {
+        DockerScope {
+            state,
+            selection: 0,
+            filter: filter.to_string(),
+            filter_active,
+            sub_id: 42,
+        }
+    }
+
+    /// Render the docker tile into a TestBackend-backed frame, filling
+    /// the whole backend area (equivalent to the docker tile being the
+    /// only tile drawn in these focused render tests).
+    fn draw_and_rows(scope: &DockerScope, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(scope, frame)).unwrap();
+        terminal
+            .draw(|frame| render(scope, frame, Rect::new(0, 0, width, height), true))
+            .unwrap();
         let buf = terminal.backend().buffer();
         let w = buf.area.width as usize;
         (0..buf.area.height as usize)
@@ -361,62 +376,52 @@ mod tests {
 
     #[test]
     fn available_state_renders_container_table_with_names_states_and_selection_marker() {
-        let scope = DockerScope {
-            state: DockerScopeState::Available {
+        let mut scope = scope_with(
+            DockerScopeState::Available {
                 containers: vec![
-                    make_container("webapp", "nginx:latest", "running", "Up 5 minutes"),
-                    make_container("postgres-db", "postgres:14", "running", "Up 10 minutes"),
+                    make_container("webapp", "nginx:latest", "running", "Up 5 min"),
+                    make_container("postgres-db", "postgres:14", "running", "Up 10 min"),
                     make_container("stale", "alpine:latest", "exited", "Exited (0)"),
                 ],
                 engine_source: "Docker Desktop".into(),
             },
-            selection: 1,
-            filter: String::new(),
-            filter_active: false,
-            sub_id: Some(42),
-        };
-
-        let rows = draw_and_rows(&scope);
-
-        assert!(
-            any_row_contains(&rows, "webapp"),
-            "name column must contain 'webapp'. Rows: {rows:?}"
+            "",
+            false,
         );
+        scope.selection = 1;
+
+        let rows = draw_and_rows(&scope, 120, 30);
+
+        assert!(any_row_contains(&rows, "webapp"));
         assert!(any_row_contains(&rows, "postgres-db"));
         assert!(any_row_contains(&rows, "stale"));
         assert!(any_row_contains(&rows, "nginx:latest"));
         assert!(any_row_contains(&rows, "running"));
         assert!(any_row_contains(&rows, "exited"));
 
-        // Selected row (index 1 = postgres-db) must have the ▶ marker.
         let selected_row = rows
             .iter()
             .find(|r| r.contains("postgres-db"))
             .expect("postgres-db row present");
         assert!(
-            selected_row.starts_with('▶') || selected_row.contains("▶ "),
-            "selected row must start with ▶ marker; got {selected_row:?}"
+            selected_row.contains("▶ "),
+            "selected row must show ▶ marker; got {selected_row:?}"
         );
 
-        // Non-selected rows must NOT have the marker.
         let web_row = rows.iter().find(|r| r.contains("webapp")).unwrap();
         assert!(
-            !web_row.starts_with('▶'),
+            !web_row.contains("▶ "),
             "non-selected row must not show ▶ marker; got {web_row:?}"
         );
 
-        // Status bar references the engine source and the live count.
         assert!(any_row_contains(&rows, "Docker Desktop"));
         assert!(any_row_contains(&rows, "3/3"));
     }
 
     #[test]
     fn connecting_state_renders_connecting_message() {
-        let scope = DockerScope {
-            state: DockerScopeState::Connecting,
-            ..Default::default()
-        };
-        let rows = draw_and_rows(&scope);
+        let scope = scope_with(DockerScopeState::Connecting, "", false);
+        let rows = draw_and_rows(&scope, 120, 30);
         assert!(any_row_contains(&rows, "Connecting to docker engine"));
         assert!(any_row_contains(&rows, "connecting…"));
     }
@@ -424,82 +429,75 @@ mod tests {
     #[test]
     fn unavailable_state_renders_reason_verbatim() {
         let reason = "docker engine unreachable. Tried:\n  - Docker Desktop: socket file not found";
-        let scope = DockerScope {
-            state: DockerScopeState::Unavailable {
+        let scope = scope_with(
+            DockerScopeState::Unavailable {
                 reason: reason.into(),
             },
-            ..Default::default()
-        };
-        let rows = draw_and_rows(&scope);
+            "",
+            false,
+        );
+        let rows = draw_and_rows(&scope, 120, 30);
         assert!(any_row_contains(&rows, "Docker engine unavailable"));
         assert!(
             any_row_contains(&rows, "Docker Desktop: socket file not found"),
-            "Unavailable reason text must render verbatim — user needs the diagnostic. Rows: {rows:?}"
+            "Unavailable reason text must render verbatim. Rows: {rows:?}"
         );
-        // Status bar colored red (content-wise, "unavailable" present).
         assert!(any_row_contains(&rows, "unavailable"));
     }
 
     #[test]
     fn available_but_empty_shows_distinct_no_containers_message() {
-        let scope = DockerScope {
-            state: DockerScopeState::Available {
+        let scope = scope_with(
+            DockerScopeState::Available {
                 containers: Vec::new(),
                 engine_source: "Docker Desktop".into(),
             },
-            ..Default::default()
-        };
-        let rows = draw_and_rows(&scope);
+            "",
+            false,
+        );
+        let rows = draw_and_rows(&scope, 120, 30);
         assert!(any_row_contains(&rows, "No containers"));
-        // Must NOT show the Unavailable text — empty list is a distinct
-        // state from engine unreachable.
         assert!(!any_row_contains(&rows, "Docker engine unavailable"));
     }
 
     #[test]
     fn filter_that_matches_nothing_shows_no_match_message() {
-        let scope = DockerScope {
-            state: DockerScopeState::Available {
+        let scope = scope_with(
+            DockerScopeState::Available {
                 containers: vec![make_container("web", "nginx", "running", "Up")],
                 engine_source: "test".into(),
             },
-            filter: "no-such-container".into(),
-            filter_active: false,
-            selection: 0,
-            sub_id: None,
-        };
-        let rows = draw_and_rows(&scope);
+            "no-such-container",
+            false,
+        );
+        let rows = draw_and_rows(&scope, 120, 30);
         assert!(any_row_contains(&rows, "No containers match filter"));
-        // Filter bar shows the active filter.
         assert!(any_row_contains(&rows, "filter: no-such-container"));
     }
 
     #[test]
     fn filter_bar_shows_caret_when_active() {
-        let scope = DockerScope {
-            state: DockerScopeState::Available {
+        let scope = scope_with(
+            DockerScopeState::Available {
                 containers: vec![make_container("web", "nginx", "running", "Up")],
                 engine_source: "test".into(),
             },
-            filter: "we".into(),
-            filter_active: true,
-            selection: 0,
-            sub_id: None,
-        };
-        let rows = draw_and_rows(&scope);
+            "we",
+            true,
+        );
+        let rows = draw_and_rows(&scope, 120, 30);
         let filter_row = rows.iter().find(|r| r.contains("filter:")).unwrap();
         assert!(
-            filter_row.contains("we_") || filter_row.ends_with("we_"),
+            filter_row.contains("we_"),
             "active filter must end with the caret `_`; got {filter_row:?}"
         );
     }
 
     #[test]
     fn ports_column_shows_public_and_internal_mappings() {
-        // Wider TestBackend for this test: the full port formatting
-        // ("0.0.0.0:80→8080/tcp, 9090/tcp") needs more than 120 cols after
-        // the fixed-width NAME + IMAGE + STATE + STATUS columns consume
-        // their share. 180 is realistic for a side-monitor terminal.
+        // 180×20 backend for this test — the port formatting needs
+        // more columns after NAME/IMAGE/STATE/STATUS consume their
+        // fixed shares.
         let c = DockerContainer {
             id: "id".into(),
             names: vec!["/web".into()],
@@ -525,16 +523,41 @@ mod tests {
             ],
             labels: Vec::new(),
         };
-        let scope = DockerScope {
-            state: DockerScopeState::Available {
+        let scope = scope_with(
+            DockerScopeState::Available {
                 containers: vec![c],
                 engine_source: "test".into(),
             },
-            ..Default::default()
-        };
-        let backend = TestBackend::new(180, 20);
+            "",
+            false,
+        );
+        let rows = draw_and_rows(&scope, 180, 20);
+        let web_row = rows
+            .iter()
+            .find(|r| r.contains("/web"))
+            .expect("web row present");
+        assert!(
+            web_row.contains("80") && web_row.contains("8080"),
+            "public port mapping must render; got {web_row:?}"
+        );
+        assert!(
+            web_row.contains("9090/tcp"),
+            "internal-only port must render as `9090/tcp`; got {web_row:?}"
+        );
+    }
+
+    #[test]
+    fn unfocused_border_is_dimmed() {
+        // Smoke test: rendering with focused=false doesn't panic and
+        // still shows content. Full visual distinction is a manual
+        // check — TestBackend doesn't preserve color attributes in
+        // symbols, but we can verify the structure.
+        let scope = scope_with(DockerScopeState::Connecting, "", false);
+        let backend = TestBackend::new(60, 15);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(&scope, frame)).unwrap();
+        terminal
+            .draw(|frame| render(&scope, frame, Rect::new(0, 0, 60, 15), false))
+            .unwrap();
         let buf = terminal.backend().buffer();
         let w = buf.area.width as usize;
         let rows: Vec<String> = (0..buf.area.height as usize)
@@ -547,17 +570,10 @@ mod tests {
                     .to_string()
             })
             .collect();
-        let web_row = rows
-            .iter()
-            .find(|r| r.contains("/web"))
-            .expect("web row present");
+        assert!(rows[0].contains('─'), "top border must still be drawn");
         assert!(
-            web_row.contains("80") && web_row.contains("8080"),
-            "public port mapping must be rendered; got {web_row:?}"
-        );
-        assert!(
-            web_row.contains("9090/tcp"),
-            "internal-only port must render as `9090/tcp`; got {web_row:?}"
+            rows.iter().any(|r| r.contains("Connecting")),
+            "content must still render when unfocused"
         );
     }
 }
