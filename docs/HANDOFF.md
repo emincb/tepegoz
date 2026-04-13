@@ -61,11 +61,21 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## Engineer section
 
-**Last updated:** 2026-04-14, post-C3b land.
+**Last updated:** 2026-04-14, post-C3c land.
 
 ### Where I left off
 
-C3a + C3b shipped. Two commits on `main`. C3b is one commit: CTO push-back cleanup (R/S aliases removed; K/X absorption during confirm; strengthened 10 s test; capital-R no-op test) + logs panel body. 164 tests green, fmt + clippy clean.
+C3a + C3b + C3c shipped. Three commits on `main`. C3c is one commit: the integration test + 9-scenario manual demo script. 165 tests green, fmt + clippy clean.
+
+C3c covers:
+
+- New integration test `crates/tepegoz-core/tests/docker_scope.rs::restart_propagates_to_follow_up_container_list`. Opt-in `TEPEGOZ_DOCKER_TEST=1`. Provisions a unique-per-PID alpine container, connects a client, subscribes to `Docker`, captures pre-restart (state, status), sleeps 2 s so "Up N seconds" advances visibly, sends `DockerAction::Restart` with a known `request_id`, then drains events until (a) matching `DockerActionResult::Success` AND (b) a post-Success ContainerList shows `state != pre_state || status != pre_status`. Force-removes on Drop. Verified locally against Docker Desktop in ~6 s. CI runs with the env var unset so it skips cleanly.
+- Fully rewritten `docs/OPERATIONS.md` "Slice C3 manual demo prep" — 9 scenarios + pass/fail matrix. Replaces the stub Step 7 from the C1.5c section.
+- `docs/STATUS.md` gets a new "Phase 3 polish candidates" section recording the three CTO-flagged non-urgent follow-ups (bounded `tail_lines` default, logs tile zoom, color palette feedback revisit).
+
+C3a + C3b recap still valid — see commit `8a9176c` (C3a) and `fc5ded4` (C3b) for full scope. The TUI has: r/s immediate dispatch, K/X inline confirm modal with K→K absorption, pending-action 30 s timeout sweep, toast overlay (stack of 3, drop-oldest, per-kind auto-dismiss), logs panel as Docker-tile sub-state with DockerStreamEnded handling + read-only transcript.
+
+Test count: 165 (C3b was 164; +1 for the C3c integration test). Lib tests unchanged from C3b's 130.
 
 C3b body covers:
 
@@ -83,14 +93,15 @@ Test count: 164 (up from 143). tepegoz-tui lib tests: 130 (app 69, scope::docker
 
 ### What I'm mid-flight on
 
-_Nothing._ Waiting on CTO review of C3b before starting C3c.
+_Nothing._ Waiting on CTO review of C3c. After sign-off, the user runs the manual demo in a real terminal to close Phase 3.
 
 ### What I'm expecting from the CTO next
 
-- Sign-off on C3b or redirect.
-- If signed off: authorize C3c (end-to-end integration test + manual demo script). My implementation sketch:
-  - New opt-in test `crates/tepegoz-core/tests/docker_action_e2e.rs` or extension to `docker_scope.rs`: gated on `TEPEGOZ_DOCKER_TEST=1`, provisions a unique-per-PID alpine container (reusing the existing `sleep 120` pattern from Slice B's end-to-end), opens a daemon, connects a client, sends `Payload::DockerAction(DockerActionRequest { kind: Restart, ... })`, awaits `DockerActionResult::Success` with matching request_id, then awaits the next `ContainerList` and asserts the provisioned container shows the expected state (still `running`, but with an updated `status` timestamp reflecting the restart). Force-remove on Drop so panics don't leak.
-  - Add the C3 manual-demo script to `docs/OPERATIONS.md`: cover (1) r/s immediate dispatch + Success toast; (2) K/X confirm flow including K→K absorption (new test case for the user to eyeball); (3) Failure toast verbatim text (stop a docker container, then `r` to trigger an error); (4) Timeout toast by killing docker mid-action; (5) Toast stacking + drop-oldest visual; (6) Logs panel: `l` enters, see tail update live, `k`/`PgUp` scrolls, `G` returns; (7) Stream-ended marker by stopping a container while in logs view.
+- Sign-off on C3c or redirect on the integration-test shape / demo-script contents.
+- User runs the 9-scenario manual demo in a real terminal. Pass/fail matrix in `docs/OPERATIONS.md` "Slice C3 manual demo prep". Scenarios 1–8 gate Phase 3 close; scenario 9 (tile-sized logs sanity) is observational.
+- If user signs off on 1–8: Phase 3 row in `docs/STATUS.md` goes ✅. Any gotchas from scenario 9 land in `docs/ISSUES.md` as a Phase-3-polish item; not a blocker.
+- Then Slice D design pass (the blocker before any Slice D code can start — fixed layout has exactly one pty tile, so "DockerExec → new pane" is architecturally non-trivial; CTO has three candidate approaches he wants to run a design pass on before approving implementation).
+- Phase 4 (Ports + Processes panels) is the natural next phase once Phase 3 closes. Tiles already exist as placeholders in the god-view layout; the subscription pattern is mature. Should be the smoothest phase yet if we stick to the form.
 
 ### Anything that would surprise a fresh-me
 

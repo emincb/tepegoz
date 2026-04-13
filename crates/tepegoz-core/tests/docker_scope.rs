@@ -629,6 +629,198 @@ async fn docker_scope_lists_provisioned_container_within_2s() {
     daemon_handle.abort();
 }
 
+/// Slice C3c acceptance: a client-initiated `Restart` must produce
+/// `DockerActionResult::Success` with matching `request_id` AND the
+/// daemon's next `ContainerList` must reflect the restart — the
+/// container's `state` / `status` shift from the pre-restart
+/// snapshot. This pins the full round-trip: TUI → DockerAction →
+/// daemon → engine → Success → next refresh → visible state change.
+/// If the daemon's `Subscribe(Docker)` poller didn't repoll after an
+/// action completed, the list would go stale and this would fail;
+/// if `DockerAction` dispatch didn't correlate `request_id`, the
+/// client would never know its action succeeded. Both failure modes
+/// pass the unit tests and fail here.
+///
+/// We allow either a `status` string change (the common case —
+/// Docker's "Up N seconds" resets to "Up Less than a second" on
+/// Restart, which is deterministically a different string after the
+/// pre-restart sleep) or a `state` change (caught mid-restart:
+/// "restarting" / "created" briefly) — both prove the daemon
+/// refreshed after the action and the list is not stale.
+///
+/// Opt-in via `TEPEGOZ_DOCKER_TEST=1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_propagates_to_follow_up_container_list() {
+    if std::env::var("TEPEGOZ_DOCKER_TEST").ok().as_deref() != Some("1") {
+        eprintln!("skipping: set TEPEGOZ_DOCKER_TEST=1 to enable (requires running docker)");
+        return;
+    }
+
+    let container_name = format!("tepegoz-c3c-{}", std::process::id());
+    let run = std::process::Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &container_name,
+            "alpine:latest",
+            "sleep",
+            "120",
+        ])
+        .output()
+        .expect("docker run");
+    assert!(
+        run.status.success(),
+        "docker run failed: stderr={:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let container_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(!container_id.is_empty(), "docker run returned no id");
+
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+    let _cleanup = Cleanup(container_name.clone());
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock_path = tmp.path().join("daemon.sock");
+    let config = tepegoz_core::DaemonConfig {
+        socket_path: Some(sock_path.clone()),
+    };
+    let daemon_handle = tokio::spawn(async move {
+        tepegoz_core::run_daemon(config).await.expect("daemon ran");
+    });
+    wait_for_socket(&sock_path, Duration::from_secs(5)).await;
+
+    let (mut r, mut w) = connect(&sock_path).await;
+
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::Docker { id: DOCKER_SUB_ID }),
+        },
+    )
+    .await
+    .expect("subscribe");
+
+    // Snapshot the pre-restart state + status of our container from the
+    // first ContainerList that mentions it.
+    let (pre_state, pre_status) = loop {
+        let env = tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut r))
+            .await
+            .expect("initial ContainerList must arrive within 5 s")
+            .expect("read");
+        if let Payload::Event(EventFrame {
+            subscription_id: DOCKER_SUB_ID,
+            event: Event::ContainerList { containers, .. },
+        }) = env.payload
+        {
+            if let Some(c) = containers.iter().find(|c| {
+                c.names
+                    .iter()
+                    .any(|n| n.trim_start_matches('/') == container_name)
+            }) {
+                assert_eq!(
+                    c.state, "running",
+                    "container must be running pre-restart, got {:?}",
+                    c.state
+                );
+                break (c.state.clone(), c.status.clone());
+            }
+        }
+    };
+
+    // Let the "Up N seconds" counter tick up so it visibly differs from
+    // the post-restart reset (pre-restart ~Up 2s, post-restart ~Up
+    // Less than a second).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerAction(DockerActionRequest {
+                request_id: ACTION_REQ_ID,
+                container_id: container_id.clone(),
+                kind: DockerActionKind::Restart,
+            }),
+        },
+    )
+    .await
+    .expect("send action");
+
+    // Read until DockerActionResult::Success for our request_id, then
+    // keep reading until a fresh ContainerList shows a shifted
+    // state/status for our container. 30 s budget covers (1) the
+    // restart itself (usually <1 s for alpine sleep), (2) the daemon's
+    // next Docker poll (every 2 s), (3) CI variance.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut got_success = false;
+    let mut post_reflected = false;
+    while tokio::time::Instant::now() < deadline && (!got_success || !post_reflected) {
+        let Ok(Ok(env)) = tokio::time::timeout(Duration::from_secs(3), read_envelope(&mut r)).await
+        else {
+            continue;
+        };
+        match env.payload {
+            Payload::DockerActionResult(res) if res.request_id == ACTION_REQ_ID => {
+                assert_eq!(res.container_id, container_id);
+                assert_eq!(res.kind, DockerActionKind::Restart);
+                match res.outcome {
+                    DockerActionOutcome::Success => got_success = true,
+                    DockerActionOutcome::Failure { reason } => {
+                        panic!("Restart of {container_name} failed: {reason}")
+                    }
+                }
+            }
+            Payload::Event(EventFrame {
+                subscription_id: DOCKER_SUB_ID,
+                event: Event::ContainerList { containers, .. },
+            }) => {
+                // Only count ContainerLists that come AFTER the Success
+                // result. Before Success, the list is still "pre" —
+                // any shift there would be spurious (e.g. the daemon's
+                // 2 s refresh tick firing between our subscribe and
+                // the action).
+                if !got_success {
+                    continue;
+                }
+                if let Some(c) = containers.iter().find(|c| {
+                    c.names
+                        .iter()
+                        .any(|n| n.trim_start_matches('/') == container_name)
+                }) {
+                    if c.state != pre_state || c.status != pre_status {
+                        post_reflected = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        got_success,
+        "DockerActionResult::Success for request_id {ACTION_REQ_ID} never arrived"
+    );
+    assert!(
+        post_reflected,
+        "follow-up ContainerList never reflected the Restart: \
+         pre=(state={pre_state:?}, status={pre_status:?}) but no subsequent \
+         list showed a shift for {container_name:?}. Either the daemon's \
+         poller didn't repoll after the action, or the action didn't hit \
+         the engine at all."
+    );
+
+    daemon_handle.abort();
+}
+
 // ---- helpers ----
 
 /// Read events on the connection until one references `target_sub_id`,

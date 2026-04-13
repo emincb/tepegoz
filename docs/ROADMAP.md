@@ -248,9 +248,9 @@ Full script in `docs/OPERATIONS.md` "Slice C manual demo prep".
 - Add to `crates/tepegoz-core/tests/docker_scope.rs` a TUI-driver test that spawns the daemon, runs a scripted `App` (no terminal) through "subscribe → receive ContainerList → press r → receive DockerActionResult". Bypasses crossterm but exercises the entire wire path.
 - **Manual demo (per CTO §7 sign-off, including new Step 10):** start daemon + TUI; switch to scope (`Ctrl-b s`); see container table; navigate (j/k); filter (`/`); switch back to pane (`Ctrl-b a`); verify vim-preservation; detach + reattach (`Ctrl-b d`, `tepegoz tui`); **kill the docker daemon, verify scope view transitions to Unavailable within ~5 s without crashing the TUI; restart docker, verify scope view recovers**. Standing victim-container snippet in `docs/OPERATIONS.md`.
 
-#### Slice C3 — Action keybinds + toasts + logs panel · 🟠 (C3a + C3b landed; C3c pending)
+#### Slice C3 — Action keybinds + toasts + logs panel · 🟡 (C3a + C3b + C3c landed; user manual demo pending)
 
-Lands as three sub-commits per CTO sign-off: **C3a** (actions + confirm modal + toasts + timeout sweep), **C3b** (logs panel sub-state inside the Docker tile + C3a style-cleanup: R/S aliases removed + K/X absorption behavior), **C3c** (end-to-end Restart test + manual demo).
+Lands as three sub-commits per CTO sign-off: **C3a** (actions + confirm modal + toasts + timeout sweep), **C3b** (logs panel sub-state inside the Docker tile + C3a style-cleanup: R/S aliases removed + K/X absorption behavior), **C3c** (end-to-end Restart round-trip test + 9-scenario manual demo script).
 
 **C3a scope (delivered).**
 - `r` restart (immediate; recoverable) and `s` stop (immediate; recoverable) dispatch `DockerAction` against the selected container on the focused Docker tile. Both also bind `R` / `S` so caps-lock doesn't silently steal the action.
@@ -275,7 +275,12 @@ Lands as three sub-commits per CTO sign-off: **C3a** (actions + confirm modal + 
 - `tepegoz-tui::scope::docker::tests` 14 (up from 11): logs view renders status + transcript + logs-mode help bar; stream-ended marker renders at the tail with the reason; confirm modal is suppressed while logs view is active.
 - Combined: `cargo fmt --all` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` 164 passed / 0 failed.
 
-**C3c acceptance tests (pending).** End-to-end integration test per CTO §C3c; manual demo script in `docs/OPERATIONS.md`.
+**C3c acceptance tests (delivered).**
+- `crates/tepegoz-core/tests/docker_scope.rs::restart_propagates_to_follow_up_container_list` — opt-in `TEPEGOZ_DOCKER_TEST=1`. Provisions a unique-per-PID alpine container, subscribes to Docker, snapshots pre-restart `state`/`status`, sleeps 2 s to let "Up N seconds" advance so the post-restart reset is observably different, sends `DockerAction::Restart` with a known `request_id`, asserts matching `DockerActionResult::Success` (panics with the engine's reason on `Failure`), then asserts a subsequent `ContainerList` (post-Success only — pre-Success lists are "pre" and any shift there is spurious) shows `state != pre_state || status != pre_status`. Force-removes on `Drop` so panics don't leak. Verified locally against Docker Desktop (~6 s run time). This is the full round-trip pin: client → daemon socket → DockerAction → engine → DockerActionResult::Success → next daemon poll → ContainerList reflects the restart. If the daemon's `Subscribe(Docker)` poller didn't repoll after an action, or if `request_id` correlation broke, this test fails where the unit tests pass.
+- **Manual demo** in `docs/OPERATIONS.md` "Slice C3 manual demo prep": 9 scenarios with a pass/fail matrix covering `r`/`s` dispatch + Success toast, capital-`R` no-op (case-discipline lock), `K`/`X` confirm flow including K→K absorption, Failure toast verbatim reason, 30 s pending-action timeout, toast stacking + drop-oldest, logs panel entry/tail/scroll/exit, `DockerStreamEnded` marker, and a tile-sized logs sanity check. Scenarios 1–8 gate Phase 3 close; scenario 9 is observational (any gotchas → `docs/ISSUES.md` as Phase-3-polish, does NOT block Phase 3 close).
+- Combined: `cargo fmt --all` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` 165 passed / 0 failed.
+
+**Gate.** CI green on macOS + ubuntu-latest, then CTO reviews the integration-test shape + demo script. User runs the manual demo in a real terminal with the pass/fail matrix. If scenarios 1–8 sign off, Phase 3 row in `docs/STATUS.md` goes ✅.
 
 ### Slice D — `DockerExec` → new pty pane · ⚪
 

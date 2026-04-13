@@ -198,21 +198,256 @@ to a single bordered "Terminal too small for god view — Resize to at
 least 80×24" tile. Resize back up; the god view reappears with PTY
 focused and all state preserved.
 
-**Step 7 — C3 keybinds** (enabled only after Slice C3 lands):
-
-```
-l       → open logs panel for selected row; tick-N output streams
-r       → restart selected container; toast confirms; table updates ~2s
-s       → stop selected container; toast confirms
-K, y    → kill with confirm; n cancels
-X, y    → force-remove with confirm; n cancels
-Enter   → exec into container (Slice D; opens new pane)
-```
-
 ### Tear down
 
 ```sh
 docker rm -f tepegoz-slice-c-victim
+```
+
+## Slice C3 manual demo prep (Phase 3)
+
+C3 adds action keybinds (`r`/`s`/`K`/`X`), the toast overlay, pending-action timeout sweep, and the logs sub-state inside the Docker tile. Automated coverage is in `tepegoz-tui::app::tests` + `tepegoz-tui::scope::docker::tests` + `tepegoz-tui::toast::tests` (hermetic) and `crates/tepegoz-core/tests/docker_scope.rs::restart_propagates_to_follow_up_container_list` (opt-in `TEPEGOZ_DOCKER_TEST=1`, end-to-end). This section is the real-terminal eyeball check the user runs before Phase 3 closes.
+
+### Prep
+
+Reuse the standing victim from C1.5c if still running, or provision fresh:
+
+```sh
+docker run -d --name tepegoz-slice-c-victim alpine sh -c \
+  "i=0; while true; do echo tick-\$i; i=\$((i+1)); sleep 1; done"
+
+# Second victim — short-lived, for the stream-ended demo (Step 8).
+docker run -d --name tepegoz-stream-ended-victim alpine sh -c \
+  "echo hello; sleep 3"
+
+cargo build
+./target/debug/tepegoz daemon    # terminal 1
+./target/debug/tepegoz tui        # terminal 2
+# → Ctrl-b j to focus the Docker tile; the victims should appear.
+```
+
+### Demo sequence
+
+**Step 1 — `r` / `s` immediate dispatch + Success toast.**
+
+```
+# Focus Docker; select the tick-victim row (j/k to move ▶).
+r                    # immediate Restart
+# → expect: a green "ok: Restart tepegoz-slice-c-victim — succeeded"
+#   toast appears as a 1-line strip just above the Claude Code tile.
+#   Auto-dismiss after ~3 s. The Docker table continues ticking; the
+#   container's "STATUS" column shifts (e.g. "Up 12 seconds" → "Up
+#   Less than a second") on the next ~2 s refresh.
+s                    # immediate Stop
+# → expect: another green toast for the Stop. The table shows the
+#   container in "exited" state on the next refresh. Run
+#   `docker start tepegoz-slice-c-victim` in terminal 3 to bring it
+#   back for the remaining steps.
+```
+
+**Step 2 — capital `R` is a no-op (case-discipline lock).**
+
+```
+# With the tick-victim selected and Docker tile focused:
+<Shift>r             # press capital R
+# → expect: NOTHING. No toast, no modal, no envelope to the daemon.
+#   Case-discipline rule: capital = destructive (K/X only); lowercase
+#   = safe (r/s) and navigation (j/k/h/l). The previous C3a aliases
+#   (r|R, s|S) were removed per push-back. Verified by
+#   capital_r_is_noop_when_docker_focused_after_case_discipline_lock
+#   in the state-machine tests; this is the real-terminal confirmation.
+```
+
+**Step 3 — `K` / `X` confirm modal + K→K absorption.**
+
+```
+# With tick-victim selected:
+K                    # capital K
+# → expect: a centered bordered box appears inside the Docker tile's
+#   Rect (NOT full-screen) with " confirm " in the title, "Kill
+#   container tepegoz-slice-c-victim?" body, "[y] confirm · any
+#   other key cancels" hint. The pty tile + placeholder tiles stay
+#   visible and live around it. Help bar swaps to the confirm-mode
+#   hint.
+
+K                    # press K AGAIN while the Kill modal is open
+# → expect: ABSORBED. The modal stays showing the original Kill
+#   confirm (same container, same deadline — the 10 s auto-cancel
+#   does NOT reset). Per C3b UX clarification: K/X during an open
+#   confirm must not switch the target or refresh the deadline.
+
+X                    # try X (the other destructive key)
+# → expect: also ABSORBED. Modal still shows "Kill container …?",
+#   not "Remove container …?".
+
+n                    # cancel
+# → expect: modal disappears, no envelope sent. (Also test: Esc
+#   cancels; any arbitrary non-y/K/X key cancels.)
+
+# Now exercise the actual confirm-and-dispatch:
+X                    # open Remove confirm
+y                    # confirm
+# → expect: toast "ok: Remove tepegoz-slice-c-victim — succeeded",
+#   container vanishes from the table on the next refresh.
+```
+
+**Step 4 — Failure toast with verbatim engine reason.**
+
+Requires a container that refuses the action. Stop the engine
+briefly to force the Failure path:
+
+```
+# Terminal 3: start a fresh victim, then IMMEDIATELY stop docker.
+docker run -d --name tepegoz-fail-victim alpine sleep 120
+# macOS Docker Desktop: menu → Quit
+# macOS Colima:          colima stop
+# Linux:                 sudo systemctl stop docker
+
+# In the TUI (Docker tile will swap to Unavailable within ~5 s; wait
+# for it, then restart docker so the list repopulates).
+# Start docker. Wait for the tile to recover.
+# Focus Docker, select tepegoz-fail-victim, then FORCE a failure
+# by killing docker AGAIN between the selection and the keypress:
+# (this is the race — if the engine vanishes mid-action.)
+
+# Or the simpler way: `docker rm -f tepegoz-fail-victim` from the
+# outside, then in the TUI press `r` against the now-gone row
+# (the list may still show it for up to 2 s until the next refresh).
+docker rm -f tepegoz-fail-victim
+# In the TUI, with the stale row still selected:
+r
+# → expect: red "err: Restart tepegoz-fail-victim failed: <engine
+#   reason>" toast. The reason text is VERBATIM from dockerd ("No
+#   such container: tepegoz-fail-victim" or similar). Auto-dismiss
+#   after ~8 s (longer than Success — user needs time to read).
+```
+
+**Step 5 — 30 s pending-action timeout toast.**
+
+```
+# The daemon + engine must be reachable when the action is sent, but
+# the engine must hang or vanish between send and response. Easiest
+# way: ask for a restart of the tick-victim, then immediately SIGSTOP
+# dockerd so the action stalls. After 30 s the App emits a timeout
+# toast.
+# On macOS Colima: `pkill -STOP -x colima` (terminal 3).
+# On Linux:        `sudo pkill -STOP dockerd` (terminal 3).
+r                    # start Restart
+# → within 30 s: red "err: Restart tepegoz-slice-c-victim timed
+#   out — check engine" toast. Docker tile remains; no crash.
+#   Resume docker (`pkill -CONT …`) and verify the tile recovers.
+# Skip this step if you don't have a trivial way to stall dockerd
+# locally — the state-machine tests cover this path.
+```
+
+**Step 6 — toast stacking + drop-oldest.**
+
+```
+# Produce 4 toasts in rapid succession. Easiest: restart the
+# tick-victim three times quickly (each Success toast lasts 3 s),
+# then a 4th any action.
+r   r   r   r
+# → expect: 3 toasts visible at once, stacked bottom-aligned above
+#   the Claude Code strip. When the 4th arrives, the OLDEST (topmost
+#   in the stack) silently disappears; 3 visible again. No keystrokes
+#   blocked during this — navigation + other keybinds continue to
+#   work unhindered.
+```
+
+**Step 7 — logs panel: enter, tail, scroll, exit.**
+
+```
+# Focus Docker, select tick-victim.
+l
+# → expect: Docker tile's content swaps from the container list to
+#   a log transcript. Tile title becomes "docker · logs ·
+#   tepegoz-slice-c-victim". Status line: "N lines · tail: on ·
+#   stream: live". Help bar: "[j/k] scroll · [PgUp/PgDn] page · [G]
+#   tail · [Esc/q] back". Lines begin arriving — "tick-0", "tick-1",
+#   … one per second, auto-scrolling into view at the tail.
+
+k                    # scroll up one line
+# → expect: "tail: on" flips to "tail: off" (yellow). Scroll
+#   position holds — new tick-N lines still append to the buffer
+#   but the visible window stays put.
+
+<PageUp>             # scroll up 10 lines
+<PageDown>           # scroll down 10 lines
+# → reaching offset 0 via PgDn re-enables tail: "tail: on".
+
+G                    # jump to tail
+# → "tail: on". Live lines visible again.
+
+# Focus-persistence sanity: focus away and back.
+Ctrl-b k             # focus PTY tile
+Ctrl-b j             # focus Docker tile again
+# → expect: logs view is still there, still tailing. (Unlike the
+#   confirm modal, logs view persists across focus moves.)
+
+<Esc>                # exit logs view
+# → expect: Docker tile returns to the container list view. The
+#   App sends Unsubscribe; the daemon stops the log stream.
+# (q also exits; try it on the next entry to confirm.)
+```
+
+**Step 8 — stream-ended marker on container exit.**
+
+```
+# The second victim (tepegoz-stream-ended-victim) sleeps 3 s then
+# exits. If it's already exited from earlier, recreate:
+docker run -d --name tepegoz-stream-ended-victim alpine sh -c \
+  "echo hello; sleep 3"
+# → Immediately in the TUI: Ctrl-b j, select stream-ended-victim, l.
+# → expect: transcript shows "hello", then after ~3 s a dimmed
+#   italic line appears at the tail:
+#     — log stream ended: <reason> —
+#   Status line: "tail: off · stream: ended: <reason>". The reason
+#   is verbatim from dockerd ("container exited" or similar). The
+#   transcript stays scrollable; Esc / q returns to the list.
+```
+
+**Step 9 — tile-sized logs sanity check** (CTO addition; eyeball only):
+
+```
+# At 120×40 the Docker tile is approximately 40 cols × 17 rows. The
+# logs sub-state renders inside that tile's Rect — not full-screen.
+# Enter logs on tick-victim and verify:
+#
+# · "tick-N" lines are short and fit cleanly — should be obviously readable.
+# · Produce some longer output to stress-test wrapping. Terminal 3:
+docker exec tepegoz-slice-c-victim sh -c \
+  'echo "{\"level\":\"info\",\"msg\":\"longer line that probably overflows 40 cols for eyeball testing of the ratatui Paragraph widget\",\"ts\":\"2026-04-14T12:00:00Z\"}"'
+#
+# → expect: long line renders readably. Exact behavior is whatever
+#   ratatui's Paragraph does by default (currently: clip at right
+#   edge; no horizontal scroll; no wrap). If the result looks awful
+#   (unreadable / truncation obscures useful content), record the
+#   gotcha in docs/ISSUES.md as a Phase-3-polish item ("logs
+#   horizontal wrap or tile zoom") and proceed. Do NOT block C3
+#   close on this — Phase-3 polish candidates are listed in
+#   docs/STATUS.md's "Phase 3 polish candidates" section.
+```
+
+### Pass/fail matrix
+
+| # | Scenario | Pass |
+|---|---|---|
+| 1 | `r`/`s` immediate dispatch + green Success toast + table refresh | ☐ |
+| 2 | Capital `R` is a no-op (no toast, no modal, no envelope) | ☐ |
+| 3 | `K`/`X` open inline modal; repeat K/X absorbs; y confirms; n / Esc / other cancel | ☐ |
+| 4 | Failure toast renders verbatim dockerd reason text | ☐ |
+| 5 | 30 s pending-action timeout emits "timed out — check engine" toast | ☐ |
+| 6 | Toast stacking caps at 3; 4th drops oldest silently; keystrokes unblocked | ☐ |
+| 7 | Logs panel: enters, tails live, scrolls, `G` resets tail, Esc / q returns | ☐ |
+| 8 | `DockerStreamEnded` renders dimmed "— log stream ended: `<reason>` —" line | ☐ |
+| 9 | Tile-sized logs sanity: lines render readably in cramped Docker tile | ☐ |
+
+Sign off on rows 1–8 closes Phase 3 (row 3 in `docs/STATUS.md` → ✅). Row 9 is observational — record any gotchas in `docs/ISSUES.md` as a polish item; does NOT gate Phase 3 close.
+
+### Tear down
+
+```sh
+docker rm -f tepegoz-slice-c-victim tepegoz-stream-ended-victim 2>/dev/null
 ```
 
 ## Common issues
