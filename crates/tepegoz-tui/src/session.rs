@@ -20,14 +20,14 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use tepegoz_proto::{
     Envelope, Hello, OpenPaneSpec, PROTOCOL_VERSION, PaneInfo, Payload,
     codec::{read_envelope, write_envelope},
 };
 
-use crate::app::{App, AppAction, AppEvent, DetachReason};
+use crate::app::{App, AppAction, AppEvent, DetachReason, ToastKind};
 use crate::scope;
 use crate::terminal;
 
@@ -278,6 +278,16 @@ impl AppRuntime {
                             ExitReason::PaneExited { exit_code }
                         }
                     });
+                }
+                AppAction::ShowToast { kind, message } => {
+                    // C3 implements the actual overlay. For C2, log and
+                    // move on — the user will at least see it in
+                    // `tui.log`. Severity is kept wired through so C3
+                    // can route colors / auto-dismiss off `kind`.
+                    match kind {
+                        ToastKind::Error => warn!(%message, "toast"),
+                        ToastKind::Success | ToastKind::Info => info!(%message, "toast"),
+                    }
                 }
             }
         }

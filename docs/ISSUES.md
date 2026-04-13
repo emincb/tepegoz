@@ -6,7 +6,17 @@ Active bugs and their diagnostic state. Resolved issues archived below with fix 
 
 ## Active
 
-_None._
+### ⚠️ Vim-preservation across Scope→Pane re-attach — pending eyeball confirmation
+
+Byte-level proxy (`crates/tepegoz-core/tests/vim_preservation.rs`) passes: `PaneSnapshot` after the synthetic re-attach contains the alt-screen entry, cursor positioning, and marker text. Real-terminal confirmation happens at C2c3 manual demo (Step 1 of the demo sequence in `docs/OPERATIONS.md`).
+
+If vim breaks in a real terminal, fallback mitigations ranked by cost:
+
+1. **Resize-after-attach (cheapest).** In `App::switch_to_pane`, after the new `AttachPane`, emit a second `ResizePane` with the current dims. The pty's child receives `SIGWINCH`; vim / htop / less / tmux / anything else that tracks terminal size all redraw on `SIGWINCH`. ~3-line change, no protocol churn.
+
+2. **Keep `AttachPane` alive across mode switches (real refactor).** App keeps the pane subscription live in scope mode but drops incoming `PaneOutput` bytes on the floor instead of writing them to stdout. No synthetic re-attach needed; no scrollback re-transfer cost. Requires changing the `AppAction` set (no more `EnterPaneMode → Unsubscribe + AttachPane` on switch) and the runtime's mode-switch handling. Also requires the runtime to re-emit a synthetic "current screen" buffer on Scope→Pane to repaint whatever the screen looked like before the scope takeover. ~50-line change.
+
+Pick (1) first if eyeball fails. Only escalate to (2) if (1) doesn't fix it.
 
 ---
 

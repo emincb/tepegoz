@@ -2,7 +2,7 @@
 
 Single Rust binary that fuses pty multiplexing, SSH fleet management, Docker inspection, and port scanning into one screen. Target user runs many parallel Claude Code agents across local + remote VMs and needs a unified god view.
 
-**Current state.** Phase 3 in progress — Slices A (socket discovery + container list), B (lifecycle actions + logs streaming + container stats), C1 (TUI App + AppEvent/AppAction skeleton + view enum + scope-stub renderer), and the C2 gate (daemon Unsubscribe-of-pane-sub bug fix + vim-preservation byte-level proxy test) landed. C2 commit 2 (rendering), C2 commit 3 (end-to-end), C3 (action keybinds), D (DockerExec → new pane) outstanding. Full state in `docs/STATUS.md`; active issues in `docs/ISSUES.md`.
+**Current state.** Phase 3 in progress — Slices A (socket discovery + container list), B (lifecycle actions + logs streaming + container stats), C1 (TUI App + AppEvent/AppAction skeleton + view enum), the C2 gate (daemon Unsubscribe-of-pane-sub bug fix + vim-preservation byte-level proxy), and **C2 commit 2 (Docker scope rendering: container table + three-state lifecycle + navigation + filter + ShowToast wire)** landed. C2 commit 3 (end-to-end test + eyeball demo), C3 (action keybinds + toasts + logs panel), D (DockerExec → new pane) outstanding. Full state in `docs/STATUS.md`; active issues in `docs/ISSUES.md`.
 
 ## Repo
 

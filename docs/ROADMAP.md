@@ -142,18 +142,28 @@ Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode
 - Container table widget, three-state lifecycle visuals, navigation, filter (see C2 commit 2 scope below).
 - The 3 small test gaps (per CTO C2 first-commit list): `second_switch_to_pane_is_idempotent`, `help_in_pane_mode_is_dropped`, and the new `AppAction::ShowToast` variant for `Payload::Error` + `DockerActionResult::Failure` routing.
 
-##### C2 commit 2 — rendering work · ⚪
+##### C2 commit 2 — rendering work · ✅
 
-**Scope.**
-- Replace the C1 stub with the real container table (ratatui Table widget). Columns: NAME, IMAGE, STATE, STATUS, PORTS.
-- Wire `Subscribe(Docker)` on enter to scope view; `Unsubscribe` on leave. State transitions from `Idle → Connecting → (Available | Unavailable)`.
-- Three distinct visual states (per CTO §2 sign-off):
-  - `Connecting` — "Connecting to docker engine…" (rendered immediately on subscribe, before the first event).
-  - `Available { containers, engine_source }` — table; `containers.len() == 0` shows a separate "No containers" empty state (don't conflate with Unavailable).
-  - `Unavailable { reason }` — verbatim reason from the daemon's `DockerUnavailable`.
-- Navigation: ↑↓ / `j` `k` / `g` `G` / `Home` `End` (arrow + vi + standard, all work).
-- Filter: `/` enters filter input (free-text, matches name + image substring); `Esc` clears filter.
-- The 3 small test gaps from CTO C2 first-commit list: `second_switch_to_pane_is_idempotent`, `help_in_pane_mode_is_dropped`, and the `AppAction::ShowToast { kind, message }` variant routing `Payload::Error` + `DockerActionResult::Failure` to it (runtime stubs as `tracing::warn!` for C2; C3 implements actual overlay).
+**Delivered.**
+- `tepegoz-tui/src/app.rs` rewritten:
+  - `switch_to_scope` allocates a docker sub_id, sends `Subscribe(Docker)`, sets state to `Connecting` (immediate visual feedback — no blank-spinner window).
+  - `switch_to_pane` sends `Unsubscribe(docker_sub_id)`, resets docker state to `Idle`, clears filter + selection, then the existing synthetic pane re-attach.
+  - `handle_docker_event`: `ContainerList` → `Available { containers, engine_source }` + `clamp_selection`; `DockerUnavailable { reason }` → `Unavailable { reason }`; `DockerStreamEnded` → no-op (C3 logs/stats consumer).
+  - `AppAction::ShowToast { kind: Info|Success|Error, message }` variant. `handle_daemon_envelope` routes `Payload::Error` and `DockerActionResult::Failure` to `ToastKind::Error`; `Success` deferred to C3.
+  - `ScopeKeyParser` state machine parses ESC CSI sequences (arrows, `Home`, `End`) plus `ESC ESC` → standalone `Escape`; flushes pending lone `ESC` at end of chunk (terminal reads deliver full `ESC [ A` in one go). Navigation: ↑↓ / `j` `k` / `g` `G` / `Home` `End`. Filter: `/` activates input, typed chars append, `Backspace` trims, `Enter` commits (keeps filter), `Esc` clears (both filter text and active mode). Filter matches name + image substring, case-insensitive.
+  - `DockerScope::{ matches_filter, visible_count, clamp_selection }` helpers so the renderer doesn't duplicate logic.
+- `tepegoz-tui/src/scope/docker.rs` rewritten as the real renderer:
+  - Three-state lifecycle with distinct visuals (Connecting is yellow; Available is green-status with `▶` selection marker; Unavailable is red-bordered with verbatim reason).
+  - Empty-list state (Available but 0 visible) renders "No containers" or "No containers match filter" — explicitly distinct from Unavailable.
+  - Filter bar (top) with `filter: <text>_` caret when active.
+  - Help bar (bottom) context-aware (different hints when filter is active vs browsing).
+  - Status bar shows `visible/total container(s)` + engine source + filter note.
+  - Port column shows public mappings first, truncates to 3 + "+N" overflow.
+- `tepegoz-tui/src/session.rs`: `AppAction::ShowToast` stubbed as `tracing::warn!`/`info!` depending on severity (C3 implements the actual overlay).
+
+**Acceptance tests.**
+- 27 `tepegoz-tui::app::tests` (up from 14) including the 3 CTO-requested gaps (`second_switch_to_pane_is_idempotent`, `ctrl_b_question_in_pane_mode_is_dropped`, and the `DockerActionResult::Success does not toast yet` + `Payload::Error routes to ShowToast` pair for the ShowToast wire) plus navigation (j/k/arrows/g/G/Home/End), filter (narrow/commit/clear/backspace), and Docker subscription lifecycle (subscribe-on-enter, Unsubscribe-on-leave, state transitions).
+- 7 `tepegoz-tui::scope::docker::tests` headless render tests using `ratatui::backend::TestBackend(120×30)`: Available state renders container table with names/images/states + `▶` marker; Connecting message; Unavailable with verbatim reason; Available-but-empty shows distinct "No containers"; filter matching nothing; filter-bar caret when active; ports column renders public + internal mappings (uses 180-wide TestBackend for the port test since port strings overflow 120 cols after the fixed NAME/IMAGE/STATUS columns consume their share).
 
 ##### C2 commit 3 — end-to-end test · ⚪
 
