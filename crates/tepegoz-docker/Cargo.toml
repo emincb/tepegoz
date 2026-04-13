@@ -1,0 +1,14 @@
+[package]
+name = "tepegoz-docker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Docker scope for Tepegöz: bollard wrapper and socket discovery."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

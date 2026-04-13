@@ -1,0 +1,24 @@
+[package]
+name = "tepegoz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "God view for your fleet — single-binary dev tool combining pty multiplexing, SSH fleet management, Docker inspection, and port scanning."
+
+[[bin]]
+name = "tepegoz"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+tepegoz-core = { workspace = true }
+tepegoz-tui = { workspace = true }
+tepegoz-agent = { workspace = true }

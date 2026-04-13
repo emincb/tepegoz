@@ -1,0 +1,15 @@
+[package]
+name = "tepegoz-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ratatui-based TUI client for the Tepegöz daemon."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tepegoz-proto = { workspace = true }

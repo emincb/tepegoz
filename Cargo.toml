@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tepegoz",
+    "crates/tepegoz-proto",
+    "crates/tepegoz-core",
+    "crates/tepegoz-tui",
+    "crates/tepegoz-agent",
+    "crates/tepegoz-probe",
+    "crates/tepegoz-pty",
+    "crates/tepegoz-docker",
+    "crates/tepegoz-scan",
+    "crates/tepegoz-ssh",
+    "crates/tepegoz-transport",
+    "crates/tepegoz-record",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Emin <emincb@users.noreply.github.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/emincb/tepegoz"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# cli
+clap = { version = "4.5", features = ["derive"] }
+
+# errors
+anyhow = "1"
+thiserror = "1"
+
+# tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# internal crates
+tepegoz-proto = { path = "crates/tepegoz-proto" }
+tepegoz-core = { path = "crates/tepegoz-core" }
+tepegoz-tui = { path = "crates/tepegoz-tui" }
+tepegoz-agent = { path = "crates/tepegoz-agent" }
+tepegoz-probe = { path = "crates/tepegoz-probe" }
+tepegoz-pty = { path = "crates/tepegoz-pty" }
+tepegoz-docker = { path = "crates/tepegoz-docker" }
+tepegoz-scan = { path = "crates/tepegoz-scan" }
+tepegoz-ssh = { path = "crates/tepegoz-ssh" }
+tepegoz-transport = { path = "crates/tepegoz-transport" }
+tepegoz-record = { path = "crates/tepegoz-record" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[profile.release-agent]
+inherits = "release"
+opt-level = "z"
+lto = "fat"

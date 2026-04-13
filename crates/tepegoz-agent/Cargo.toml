@@ -1,0 +1,15 @@
+[package]
+name = "tepegoz-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tepegöz remote agent logic (invoked over SSH stdio)."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tepegoz-proto = { workspace = true }
