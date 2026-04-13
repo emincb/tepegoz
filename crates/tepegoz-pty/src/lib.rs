@@ -322,12 +322,16 @@ fn reader_loop(
             Ok(0) => break,
             Ok(n) => {
                 let bytes = Bytes::copy_from_slice(&buf[..n]);
-                {
-                    let mut sb = scrollback.lock().expect("scrollback mutex");
-                    sb.append(bytes.clone());
-                }
-                // Ignore send errors: no subscribers is normal.
+                // Hold the scrollback lock across BOTH the append and the
+                // broadcast send. Otherwise a subscriber that takes a
+                // snapshot between our unlock and our send will observe the
+                // same bytes in both snapshot and live stream — the TUI
+                // then renders them twice and glitches on attach.
+                // `broadcast::send` is non-blocking, so this is cheap.
+                let mut sb = scrollback.lock().expect("scrollback mutex");
+                sb.append(bytes.clone());
                 let _ = output_tx.send(PaneUpdate::Bytes(bytes));
+                drop(sb);
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -368,5 +372,69 @@ mod tests {
         sb.append(Bytes::from_static(b"hello "));
         sb.append(Bytes::from_static(b"world"));
         assert_eq!(&sb.snapshot()[..], b"hello world");
+    }
+
+    /// Regression for the subscribe/broadcast race.
+    ///
+    /// Drives a stream of deterministic numbered markers out of a real
+    /// `/bin/sh`, subscribes mid-stream (the race window), and asserts each
+    /// marker appears **exactly once** across (snapshot + live stream). If
+    /// the reader released the scrollback lock before broadcasting, a
+    /// subscriber taking a snapshot between those two points would see the
+    /// same bytes twice — the invariant this test enforces is that a given
+    /// byte is in exactly one of {snapshot, live} per subscriber.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_does_not_duplicate_bytes() {
+        let manager = PtyManager::new();
+        let pane = manager
+            .open(OpenSpec {
+                shell: Some("/bin/sh".into()),
+                cwd: None,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .expect("open pane");
+
+        // Let the shell come up and print its initial prompt.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // 50 markers with 5 ms between each → ~250 ms of production, plenty
+        // of race windows for a mid-stream subscriber to land in.
+        // `stty -echo` suppresses echo of future input; the command itself
+        // is still echoed once but contains the literal `${i}`, not
+        // `LINE_1_END`, so it won't contaminate our marker count.
+        pane.send_input(
+            b"stty -echo; for i in $(seq 1 50); do echo LINE_${i}_END; sleep 0.005; done; exit\n",
+        )
+        .expect("send_input");
+
+        // Subscribe mid-stream.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (snap, mut rx) = pane.subscribe();
+        let mut all = snap.to_vec();
+
+        loop {
+            match rx.recv().await {
+                Ok(PaneUpdate::Bytes(b)) => all.extend_from_slice(&b),
+                Ok(PaneUpdate::Exit { .. }) => break,
+                Err(_) => break,
+            }
+        }
+
+        for i in 1..=50 {
+            let needle = format!("LINE_{i}_END");
+            let count = all
+                .windows(needle.len())
+                .filter(|w| *w == needle.as_bytes())
+                .count();
+            assert_eq!(
+                count, 1,
+                "{needle} appeared {count} times (expected exactly 1). \
+                 A count > 1 indicates the scrollback/broadcast race \
+                 duplicated bytes across snapshot and live stream."
+            );
+        }
     }
 }
