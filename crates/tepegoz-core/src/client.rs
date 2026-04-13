@@ -13,7 +13,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::AbortHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -109,7 +109,13 @@ async fn session(
         }),
     })?;
 
-    let mut pane_subs: JoinSet<()> = JoinSet::new();
+    // Both pane and docker subscriptions live in HashMap<id, AbortHandle> so
+    // `Unsubscribe { id }` can cancel either kind by id. Until C2 / Slice C1
+    // landed we tracked pane subs in a `JoinSet<()>` with no per-id key, so
+    // `Unsubscribe` of a pane sub silently no-op'd. The C1 TUI's synthetic
+    // re-attach (Unsubscribe(prev_pane_sub) + AttachPane(new_pane_sub) on
+    // Scope→Pane switch) was leaking one zombie forwarder per mode switch.
+    let mut pane_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut docker_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut status_sub: Option<u64> = None;
     let mut ticker = tokio::time::interval(Duration::from_millis(1000));
@@ -146,7 +152,9 @@ async fn session(
         }
     };
 
-    pane_subs.abort_all();
+    for (_, handle) in pane_subs.drain() {
+        handle.abort();
+    }
     for (_, handle) in docker_subs.drain() {
         handle.abort();
     }
@@ -177,7 +185,7 @@ async fn handle_command(
     state: &Arc<SharedState>,
     event_tx: &mpsc::UnboundedSender<Envelope>,
     status_sub: &mut Option<u64>,
-    pane_subs: &mut JoinSet<()>,
+    pane_subs: &mut HashMap<u64, AbortHandle>,
     docker_subs: &mut HashMap<u64, AbortHandle>,
 ) -> anyhow::Result<()> {
     match payload {
@@ -255,6 +263,9 @@ async fn handle_command(
             if let Some(handle) = docker_subs.remove(&id) {
                 handle.abort();
             }
+            if let Some(handle) = pane_subs.remove(&id) {
+                handle.abort();
+            }
         }
 
         Payload::OpenPane(spec) => {
@@ -294,10 +305,18 @@ async fn handle_command(
             subscription_id,
         } => match state.pty.get(pane_id).await {
             Some(pane) => {
+                if let Some(prev) = pane_subs.remove(&subscription_id) {
+                    debug!(
+                        subscription_id,
+                        "replacing existing pane attachment on same id"
+                    );
+                    prev.abort();
+                }
                 let tx = event_tx.clone();
-                pane_subs.spawn(async move {
+                let handle = tokio::spawn(async move {
                     forward_pane(pane, subscription_id, tx).await;
                 });
+                pane_subs.insert(subscription_id, handle.abort_handle());
             }
             None => {
                 event_tx.send(error_envelope(

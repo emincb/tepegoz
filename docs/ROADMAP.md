@@ -129,7 +129,20 @@ Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode
 
 **Not in this slice.** Scope rendering (table widget, three-state lifecycle visuals), `Subscribe(Docker)` wiring, navigation/filter, action keybinds. All in C2.
 
-#### Slice C2 — Docker scope rendering + subscription lifecycle · ⚪
+#### Slice C2 — Docker scope rendering + subscription lifecycle · 🟠 (gate landed)
+
+##### C2 gate (first commit) — vim-preservation gate + daemon Unsubscribe fix · ✅
+
+**Delivered.**
+- **Bug fix:** Through Slice C1, daemon's `pane_subs` was `JoinSet<()>` with no per-id key — `Payload::Unsubscribe { id }` only touched `status_sub` and `docker_subs`, so the C1 TUI's synthetic re-attach was leaking one zombie pane forwarder per Scope→Pane mode switch (daemon CPU + writer-mpsc bandwidth burnt indefinitely; pane bytes sent over the socket twice). Refactored `pane_subs` to `HashMap<u64, AbortHandle>` mirroring `docker_subs`, wired `Unsubscribe` to cancel pane forwarders, and made `AttachPane` on an existing sub_id replace + abort the previous (defensive). On session end, both maps drain + abort.
+- **Regression test** `crates/tepegoz-core/tests/pane_unsubscribe.rs` — pins the invariant: after `Unsubscribe(sub_1)`, no further envelopes arrive with `subscription_id == sub_1`. New input is observable on the new sub.
+- **Vim-preservation byte-level proxy** `crates/tepegoz-core/tests/vim_preservation.rs` — drives a real `/bin/sh` pane, emits vim-style escape sequences (alt-screen entry `ESC[?1049h`, cursor positioning `ESC[5;10H`, marker text) via `printf`, then exercises the C1 synthetic re-attach pattern (Unsubscribe(sub_1) + AttachPane(sub_2)) and asserts the new `PaneSnapshot` contains all three byte markers. **This is the strongest automated proxy for the vim demo; eyeball confirmation in a real terminal is still required** before C2 commit 2 (rendering work) lands. Per CTO §3, fallback options if eyeball reveals problems are documented at `app.rs::switch_to_pane`.
+
+**NOT yet done — C2 commit 2 (rendering) is unblocked but still pending:**
+- Container table widget, three-state lifecycle visuals, navigation, filter (see C2 commit 2 scope below).
+- The 3 small test gaps (per CTO C2 first-commit list): `second_switch_to_pane_is_idempotent`, `help_in_pane_mode_is_dropped`, and the new `AppAction::ShowToast` variant for `Payload::Error` + `DockerActionResult::Failure` routing.
+
+##### C2 commit 2 — rendering work · ⚪
 
 **Scope.**
 - Replace the C1 stub with the real container table (ratatui Table widget). Columns: NAME, IMAGE, STATE, STATUS, PORTS.
@@ -140,7 +153,13 @@ Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode
   - `Unavailable { reason }` — verbatim reason from the daemon's `DockerUnavailable`.
 - Navigation: ↑↓ / `j` `k` / `g` `G` / `Home` `End` (arrow + vi + standard, all work).
 - Filter: `/` enters filter input (free-text, matches name + image substring); `Esc` clears filter.
-- **Vim-preservation across Scope → Pane synthetic re-attach is a make-or-break check** (per CTO §3 sign-off). If `vim` doesn't preserve cleanly after a round-trip, fallback options to evaluate in C2: (a) send a `Resize` after re-attach to force vim's own redraw, (b) emit Ctrl-L equivalent into the pane, (c) keep `AttachPane` alive across mode switches and accept the buffering cost. Decide before C3, not after.
+- The 3 small test gaps from CTO C2 first-commit list: `second_switch_to_pane_is_idempotent`, `help_in_pane_mode_is_dropped`, and the `AppAction::ShowToast { kind, message }` variant routing `Payload::Error` + `DockerActionResult::Failure` to it (runtime stubs as `tracing::warn!` for C2; C3 implements actual overlay).
+
+##### C2 commit 3 — end-to-end test · ⚪
+
+**Scope.**
+- Add `crates/tepegoz-core/tests/docker_scope.rs` (or new file) test that drives a scripted App against a real daemon: subscribe → receive ContainerList → navigation moves selection → filter narrows the list. Verify table populates within ≤2 s.
+- **CTO §7 Step 10 manual:** in scope view, kill the docker daemon (Docker Desktop quit / colima stop / systemctl stop docker); verify scope view transitions to Unavailable within ~5 s without crashing the TUI; restart docker; verify scope view recovers.
 
 **Acceptance tests.**
 - Headless render test using `ratatui::backend::TestBackend(120, 30)`: build an `App`, populate `DockerScope::state` with three fake containers, drive `DrawScope`, assert names/states/ports appear in the rendered buffer at the expected cell positions, including the selected-row highlight.
