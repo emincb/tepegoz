@@ -86,6 +86,14 @@ async fn vim_style_state_survives_synthetic_reattach() {
     // literal in printf's argument so it WILL appear once in the echoed
     // command and once in the actual output — we'd have to filter that.
     // Easier: `stty -echo` first, then printf.
+    //
+    // IMPORTANT: use `\NNN` OCTAL escapes, not `\xNN` hex. Hex escapes in
+    // printf are a GNU extension that macOS /bin/sh (bash-in-POSIX-mode)
+    // accepts but Linux /bin/sh (dash on Ubuntu) does not — dash emits
+    // `\x1b` literally. Octal (`\033` = ESC) is POSIX-guaranteed for
+    // printf across bash, dash, zsh, ksh, busybox sh. CI caught the
+    // macOS-only passing when this was written with `\x1b`; see
+    // docs/OPERATIONS.md "POSIX printf portability" for the standing note.
     write_envelope(
         &mut w,
         &Envelope {
@@ -93,7 +101,7 @@ async fn vim_style_state_survives_synthetic_reattach() {
             payload: Payload::SendInput {
                 pane_id: pane.id,
                 data:
-                    b"stty -echo; printf '\\x1b[?1049h\\x1b[2J\\x1b[5;10HTEPEGOZ_VIM_TEST_MARKER'\n"
+                    b"stty -echo; printf '\\033[?1049h\\033[2J\\033[5;10HTEPEGOZ_VIM_TEST_MARKER'\n"
                         .to_vec(),
             },
         },
