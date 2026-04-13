@@ -5,24 +5,30 @@
 //! command loop, per-subscription forwarders) sends envelopes through that
 //! channel. This serializes writes without per-write locking.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use tepegoz_proto::{
-    Envelope, ErrorInfo, ErrorKind, Event, EventFrame, PROTOCOL_VERSION, Payload, Subscription,
-    Welcome,
+    DockerContainer, Envelope, ErrorInfo, ErrorKind, Event, EventFrame, PROTOCOL_VERSION, Payload,
+    Subscription, Welcome,
     codec::{read_envelope, write_envelope},
 };
 use tepegoz_pty::{OpenSpec as PtyOpenSpec, Pane, PaneUpdate};
 
 use crate::state::{DAEMON_VERSION, SharedState};
+
+/// How often the docker subscription re-fetches the container list.
+const DOCKER_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Backoff before re-attempting `Engine::connect` after a failure.
+const DOCKER_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) async fn handle_client(
     stream: UnixStream,
@@ -71,6 +77,7 @@ async fn session(
     })?;
 
     let mut pane_subs: JoinSet<()> = JoinSet::new();
+    let mut docker_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut status_sub: Option<u64> = None;
     let mut ticker = tokio::time::interval(Duration::from_millis(1000));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -95,6 +102,7 @@ async fn session(
                     &event_tx,
                     &mut status_sub,
                     &mut pane_subs,
+                    &mut docker_subs,
                 )
                 .await
                 {
@@ -106,6 +114,9 @@ async fn session(
     };
 
     pane_subs.abort_all();
+    for (_, handle) in docker_subs.drain() {
+        handle.abort();
+    }
     drop(event_tx);
     let _ = writer_handle.await;
 
@@ -134,6 +145,7 @@ async fn handle_command(
     event_tx: &mpsc::UnboundedSender<Envelope>,
     status_sub: &mut Option<u64>,
     pane_subs: &mut JoinSet<()>,
+    docker_subs: &mut HashMap<u64, AbortHandle>,
 ) -> anyhow::Result<()> {
     match payload {
         Payload::Ping => {
@@ -148,9 +160,24 @@ async fn handle_command(
             send_status(state, event_tx, id).await?;
         }
 
+        Payload::Subscribe(Subscription::Docker { id }) => {
+            if let Some(prev) = docker_subs.remove(&id) {
+                debug!(id, "replacing existing docker subscription");
+                prev.abort();
+            }
+            let tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                forward_docker(id, tx).await;
+            });
+            docker_subs.insert(id, handle.abort_handle());
+        }
+
         Payload::Unsubscribe { id } => {
             if *status_sub == Some(id) {
                 *status_sub = None;
+            }
+            if let Some(handle) = docker_subs.remove(&id) {
+                handle.abort();
             }
         }
 
@@ -340,6 +367,108 @@ fn error_envelope(kind: ErrorKind, message: &str) -> Envelope {
         payload: Payload::Error(ErrorInfo {
             kind,
             message: message.to_string(),
+        }),
+    }
+}
+
+/// Per-subscription docker poll loop.
+///
+/// Connects to the engine, emits an immediate `ContainerList`, then refreshes
+/// every [`DOCKER_REFRESH_INTERVAL`]. If `Engine::connect` or
+/// `list_containers` fails, emits a single `DockerUnavailable` (only on the
+/// transition from available — or initial — to unavailable, not on every retry)
+/// and reconnects every [`DOCKER_RECONNECT_INTERVAL`].
+///
+/// Exits when the writer mpsc closes (client disconnected) or the task is
+/// aborted (Unsubscribe).
+async fn forward_docker(subscription_id: u64, event_tx: mpsc::UnboundedSender<Envelope>) {
+    let mut last_was_unavailable: Option<bool> = None;
+
+    loop {
+        let engine = match tepegoz_docker::Engine::connect().await {
+            Ok(e) => e,
+            Err(e) => {
+                if !matches!(last_was_unavailable, Some(true))
+                    && event_tx
+                        .send(docker_unavailable_envelope(subscription_id, e.to_string()))
+                        .is_err()
+                {
+                    return;
+                }
+                last_was_unavailable = Some(true);
+                tokio::time::sleep(DOCKER_RECONNECT_INTERVAL).await;
+                continue;
+            }
+        };
+        let source = engine.source().to_string();
+        debug!(
+            subscription_id,
+            source = %source,
+            "docker engine connected for subscription"
+        );
+
+        loop {
+            match engine.list_containers().await {
+                Ok(containers) => {
+                    if event_tx
+                        .send(container_list_envelope(
+                            subscription_id,
+                            containers,
+                            source.clone(),
+                        ))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_was_unavailable = Some(false);
+                }
+                Err(e) => {
+                    warn!(
+                        subscription_id,
+                        error = %e,
+                        "docker list_containers failed; engine may have gone away"
+                    );
+                    if !matches!(last_was_unavailable, Some(true))
+                        && event_tx
+                            .send(docker_unavailable_envelope(subscription_id, e.to_string()))
+                            .is_err()
+                    {
+                        return;
+                    }
+                    last_was_unavailable = Some(true);
+                    break; // outer loop reconnects after RECONNECT_INTERVAL
+                }
+            }
+            tokio::time::sleep(DOCKER_REFRESH_INTERVAL).await;
+        }
+
+        tokio::time::sleep(DOCKER_RECONNECT_INTERVAL).await;
+    }
+}
+
+fn container_list_envelope(
+    subscription_id: u64,
+    containers: Vec<DockerContainer>,
+    engine_source: String,
+) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::ContainerList {
+                containers,
+                engine_source,
+            },
+        }),
+    }
+}
+
+fn docker_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::DockerUnavailable { reason },
         }),
     }
 }

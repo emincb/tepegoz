@@ -12,3 +12,9 @@ description = "Docker scope for Tepegöz: bollard wrapper and socket discovery."
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+bollard = "0.20"
+futures-util = "0.3"
+tepegoz-proto = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

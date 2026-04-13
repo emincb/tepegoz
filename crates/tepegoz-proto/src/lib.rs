@@ -17,7 +17,11 @@ pub mod codec;
 pub mod socket;
 
 /// Current wire protocol version. Bumps on breaking change.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Bumped to 3 in Phase 3 Slice A: added `Subscription::Docker`,
+/// `Event::ContainerList`, `Event::DockerUnavailable`, plus the
+/// `DockerContainer`/`DockerPort`/`KeyValue` types they reference.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Identifier for a pty pane owned by the daemon.
 pub type PaneId = u64;
@@ -89,7 +93,16 @@ pub struct Welcome {
 /// subscriptions on one connection.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 pub enum Subscription {
-    Status { id: u64 },
+    Status {
+        id: u64,
+    },
+    /// Subscribe to docker engine events: container list refreshes plus
+    /// availability transitions. Daemon will retry connecting if docker is
+    /// unreachable, so a single `Docker` subscription survives `dockerd`
+    /// restarts without the client having to resubscribe.
+    Docker {
+        id: u64,
+    },
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
@@ -119,6 +132,18 @@ pub enum Event {
     /// and some bytes were dropped from the front of the ring buffer.
     PaneLagged {
         dropped_bytes: u64,
+    },
+    /// Full container list from the docker engine (running + stopped). Sent
+    /// on initial connect and on every subsequent refresh tick.
+    ContainerList {
+        containers: Vec<DockerContainer>,
+        engine_source: String,
+    },
+    /// The docker engine is not reachable. Sent once when the daemon transitions
+    /// to unreachable; the daemon keeps retrying internally and will follow up
+    /// with a `ContainerList` once a connection is established.
+    DockerUnavailable {
+        reason: String,
     },
 }
 
@@ -174,4 +199,45 @@ pub enum ErrorKind {
     UnknownPane,
     InvalidRequest,
     Internal,
+}
+
+/// Docker container row delivered in `Event::ContainerList`. Lossy view of
+/// `bollard::models::ContainerSummary` — fields the TUI actually renders, plus
+/// labels (sorted, full set) for filter UX.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DockerContainer {
+    pub id: String,
+    /// Container names as reported by docker (with the leading `/`).
+    pub names: Vec<String>,
+    pub image: String,
+    pub image_id: String,
+    pub command: String,
+    /// Container creation time (Unix seconds).
+    pub created_unix_secs: i64,
+    /// "running" | "exited" | "paused" | "created" | "restarting" | "removing" |
+    /// "dead" | "unknown". The string form is intentional — it's what docker
+    /// returns and what the TUI renders.
+    pub state: String,
+    /// Free-form short status, e.g. "Up 5 minutes" or "Exited (0) 3 hours ago".
+    pub status: String,
+    pub ports: Vec<DockerPort>,
+    pub labels: Vec<KeyValue>,
+}
+
+/// Port mapping as reported in a container summary. `0` means "no public port"
+/// (the host side is not bound).
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DockerPort {
+    pub ip: String,
+    pub private_port: u16,
+    pub public_port: u16,
+    /// "tcp" | "udp" | "sctp".
+    pub protocol: String,
+}
+
+/// Generic key/value pair for label / env-style maps.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct KeyValue {
+    pub key: String,
+    pub value: String,
 }

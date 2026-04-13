@@ -40,15 +40,15 @@ pub struct Envelope {
     pub payload: Payload,
 }
 
-pub const PROTOCOL_VERSION: u32 = 2;  // bumped on breaking change
+pub const PROTOCOL_VERSION: u32 = 3;  // bumped on breaking change
 ```
 
-### Payload taxonomy (v2)
+### Payload taxonomy (v3)
 
 Client → daemon (commands):
 - `Hello(Hello { client_version, client_name })` — handshake
 - `Ping` — keepalive
-- `Subscribe(Subscription::Status { id })` — subscribe to the daemon status stream
+- `Subscribe(Subscription::{ Status { id } | Docker { id } })` — subscribe to a stream
 - `Unsubscribe { id }` — cancel a subscription
 - `OpenPane(OpenPaneSpec { shell, cwd, env, rows, cols })`
 - `AttachPane { pane_id, subscription_id }`
@@ -71,6 +71,8 @@ Events (inside `Event(EventFrame)`):
 - `PaneOutput { data }` — live output chunk
 - `PaneExit { exit_code }` — pane's child exited; subscription is closed
 - `PaneLagged { dropped_bytes }` — subscriber fell behind; broadcast dropped events
+- `ContainerList { containers, engine_source }` — full docker container list (running + stopped); refreshed every 2 s while engine is reachable; `engine_source` identifies which docker (e.g. `"Docker Desktop (/Users/me/.docker/run/docker.sock)"`) so the user can tell which runtime they're looking at
+- `DockerUnavailable { reason }` — emitted on availability *transitions* (subscribe-time or after the engine goes away). `reason` lists every connect candidate the daemon tried; the daemon keeps retrying every 5 s and follows up with `ContainerList` once a connection comes back
 
 ### Validation
 
@@ -206,6 +208,7 @@ Broadcast channel capacity is 1024 `PaneUpdate`s. Slow subscribers get `RecvErro
   - Per-agent connection task (Phase 6+).
   - Per-client writer task owning the socket's write half, drains an unbounded mpsc of `Envelope`s.
   - Per-subscription forwarder task for each active AttachPane.
+  - Per-`Subscribe(Docker)` poll task. Tracked in a `HashMap<id, AbortHandle>` so `Unsubscribe { id }` can cancel just that subscription. Refresh interval 2 s, reconnect interval 5 s; tolerates `dockerd` restarts and engine swaps without re-subscription.
 - TUI: single task with `tokio::select!` over `stdin.read`, `read_envelope`, `winch.recv`. No ratatui rendering in v1 (raw passthrough).
 
 ### Backpressure summary

@@ -123,6 +123,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_container_list_event_roundtrip() {
+        use crate::{DockerContainer, DockerPort, KeyValue};
+
+        let (mut a, mut b) = tokio::io::duplex(8192);
+
+        let containers = vec![DockerContainer {
+            id: "abc123".into(),
+            names: vec!["/webapp".into()],
+            image: "nginx:latest".into(),
+            image_id: "sha256:deadbeef".into(),
+            command: "nginx -g daemon off;".into(),
+            created_unix_secs: 1_700_000_000,
+            state: "running".into(),
+            status: "Up 5 minutes".into(),
+            ports: vec![DockerPort {
+                ip: "0.0.0.0".into(),
+                private_port: 80,
+                public_port: 8080,
+                protocol: "tcp".into(),
+            }],
+            labels: vec![KeyValue {
+                key: "com.docker.compose.project".into(),
+                value: "myapp".into(),
+            }],
+        }];
+
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 9,
+                event: Event::ContainerList {
+                    containers: containers.clone(),
+                    engine_source: "Docker Desktop (/Users/me/.docker/run/docker.sock)".into(),
+                },
+            }),
+        };
+
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event:
+                    Event::ContainerList {
+                        containers: c,
+                        engine_source,
+                    },
+            }) => {
+                assert_eq!(subscription_id, 9);
+                assert_eq!(c, containers, "container list survived rkyv roundtrip");
+                assert!(engine_source.contains("Docker Desktop"));
+            }
+            other => panic!("expected Event(ContainerList), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn docker_unavailable_event_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 11,
+                event: Event::DockerUnavailable {
+                    reason: "docker engine unreachable. Tried:\n  - Docker Desktop: socket file not found".into(),
+                },
+            }),
+        };
+
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::DockerUnavailable { reason },
+            }) => {
+                assert_eq!(subscription_id, 11);
+                assert!(reason.contains("Docker Desktop"));
+            }
+            other => panic!("expected Event(DockerUnavailable), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_docker_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(crate::Subscription::Docker { id: 42 }),
+        };
+
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+
+        match decoded.payload {
+            Payload::Subscribe(crate::Subscription::Docker { id }) => assert_eq!(id, 42),
+            other => panic!("expected Subscribe(Docker), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn frame_too_large_errors_before_allocation() {
         // Write a len prefix that exceeds MAX_FRAME_SIZE, then zero bytes.
         let (mut a, mut b) = tokio::io::duplex(1024);

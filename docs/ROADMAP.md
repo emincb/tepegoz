@@ -74,22 +74,56 @@ Per-phase: goal, delivered (or scope), acceptance test, explicit non-goals, risk
 
 ---
 
-## Phase 3 — Docker scope panel · ⚪ (blocked by Phase 2)
+## Phase 3 — Docker scope panel · 🟠 (Slice A landed)
 
 **Goal.** First scope panel. Lists containers; tails logs; execs into container (opens a new pane); lifecycle actions. Sets the UX template for Ports/Processes/Logs in Phase 4.
 
+Phase 3 is large enough to land in slices. Each slice is independently green and tests its own behavior end-to-end.
+
+### Slice A — Foundation: socket discovery + container list subscription · ✅
+
+**Delivered (code).**
+- `tepegoz-docker`: socket discovery walks `$DOCKER_HOST` env > Docker Desktop (`~/.docker/run/docker.sock`) > Colima (`~/.colima/default/docker.sock`) > Rancher Desktop (`~/.rd/docker.sock`) > native Linux (`/var/run/docker.sock`). `Engine::connect` returns the first candidate that pings inside a 5 s probe budget, or a structured `ConnectError` listing every attempt with its reason. `Engine::list_containers` returns wire-typed `Vec<DockerContainer>`. `bollard::models::ContainerSummary` → `tepegoz_proto::DockerContainer` translation handles missing optional fields with safe defaults; labels come out sorted; empty/unset state collapses to `"unknown"`.
+- Wire protocol bumped to **v3**: `Subscription::Docker { id }`; `Event::ContainerList { containers, engine_source }`; `Event::DockerUnavailable { reason }`; supporting types `DockerContainer`, `DockerPort`, `KeyValue`.
+- Daemon: per-`Subscribe(Docker)` poll task tracked in `HashMap<id, AbortHandle>` so `Unsubscribe { id }` cancels just that subscription. Refresh interval 2 s; reconnect interval 5 s. Emits `DockerUnavailable` only on availability *transitions* (not on every retry) to avoid spamming clients.
+
+**Acceptance tests.**
+- `crates/tepegoz-core/tests/docker_scope.rs::docker_subscription_emits_either_container_list_or_unavailable` — spawns daemon, sends `Subscribe(Docker)`, asserts the first event is one of `ContainerList | DockerUnavailable` within a 30 s budget. Both paths green; `engine_source` and `reason` are non-empty.
+- `crates/tepegoz-core/tests/docker_scope.rs::docker_subscription_returns_container_list_when_engine_is_running` — opt-in via `TEPEGOZ_DOCKER_TEST=1`. Insists on the Available path; meant for CI/local runs that provision docker beforehand.
+- `tepegoz-docker::tests::into_wire_translates_bollard_summary` + `into_wire_handles_empty_state` — translation correctness in the absence of a real engine.
+- `tepegoz-docker::socket::tests::*` — socket discovery order is stable.
+- `tepegoz-proto::codec::tests::{subscribe_docker_roundtrip, docker_container_list_event_roundtrip, docker_unavailable_event_roundtrip}` — wire roundtrip for the new variants.
+
+**Not in this slice.** Lifecycle actions, logs streaming, container stats, TUI scope view. See B/C/D below.
+
+### Slice B — Lifecycle actions + logs streaming + container stats · ⚪
+
 **Scope.**
-- `tepegoz-docker`: `bollard` wrapper with socket discovery across Docker Desktop (`/var/run/docker.sock`), Colima (`~/.colima/default/docker.sock`), Rancher Desktop, `$DOCKER_HOST` env, native Linux socket. Graceful degradation when docker is unreachable.
-- Wire protocol extension: `Subscribe(Docker)`; events `ContainerList`, `ContainerStats`, `ContainerLog`, `ContainerEvent` (from `/events`).
-- Commands: `DockerAction(Restart|Stop|Start|Remove|Kill)`, `DockerLogs(container_id, follow)`, `DockerExec(container_id, cmd)`.
-- TUI panel: table view (name, image, status, cpu%, mem, ports); keybinds for logs (new subscription), exec (new pty pane), restart/stop/rm, inspect.
-- TUI must gain a scope-vs-pty view switch.
+- Commands: `DockerAction { container_id, kind: Start|Stop|Restart|Kill|Remove }`. Daemon translates to bollard calls; emits a one-shot `DockerActionResult { container_id, kind, outcome }` event keyed to the originating subscription (or to a per-command response payload — TBD when we get there).
+- `Subscribe(DockerLogs { container_id, follow, tail_lines })` subscription. Daemon streams `ContainerLog { container_id, stream: Stdout|Stderr, data, ts }` events.
+- `ContainerStats { container_id, cpu_percent, mem_bytes, mem_percent }` periodic events (every 1–2 s) embedded in the existing `Subscribe(Docker)` stream — or a separate `Subscribe(DockerStats)`, TBD.
 
-**Acceptance.** Integration test against a mocked or real Docker socket: open container, drive List/Log/Action, verify responses.
+**Acceptance.** Provision a known short-lived alpine container; subscribe to docker; restart it; verify the action succeeded and a follow-up `ContainerList` reflects the change.
 
-**Not in scope.** Docker Compose, swarm, multi-host. Cross-container networking visualization (Phase 4+).
+### Slice C — TUI scope view + scope/pty switch · ⚪
 
-**Risks.** Socket discovery across Docker runtimes is the main engineering risk. Graceful degradation when docker is absent is essential — don't let a missing docker break the daemon.
+**Scope.**
+- TUI gains a second view mode: scope view (rendered with ratatui — bring the dep back) showing the container table (name, image, status, cpu%, mem, ports).
+- View switch: `Ctrl-b s` enters scope view, `Ctrl-b a` returns to attached pane. Detach (`Ctrl-b d/q`) still works in either view.
+- Scope view keybinds: `r` restart, `s` stop, `k` kill, `x` remove, `l` open logs (Slice B subscription), `Enter` exec (Slice D).
+
+**Acceptance.** Manual: launch daemon + TUI, switch to scope, see local containers, restart one, verify the table updates within ~2 s. Plus an automated render test if it's reasonable to do so headlessly.
+
+### Slice D — `DockerExec` → new pty pane · ⚪
+
+**Scope.**
+- Command: `DockerExec { container_id, cmd, env, rows, cols }`. Daemon spawns a docker exec session, wraps it as a `Pane` in `PtyManager`, returns `PaneOpened(PaneInfo)`. From the client's perspective it looks identical to opening a local shell pane.
+
+**Acceptance.** Provision a known container; exec into it; send `pwd\n`; verify expected output in pane scrollback.
+
+**Not in scope (Phase 3 overall).** Docker Compose, swarm, multi-host. Cross-container networking visualization (Phase 4+).
+
+**Risks.** Socket discovery across Docker runtimes was the main engineering risk; Slice A's structured-error connect with a transparent reason field shoulders that. Logs and exec streaming may surface backpressure scenarios that didn't appear in pty work — broadcast capacity may need tuning per-subscription kind.
 
 ---
 
