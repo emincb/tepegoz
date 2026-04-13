@@ -58,6 +58,40 @@ Tail live:
 tail -f ~/.cache/tepegoz/tui.log
 ```
 
+## Slice C manual demo prep (Phase 3)
+
+The TUI scope view (Slice C2+) is the part where eyeball-confirmation has historically diverged from test-passes (Phase 2 immediate-detach was exactly this). Acceptance for C2/C3 includes a manual demo against a standing fixture container.
+
+```sh
+# Spin up the victim container before the demo:
+docker run -d --name tepegoz-slice-c-victim alpine sh -c \
+  "i=0; while true; do echo tick-\$i; i=\$((i+1)); sleep 1; done"
+
+# Run the demo (separate terminal):
+./target/debug/tepegoz daemon
+./target/debug/tepegoz tui
+# Ctrl-b s   → switch to scope; verify tepegoz-slice-c-victim in the table
+# j/k        → navigate
+# l          → open logs panel; should see tick-N output streaming (C3)
+# r          → restart; toast confirms (C3); table updates within ~2s
+# K, then y  → kill (with confirm); then Start it again to verify (C3)
+# Ctrl-b a   → return to pane; verify pane state preserved (vim test in C2)
+# Ctrl-b d   → detach
+# tepegoz tui again → reattach to same pane (Phase 2 invariant)
+#
+# CTO §7 Step 10 (Slice C2 acceptance):
+# - In scope view, kill the docker daemon (Docker Desktop → Quit; or
+#   `colima stop`; or `systemctl stop docker`).
+# - Verify scope view transitions to Unavailable within ~5s without
+#   crashing the TUI.
+# - Restart docker; verify scope view recovers to showing containers.
+
+# Tear down:
+docker rm -f tepegoz-slice-c-victim
+```
+
+The container produces continuous log output (for the `l` keybind), is safe to Restart/Kill/Remove (no state-loss risk), and lives long enough for stats sampling to settle.
+
 ## Common issues
 
 ### "another tepegoz daemon is already running"

@@ -1,22 +1,30 @@
 //! Tepegöz TUI client.
 //!
-//! Single pane, raw-passthrough attach. The TUI connects to the daemon,
-//! ensures a pane exists (creating a default shell if needed), attaches to
-//! it, and thereafter:
+//! Two view modes:
 //!
-//! - pipes user keystrokes from stdin → daemon (`SendInput`)
-//! - pipes `PaneOutput` events from the daemon → stdout directly
-//! - handles SIGWINCH → `ResizePane`
-//! - detects `Ctrl-b d` → detach (exit TUI, leave pane running)
+//! - **Pane** (default): raw-passthrough attach to a pty pane. Stdin →
+//!   `SendInput`, `PaneOutput` → stdout, `SIGWINCH` → `ResizePane`. The
+//!   user's real terminal emulator does the ANSI rendering — no vt100
+//!   parsing on our side.
+//! - **Scope**: ratatui-rendered scope panel. Slice C ships the Docker
+//!   panel (container list, lifecycle actions, logs streaming).
 //!
-//! The user's real terminal emulator does the ANSI rendering. No vt100
-//! parsing on our side — that's deferred until we need overlay chrome
-//! (e.g. tiled layout).
+//! View switching: `Ctrl-b s` enters scope view; `Ctrl-b a` returns to the
+//! attached pane; `Ctrl-b d`/`Ctrl-b q` detaches from either view.
+//!
+//! Architecture: a pure [`app::App`] state machine handles every event
+//! ([`app::AppEvent`]) and emits [`app::AppAction`]s; the
+//! [`session::AppRuntime`] executes those actions against the daemon
+//! socket, stdin/stdout, and ratatui's terminal. State-machine tests live
+//! in `app::tests`; the runtime is exercised end-to-end by the scope
+//! integration test in `tepegoz-core/tests/`.
 
 use std::path::PathBuf;
 
+mod app;
 mod config;
 mod input;
+mod scope;
 mod session;
 mod terminal;
 mod tracing_setup;

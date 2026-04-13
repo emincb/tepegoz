@@ -74,7 +74,7 @@ Per-phase: goal, delivered (or scope), acceptance test, explicit non-goals, risk
 
 ---
 
-## Phase 3 — Docker scope panel · 🟠 (Slices A + B landed)
+## Phase 3 — Docker scope panel · 🟠 (Slices A + B + C1 landed)
 
 **Goal.** First scope panel. Lists containers; tails logs; execs into container (opens a new pane); lifecycle actions. Sets the UX template for Ports/Processes/Logs in Phase 4.
 
@@ -108,14 +108,71 @@ Phase 3 is large enough to land in slices. Each slice is independently green and
 - `tepegoz-docker::tests` — `stats_to_wire_computes_cpu_percent` (synthetic CPU delta → 80%), `stats_to_wire_returns_zero_cpu_when_delta_is_unavailable` (no precpu, sys_delta=0), `stats_to_wire_handles_missing_memory_section`.
 - `tepegoz-core/tests/docker_scope.rs` adds three always-on unreachable-engine tests (`DockerAction` returns `Failure` with reason; `Subscribe(DockerLogs)` and `Subscribe(DockerStats)` both terminate with `DockerStreamEnded`) plus an opt-in `TEPEGOZ_DOCKER_TEST=1` end-to-end test that provisions an `alpine:latest` container, observes a stdout marker through `Subscribe(DockerLogs)`, observes a stats sample with `mem_bytes > 0` through `Subscribe(DockerStats)`, and asserts `DockerAction(Restart)` returns `Success`. The container is force-removed via `Drop` cleanup so a panic mid-test doesn't leak it.
 
-### Slice C — TUI scope view + scope/pty switch · ⚪
+### Slice C — TUI scope view + scope/pty switch
+
+Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode app (Pane + Scope) rather than the pure-passthrough attach loop we had through Phase 2. The architecture commitment Phases 4 (Ports/Processes), 5 (SSH remote pty), and 7 (port scanner) inherit lives here. Per CTO sign-off, lands as three sub-commits.
+
+#### Slice C1 — TUI skeleton + view enum + event bus · ✅
+
+**Delivered (code).**
+- `tepegoz-tui/src/app.rs`: pure-state-machine `App` with `View::{Pane, Scope(ScopeKind::Docker)}`. Single mutator `App::handle_event(AppEvent) -> Vec<AppAction>` — no I/O. `AppEvent::{StdinChunk, DaemonEnvelope, Resize, Tick, PendingActionTimeout}` covers every external happening; `AppAction::{SendEnvelope, WriteStdout, EnterPaneMode, EnterScopeMode, DrawScope, Detach(DetachReason::{User, PaneExited{exit_code}})}` enumerates every side effect. `DockerScope` state (Idle/Connecting/Available/Unavailable) is defined with placeholder fields (selection, filter, sub_id) so C2 doesn't have to grow the struct shape.
+- `tepegoz-tui/src/input.rs`: `InputFilter` extended with `SwitchToScope` (Ctrl-b s), `SwitchToPane` (Ctrl-b a), `Help` (Ctrl-b ?). All control sequences split the byte stream cleanly (any pre-control bytes get forwarded as `Forward(Vec<u8>)` first, then the control action; bytes after the control are dropped).
+- `tepegoz-tui/src/session.rs`: thin `AppRuntime` owns the I/O glue — daemon socket halves, writer mpsc, stdin reader, SIGWINCH stream, ratatui Terminal — and executes whatever `AppAction`s the App emits. Mode-conditional rendering: in Pane mode, raw stdout passthrough (no ratatui draw cycle); in Scope mode, ratatui takes over with a 30 Hz coalesced redraw tick that's gated off in pane mode (no CPU cost when not used).
+- `tepegoz-tui/src/scope/docker.rs`: stub renderer for the docker scope view ("Slice C1 ships only the bus + view switch; C2 wires the container table"). Status bar shows the active `DockerScopeState` discriminant.
+- New deps: `ratatui` 0.30 (default features; pulls `ratatui-crossterm` 0.1 + transitive crossterm 0.29; harmless to coexist with our existing crossterm 0.28 since both share the same OS-level termios state).
+- View switch mechanics: Pane → Scope clears the screen and starts the ratatui draw cycle. Scope → Pane clears the screen, cancels the previous `AttachPane` subscription, and sends a fresh `AttachPane` so the daemon replays current scrollback as `PaneSnapshot`. **TODO(phase-5):** scrollback re-transfer cost will matter over SSH; revisit if SSH bandwidth becomes a concern.
+
+**Acceptance tests.**
+- `tepegoz-tui::input::tests` (12) — every InputFilter behavior including the new control sequences and their split-across-chunks variants.
+- `tepegoz-tui::app::tests` (14) — App state machine drives event sequences without any I/O: initial_actions allocates AttachPane + ResizePane; Ctrl-b d emits user detach; pane keystrokes forward as SendInput; Ctrl-b s switches to scope (EnterScopeMode + DrawScope); double-switch is idempotent; Ctrl-b a returns to pane with synthetic re-attach (Unsubscribe + fresh AttachPane); PaneOutput in Pane mode emits WriteStdout; PaneSnapshot likewise; PaneOutput in Scope mode is dropped (the synthetic re-attach replays from the daemon's ring); PaneExit propagates exit_code via DetachReason::PaneExited; events for unknown subscription ids are silently dropped; Resize forwards to daemon and only redraws in scope; Tick is a no-op in Pane and emits DrawScope in Scope.
+- **Manual demo: NOT performed in C1 implementation environment** (no interactive terminal available). C2 must run the full demo sequence per Slice C "Demonstrable, not simulated" below.
+
+**Not in this slice.** Scope rendering (table widget, three-state lifecycle visuals), `Subscribe(Docker)` wiring, navigation/filter, action keybinds. All in C2.
+
+#### Slice C2 — Docker scope rendering + subscription lifecycle · ⚪
 
 **Scope.**
-- TUI gains a second view mode: scope view (rendered with ratatui — bring the dep back) showing the container table (name, image, status, cpu%, mem, ports).
-- View switch: `Ctrl-b s` enters scope view, `Ctrl-b a` returns to attached pane. Detach (`Ctrl-b d/q`) still works in either view.
-- Scope view keybinds: `r` restart, `s` stop, `k` kill, `x` remove, `l` open logs (Slice B subscription), `Enter` exec (Slice D).
+- Replace the C1 stub with the real container table (ratatui Table widget). Columns: NAME, IMAGE, STATE, STATUS, PORTS.
+- Wire `Subscribe(Docker)` on enter to scope view; `Unsubscribe` on leave. State transitions from `Idle → Connecting → (Available | Unavailable)`.
+- Three distinct visual states (per CTO §2 sign-off):
+  - `Connecting` — "Connecting to docker engine…" (rendered immediately on subscribe, before the first event).
+  - `Available { containers, engine_source }` — table; `containers.len() == 0` shows a separate "No containers" empty state (don't conflate with Unavailable).
+  - `Unavailable { reason }` — verbatim reason from the daemon's `DockerUnavailable`.
+- Navigation: ↑↓ / `j` `k` / `g` `G` / `Home` `End` (arrow + vi + standard, all work).
+- Filter: `/` enters filter input (free-text, matches name + image substring); `Esc` clears filter.
+- **Vim-preservation across Scope → Pane synthetic re-attach is a make-or-break check** (per CTO §3 sign-off). If `vim` doesn't preserve cleanly after a round-trip, fallback options to evaluate in C2: (a) send a `Resize` after re-attach to force vim's own redraw, (b) emit Ctrl-L equivalent into the pane, (c) keep `AttachPane` alive across mode switches and accept the buffering cost. Decide before C3, not after.
 
-**Acceptance.** Manual: launch daemon + TUI, switch to scope, see local containers, restart one, verify the table updates within ~2 s. Plus an automated render test if it's reasonable to do so headlessly.
+**Acceptance tests.**
+- Headless render test using `ratatui::backend::TestBackend(120, 30)`: build an `App`, populate `DockerScope::state` with three fake containers, drive `DrawScope`, assert names/states/ports appear in the rendered buffer at the expected cell positions, including the selected-row highlight.
+- Add to `crates/tepegoz-core/tests/docker_scope.rs` a TUI-driver test that spawns the daemon, runs a scripted `App` (no terminal) through "subscribe → receive ContainerList → press r → receive DockerActionResult". Bypasses crossterm but exercises the entire wire path.
+- **Manual demo (per CTO §7 sign-off, including new Step 10):** start daemon + TUI; switch to scope (`Ctrl-b s`); see container table; navigate (j/k); filter (`/`); switch back to pane (`Ctrl-b a`); verify vim-preservation; detach + reattach (`Ctrl-b d`, `tepegoz tui`); **kill the docker daemon, verify scope view transitions to Unavailable within ~5 s without crashing the TUI; restart docker, verify scope view recovers**. Standing victim-container snippet in `docs/OPERATIONS.md`.
+
+#### Slice C3 — Action keybinds + toasts + logs panel · ⚪
+
+**Scope.**
+- Scope view keybinds (per CTO §4 sign-off):
+  - `r` restart (immediate; recoverable)
+  - `s` stop (immediate; recoverable)
+  - `K` (capital) kill — **requires `y` confirmation modal** (n/Esc/anything-else cancels)
+  - `X` (capital) remove — **requires `y` confirmation modal**
+  - `l` open logs panel (`Subscribe(DockerLogs)` for selected container)
+  - `Enter` exec into container (Slice D — opens new pane)
+  - `?` help overlay
+- Action results render as toasts (overlay near bottom of scope view) — "✓ Restarted nginx" / "✗ Stop failed: container not running".
+- **Pending-action timeout** (per CTO §5 sign-off): each in-flight `DockerAction` carries a `deadline: Instant`; a 30 s sweep timer in the runtime emits `AppEvent::PendingActionTimeout(request_id)` for any expired entry; App emits a "Action timed out — check engine" toast. Cheap to add now; expensive to retrofit.
+
+**Acceptance tests.**
+- App state-machine tests: `r`/`s`/`K`/`X` emit the right `DockerAction` envelope (with the right `kind`); destructive actions (`K`/`X`) require `y` confirm before emitting; `n`/`Esc`/other key cancels. Pending-action timeout fires the toast.
+- End-to-end test: spawn daemon, drive scripted App through Restart of a real container (opt-in via `TEPEGOZ_DOCKER_TEST=1`).
+- **Manual demo (Slice C overall acceptance — see §7 in the C1 commit history for the full sequence with Step 10).**
+
+### Slice D — `DockerExec` → new pty pane · ⚪
+
+**Scope.**
+- Command: `DockerExec { container_id, cmd, env, rows, cols }`. Daemon spawns a docker exec session, wraps it as a `Pane` in `PtyManager`, returns `PaneOpened(PaneInfo)`. From the client's perspective it looks identical to opening a local shell pane.
+- TUI's `RequestOpenPane(PaneRequestKind::DockerExec { ... })` (the C1 placeholder variant) gets wired: `Enter` in scope view sends the command, awaits `PaneOpened`, then transitions `View → Pane(new_pane_id)`.
+
+**Acceptance.** Provision a known container; exec into it; send `pwd\n`; verify expected output in pane scrollback.
 
 ### Slice D — `DockerExec` → new pty pane · ⚪
 
