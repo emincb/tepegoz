@@ -492,6 +492,143 @@ async fn docker_action_logs_stats_end_to_end_against_real_engine() {
     daemon_handle.abort();
 }
 
+/// Slice C2c3 end-to-end: Subscribe(Docker) must deliver a `ContainerList`
+/// *containing a specific provisioned container* within 2 seconds when
+/// the engine is reachable. This is the signature assertion from the
+/// CTO's C2c3 ask — distinct from the Slice A acceptance test (which
+/// just checks that *some* event arrives) in that it pins both:
+///
+/// 1. Timing. The daemon's refresh interval is 2 s; subscribe→first-list
+///    should be faster than that because `Engine::connect` + first
+///    `list_containers` run inline on subscribe before the interval tick.
+///    If this deadline slips, mode-switching Ctrl-b s into scope view
+///    would render a stale "Connecting…" for too long and feel broken.
+/// 2. Content. The ContainerList must actually contain the container we
+///    provisioned. A list that's technically empty or wrong would pass
+///    the Slice A test but fail the user's eyeball.
+///
+/// Opt-in via `TEPEGOZ_DOCKER_TEST=1` (requires running docker + ability
+/// to pull `alpine:latest` if not already cached). Provisions a unique-
+/// per-PID container so concurrent runs don't collide; force-removes on
+/// Drop so panics don't leak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn docker_scope_lists_provisioned_container_within_2s() {
+    if std::env::var("TEPEGOZ_DOCKER_TEST").ok().as_deref() != Some("1") {
+        eprintln!("skipping: set TEPEGOZ_DOCKER_TEST=1 to enable (requires running docker)");
+        return;
+    }
+
+    let container_name = format!("tepegoz-c2c3-{}", std::process::id());
+    let run = std::process::Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &container_name,
+            "alpine:latest",
+            "sleep",
+            "120",
+        ])
+        .output()
+        .expect("docker run");
+    assert!(
+        run.status.success(),
+        "docker run failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+    let _cleanup = Cleanup(container_name.clone());
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock_path = tmp.path().join("daemon.sock");
+    let config = tepegoz_core::DaemonConfig {
+        socket_path: Some(sock_path.clone()),
+    };
+    let daemon_handle = tokio::spawn(async move {
+        tepegoz_core::run_daemon(config).await.expect("daemon ran");
+    });
+    wait_for_socket(&sock_path, Duration::from_secs(5)).await;
+
+    let (mut r, mut w) = connect(&sock_path).await;
+    let started = std::time::Instant::now();
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::Docker { id: DOCKER_SUB_ID }),
+        },
+    )
+    .await
+    .expect("subscribe");
+
+    // The first ContainerList for a reachable engine should arrive well
+    // under 2 s. We allow a slightly higher bound for the automated
+    // timeout so CI variance doesn't turn transient slowness into a
+    // false positive — but we ALSO assert the measured elapsed time is
+    // under 2 s so the "feels broken" threshold is pinned.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut list_elapsed = None;
+    let mut list_contained_our_container = false;
+    loop {
+        if list_elapsed.is_some() {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let env = tokio::time::timeout(remaining, read_envelope(&mut r))
+            .await
+            .expect("first event within 5 s")
+            .expect("read");
+        if let Payload::Event(EventFrame {
+            subscription_id,
+            event,
+        }) = env.payload
+        {
+            if subscription_id == DOCKER_SUB_ID {
+                match event {
+                    Event::ContainerList { containers, .. } => {
+                        list_elapsed = Some(started.elapsed());
+                        list_contained_our_container = containers.iter().any(|c| {
+                            c.names
+                                .iter()
+                                .any(|n| n.trim_start_matches('/') == container_name)
+                        });
+                    }
+                    Event::DockerUnavailable { reason } => {
+                        panic!("TEPEGOZ_DOCKER_TEST=1 requires reachable docker, got: {reason}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let elapsed = list_elapsed.expect("ContainerList must arrive within the deadline");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "ContainerList took {elapsed:?}; must be < 2s for the scope view to feel responsive on Ctrl-b s"
+    );
+    assert!(
+        list_contained_our_container,
+        "ContainerList must contain the provisioned container {container_name:?}; \
+         otherwise the user sees the list populate but the container they just started is missing"
+    );
+
+    daemon_handle.abort();
+}
+
 // ---- helpers ----
 
 /// Read events on the connection until one references `target_sub_id`,

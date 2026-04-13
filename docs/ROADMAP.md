@@ -165,11 +165,19 @@ Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode
 - 27 `tepegoz-tui::app::tests` (up from 14) including the 3 CTO-requested gaps (`second_switch_to_pane_is_idempotent`, `ctrl_b_question_in_pane_mode_is_dropped`, and the `DockerActionResult::Success does not toast yet` + `Payload::Error routes to ShowToast` pair for the ShowToast wire) plus navigation (j/k/arrows/g/G/Home/End), filter (narrow/commit/clear/backspace), and Docker subscription lifecycle (subscribe-on-enter, Unsubscribe-on-leave, state transitions).
 - 7 `tepegoz-tui::scope::docker::tests` headless render tests using `ratatui::backend::TestBackend(120×30)`: Available state renders container table with names/images/states + `▶` marker; Connecting message; Unavailable with verbatim reason; Available-but-empty shows distinct "No containers"; filter matching nothing; filter-bar caret when active; ports column renders public + internal mappings (uses 180-wide TestBackend for the port test since port strings overflow 120 cols after the fixed NAME/IMAGE/STATUS columns consume their share).
 
-##### C2 commit 3 — end-to-end test · ⚪
+##### C2 commit 3 — end-to-end test + eyeball demo · 🟡 (automated part landed; eyeball pending user)
 
-**Scope.**
-- Add `crates/tepegoz-core/tests/docker_scope.rs` (or new file) test that drives a scripted App against a real daemon: subscribe → receive ContainerList → navigation moves selection → filter narrows the list. Verify table populates within ≤2 s.
-- **CTO §7 Step 10 manual:** in scope view, kill the docker daemon (Docker Desktop quit / colima stop / systemctl stop docker); verify scope view transitions to Unavailable within ~5 s without crashing the TUI; restart docker; verify scope view recovers.
+**Delivered (automated).**
+- `crates/tepegoz-core/tests/docker_scope.rs::docker_scope_lists_provisioned_container_within_2s` — opt-in `TEPEGOZ_DOCKER_TEST=1`. Provisions a unique-per-PID `alpine:latest` container (`sleep 120`), subscribes to Docker, asserts the first `ContainerList` arrives in <2 s *and* contains the provisioned container by name. Force-removes on `Drop` so panics don't leak. The 2-second threshold pins the "feels responsive on Ctrl-b s" UX contract; a slip there would make scope view feel broken.
+- **Navigation / filter** assertions kept at the App-state-machine layer (`tepegoz-tui::app::tests`) rather than duplicated against a real daemon. The behavior under test is the App's — an end-to-end version wouldn't catch anything more than the existing unit tests, and would inflate CI time. Listed here for transparency: arrows / j / k / g / G / Home / End navigation, filter narrow / commit / clear / backspace, subscription lifecycle (subscribe on enter, unsubscribe on leave).
+
+**Eyeball demo — pending user run.** The CI automation cannot drive an interactive TUI. The manual demo is the first real-terminal check for:
+1. **Vim-preservation across Scope→Pane synthetic re-attach** (Step 1 in `docs/OPERATIONS.md`). If this fails, apply the fallback mitigation from `docs/ISSUES.md` before proceeding with C3.
+2. Scope rendering / navigation / filter (Step 2).
+3. **CTO §7 Step 10**: kill docker daemon mid-session, verify scope view transitions to Unavailable within ~5 s without crashing the TUI; restart docker, verify scope view recovers.
+4. Detach + reattach (Phase 2 invariant, Step 4).
+
+Full script in `docs/OPERATIONS.md` "Slice C manual demo prep".
 
 **Acceptance tests.**
 - Headless render test using `ratatui::backend::TestBackend(120, 30)`: build an `App`, populate `DockerScope::state` with three fake containers, drive `DrawScope`, assert names/states/ports appear in the rendered buffer at the expected cell positions, including the selected-row highlight.

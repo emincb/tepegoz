@@ -60,37 +60,121 @@ tail -f ~/.cache/tepegoz/tui.log
 
 ## Slice C manual demo prep (Phase 3)
 
-The TUI scope view (Slice C2+) is the part where eyeball-confirmation has historically diverged from test-passes (Phase 2 immediate-detach was exactly this). Acceptance for C2/C3 includes a manual demo against a standing fixture container.
+The TUI scope view is the part where eyeball-confirmation has historically diverged from test-passes (Phase 2 immediate-detach was exactly this). Acceptance for C2/C3 includes a manual demo against a standing fixture container. **Step 1 is make-or-break**: if vim-preservation across the Scope→Pane synthetic re-attach fails, stop and apply a fallback mitigation (see `docs/ISSUES.md`) before anything else.
+
+### Prep
 
 ```sh
-# Spin up the victim container before the demo:
+# Standing victim container — the demo's fixture for the scope panel.
+# Produces continuous log output (for the `l` keybind, C3), is safe to
+# Restart/Kill/Remove (no state-loss risk), lives long enough for stats
+# sampling to settle.
 docker run -d --name tepegoz-slice-c-victim alpine sh -c \
   "i=0; while true; do echo tick-\$i; i=\$((i+1)); sleep 1; done"
 
-# Run the demo (separate terminal):
+# Build + start daemon (terminal 1):
+cargo build
 ./target/debug/tepegoz daemon
-./target/debug/tepegoz tui
-# Ctrl-b s   → switch to scope; verify tepegoz-slice-c-victim in the table
-# j/k        → navigate
-# l          → open logs panel; should see tick-N output streaming (C3)
-# r          → restart; toast confirms (C3); table updates within ~2s
-# K, then y  → kill (with confirm); then Start it again to verify (C3)
-# Ctrl-b a   → return to pane; verify pane state preserved (vim test in C2)
-# Ctrl-b d   → detach
-# tepegoz tui again → reattach to same pane (Phase 2 invariant)
-#
-# CTO §7 Step 10 (Slice C2 acceptance):
-# - In scope view, kill the docker daemon (Docker Desktop → Quit; or
-#   `colima stop`; or `systemctl stop docker`).
-# - Verify scope view transitions to Unavailable within ~5s without
-#   crashing the TUI.
-# - Restart docker; verify scope view recovers to showing containers.
-
-# Tear down:
-docker rm -f tepegoz-slice-c-victim
 ```
 
-The container produces continuous log output (for the `l` keybind), is safe to Restart/Kill/Remove (no state-loss risk), and lives long enough for stats sampling to settle.
+### Demo sequence
+
+Run `./target/debug/tepegoz tui` in terminal 2.
+
+**Step 1 — vim preservation (MAKE-OR-BREAK).** The byte-level proxy
+(`crates/tepegoz-core/tests/vim_preservation.rs`) passes in CI, but this
+is the real-terminal check. If it fails, apply the fallback from
+`docs/ISSUES.md` — Resize-after-attach first.
+
+```
+# In the attached pane:
+vim /tmp/tepegoz-demo.txt
+# press `i` (insert mode)
+# type: HELLO FROM STEP 1
+# press <Esc>
+# status line should read something like: "/tmp/tepegoz-demo.txt" [New File]
+# move cursor with h/l/j/k to some non-trivial position
+
+# Switch to scope view:
+Ctrl-b s
+# → expect: container table populated with tepegoz-slice-c-victim.
+#   state "running", the tick-N image, port column empty.
+
+# Switch back to attached pane:
+Ctrl-b a
+# → expect: vim's screen intact. Status line still shows the file name.
+#   The text "HELLO FROM STEP 1" is visible in the buffer. Cursor
+#   position preserved. No garbled escape sequences.
+
+# If vim's screen is broken (blank screen, wrong cursor, garbled text):
+# STOP HERE. This is the case CTO §3 warned about. Apply mitigation (1)
+# from docs/ISSUES.md ("Resize-after-attach") and re-test. Escalate to
+# (2) only if (1) doesn't fix it.
+
+# If vim is intact, exit vim:
+# :q!
+```
+
+**Step 2 — scope rendering, navigation, filter.**
+
+```
+Ctrl-b s                    # switch back to scope view
+j, k, or ↑/↓                # move selection (▶ marker tracks)
+g / G                       # jump to top / bottom
+/ tepegoz                   # open filter input, type "tepegoz"; list narrows
+<Enter>                     # commit filter (bar stays; caret disappears)
+<Esc>                       # clear filter entirely
+```
+
+**Step 3 — engine-unavailable-mid-session recovery** (CTO §7 Step 10).
+
+```
+# In scope view, still showing containers:
+# Kill the docker daemon from OUTSIDE tepegoz.
+#   macOS Docker Desktop: menu → Quit
+#   macOS Colima:          `colima stop`  (terminal 3)
+#   Linux:                 `sudo systemctl stop docker`  (terminal 3)
+# → expect: within ~5s the scope view swaps to the Unavailable panel
+#   (red border, "Docker engine unavailable", verbatim reason from the
+#   daemon). The TUI must NOT crash or hang.
+
+# Restart docker:
+#   macOS Docker Desktop: launch the app
+#   macOS Colima:          `colima start`
+#   Linux:                 `sudo systemctl start docker`
+# → expect: within ~5s (daemon reconnect interval) the scope view swaps
+#   back to the container table. The victim container should reappear
+#   if still running, or the list may be empty if docker was stopped
+#   long enough that the container was removed.
+
+# (If `docker run` removed the container during the stop — e.g., with
+# --rm on SIGTERM — just `docker run -d --name tepegoz-slice-c-victim
+# alpine sh -c "..."` again.)
+```
+
+**Step 4 — detach + reattach (Phase 2 invariant).**
+
+```
+Ctrl-b d                    # detach (daemon + pane still running)
+./target/debug/tepegoz tui  # reattach — scrollback replay visible
+```
+
+**Step 5 — C3 keybinds** (enabled only after Slice C3 lands):
+
+```
+l       → open logs panel for selected row; tick-N output streams
+r       → restart selected container; toast confirms; table updates ~2s
+s       → stop selected container; toast confirms
+K, y    → kill with confirm; n cancels
+X, y    → force-remove with confirm; n cancels
+Enter   → exec into container (Slice D; opens new pane)
+```
+
+### Tear down
+
+```sh
+docker rm -f tepegoz-slice-c-victim
+```
 
 ## Common issues
 
