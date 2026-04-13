@@ -27,6 +27,8 @@ Tepegöz collapses all of it into one screen owned by one daemon.
 └───────────────────────────────────────────────────────┘
 ```
 
+First-run layout. No configuration required.
+
 One daemon owns the state. The TUI is a client. So is the phone app, later.
 
 ## Install

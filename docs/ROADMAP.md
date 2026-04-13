@@ -74,7 +74,7 @@ Per-phase: goal, delivered (or scope), acceptance test, explicit non-goals, risk
 
 ---
 
-## Phase 3 — Docker scope panel · 🟠 (Slices A + B + C1 landed)
+## Phase 3 — Docker scope panel · 🟠 (Slices A + B + C1 + C2 landed; C1.5 tiling foundation in progress — Decision #7 supersedes the C1 `View::{Pane, Scope}` mode enum; C2 Docker renderer being re-plumbed into a tile `Rect`)
 
 **Goal.** First scope panel. Lists containers; tails logs; execs into container (opens a new pane); lifecycle actions. Sets the UX template for Ports/Processes/Logs in Phase 4.
 
@@ -110,9 +110,13 @@ Phase 3 is large enough to land in slices. Each slice is independently green and
 
 ### Slice C — TUI scope view + scope/pty switch
 
-Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode app (Pane + Scope) rather than the pure-passthrough attach loop we had through Phase 2. The architecture commitment Phases 4 (Ports/Processes), 5 (SSH remote pty), and 7 (port scanner) inherit lives here. Per CTO sign-off, lands as three sub-commits.
+Slice C is the heaviest TUI refactor in v1 — it replaces the pure-passthrough attach loop we had through Phase 2 with the god-view tiled layout per Decision #7. The architecture commitment Phases 4 (Ports/Processes), 5 (SSH remote pty), 7 (port scanner), and 9 (Claude Code) inherit lives here. Per CTO sign-off, lands as four sub-slices: **C1** (pure-state-machine bus + event-driven skeleton), **C1.5** (tiling foundation — god-view layout, vt100 pty tile, focus nav), **C2** (Docker scope rendering + subscription lifecycle), **C3** (action keybinds + toasts + logs panel).
 
-#### Slice C1 — TUI skeleton + view enum + event bus · ✅
+A prior revision of this slice shipped C1 as a `View::{Pane, Scope}` two-mode app. That model was the drift caught by the product-vision review and is superseded by Decision #7; the C1.5 sub-slice corrects it before any further rendering work lands. C1's `AppEvent`/`AppAction` bus, Runtime↔App split, and daemon subscription-uniformity fix survive the correction. See each sub-slice below for the precise salvage list.
+
+#### Slice C1 — TUI skeleton + view enum + event bus · ✅ (superseded in part by C1.5)
+
+**Superseded in part by C1.5 (Decision #7).** The pure-state-machine `App`, `AppEvent`/`AppAction` bus, `InputFilter` split-across-chunks handling, Runtime↔App split, daemon subscription-uniformity fix, and scope-renderer plumbing in C2 all survive. What is removed in C1.5: `View::{Pane, Scope(ScopeKind)}`, `switch_to_scope` / `switch_to_pane`, the synthetic re-attach sequence, `AppAction::{EnterPaneMode, EnterScopeMode}`, `InputAction::{SwitchToScope, SwitchToPane}`, and any test asserting mode-switch semantics. `View` is redefined as `{ layout: TileLayout, focused: TileId }`. This section preserves the C1 record as landed; the new shape is documented under Slice C1.5 below.
 
 **Delivered (code).**
 - `tepegoz-tui/src/app.rs`: pure-state-machine `App` with `View::{Pane, Scope(ScopeKind::Docker)}`. Single mutator `App::handle_event(AppEvent) -> Vec<AppAction>` — no I/O. `AppEvent::{StdinChunk, DaemonEnvelope, Resize, Tick, PendingActionTimeout}` covers every external happening; `AppAction::{SendEnvelope, WriteStdout, EnterPaneMode, EnterScopeMode, DrawScope, Detach(DetachReason::{User, PaneExited{exit_code}})}` enumerates every side effect. `DockerScope` state (Idle/Connecting/Available/Unavailable) is defined with placeholder fields (selection, filter, sub_id) so C2 doesn't have to grow the struct shape.
@@ -129,9 +133,51 @@ Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode
 
 **Not in this slice.** Scope rendering (table widget, three-state lifecycle visuals), `Subscribe(Docker)` wiring, navigation/filter, action keybinds. All in C2.
 
+#### Slice C1.5 — Tiling foundation · 🟠 (in progress)
+
+**Goal.** Replace the C1 mode-switch `View` model with the tiled-layout substrate per Decision #7. The god-view default layout renders on first run; scopes not yet implemented show labeled placeholder tiles.
+
+**Delivered (plan).**
+- `vt100` crate added to `tepegoz-tui`. Pty tile renders via vt100 parser + ratatui widget.
+- `View` redefined: `{ layout: TileLayout, focused: TileId }`; `TileKind` enum: `Pty | Scope(ScopeKind) | Placeholder { label, eta_phase }`.
+- All subscriptions live concurrently: `AttachPane` on startup, `Subscribe(Docker)` on startup, placeholders for Ports/Fleet/Claude.
+- Focus navigation: `Ctrl-b h/j/k/l` + arrows; focus-respecting input routing.
+- Default layout constructor renders the god-view mockup from README on first run with no config.
+- The C2c2 Docker renderer is re-plumbed to draw into a tile `Rect` rather than owning the full frame. Three-state lifecycle, navigation, filter unchanged.
+
+**Acceptance tests.**
+- Headless render test via `TestBackend`: default layout renders with pty tile, docker tile, three placeholder tiles, all at expected rects for a 120×40 terminal.
+- State-machine tests for focus movement, focus-respecting input routing, resize re-layout.
+- `vt100` integration test: a pty that emits cursor positioning + alt-screen entry renders correctly within a 40×20 tile `Rect` without smearing into neighbors.
+- Manual demo (gated by CTO/user): `tepegoz tui` → god view visible, focus navigation feels right, Docker tile (real) and placeholder tiles (labeled) coexist cleanly, vim in the pty tile preserves correctly across focus moves and detach/reattach.
+
+**Non-goals.** Layout configurability. Resizable splits. Tile show/hide. User-defined keybinds for focus. All deferred past v1.
+
+**Risks.** `vt100` integration edge cases (wide chars, emoji, alt-screen stacking). Budget for a character-width bug.
+
+##### C1.5a — Docs-only commit
+
+- Decision #7 added to `docs/DECISIONS.md`.
+- This Slice C1.5 section inserted in `docs/ROADMAP.md`; C1 / C2 banners note what survives.
+- `docs/ARCHITECTURE.md` TUI section updated to reflect tile layout + vt100 integration + scope-renderer `(state, Frame, Rect)` contract.
+- `docs/STATUS.md` updated: C1.5 in progress; C2 renderer re-plumbing is C1.5b scope; bus fixes + daemon fixes survive.
+- README.md: mockup unchanged (already the correct spec); first-run-layout note added beneath it.
+
+**Gate.** CTO reads Decision #7 + this roadmap slice in tree. No C1.5b code until sign-off.
+
+##### C1.5b — Tiling-foundation code
+
+Per plan above. Starts after C1.5a sign-off. Ping when green on both-OS CI and pushed.
+
+##### C1.5c — Manual demo gate
+
+User (Emin) runs `tepegoz tui` in a real terminal and confirms: default god-view layout renders on first launch with no config — PTY top, Docker bottom-left, placeholder tiles bottom-middle/right/wide-strip; focus navigation (`Ctrl-b h/j/k/l` + arrows) feels natural; focused tile is visually distinct; pty tile works (`vim /tmp/foo`, type text, focus away + back, vim screen intact); Docker tile populates within ~2 s with live container list; navigation + filter work inside the Docker tile while pty tile continues updating; placeholder tiles are clearly labeled and non-interactive (no crashes on focus); detach + reattach preserves all state (Phase 2 invariant). No C3 code starts until user signs off.
+
 #### Slice C2 — Docker scope rendering + subscription lifecycle · 🟠 (gate landed)
 
-##### C2 gate (first commit) — vim-preservation gate + daemon Unsubscribe fix · ✅
+##### C2 gate (first commit) — vim-preservation gate + daemon Unsubscribe fix · ✅ (daemon fix survives; vim-preservation rationale repurposed)
+
+**C1.5 salvage.** Daemon `pane_subs: HashMap<u64, AbortHandle>` fix (`43b28eb`) is decoupled from TUI shape and survives untouched. `pane_unsubscribe.rs` stays as the daemon-side regression test. `vim_preservation.rs`'s original rationale (verifying the synthetic re-attach preserves vim state) goes away with the mode-switch model; in C1.5b the file is repurposed as a `vt100` reconstruction test — same pty harness, same marker emission, but the assertion becomes "the vt100 screen buffer contains the marker at the expected cell after feeding the pty bytes through the parser."
 
 **Delivered.**
 - **Bug fix:** Through Slice C1, daemon's `pane_subs` was `JoinSet<()>` with no per-id key — `Payload::Unsubscribe { id }` only touched `status_sub` and `docker_subs`, so the C1 TUI's synthetic re-attach was leaking one zombie pane forwarder per Scope→Pane mode switch (daemon CPU + writer-mpsc bandwidth burnt indefinitely; pane bytes sent over the socket twice). Refactored `pane_subs` to `HashMap<u64, AbortHandle>` mirroring `docker_subs`, wired `Unsubscribe` to cancel pane forwarders, and made `AttachPane` on an existing sub_id replace + abort the previous (defensive). On session end, both maps drain + abort.
@@ -142,7 +188,9 @@ Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode
 - Container table widget, three-state lifecycle visuals, navigation, filter (see C2 commit 2 scope below).
 - The 3 small test gaps (per CTO C2 first-commit list): `second_switch_to_pane_is_idempotent`, `help_in_pane_mode_is_dropped`, and the new `AppAction::ShowToast` variant for `Payload::Error` + `DockerActionResult::Failure` routing.
 
-##### C2 commit 2 — rendering work · ✅
+##### C2 commit 2 — rendering work · ✅ (content survives; re-plumbed to a tile `Rect` in C1.5b)
+
+**C1.5 salvage.** `DockerScope` state struct (Idle/Connecting/Available/Unavailable), three-state lifecycle rendering, navigation (j/k/arrows/g/G/Home/End), filter (`/` activate, `Enter` commit, `Esc` clear, `Backspace` edit, case-insensitive substring over name + image), selection clamping, `AppAction::ShowToast { kind, message }` wire, and `Payload::Error` / `DockerActionResult::Failure` routing to `ToastKind::Error` all survive. The renderer signature changes from owning the full `Frame` to `(state, Frame, Rect)`; the 7 headless render cases adjust to draw into a sub-`Rect` rather than the full frame. The mode-switch-specific App tests (`switch_to_scope` / `switch_to_pane` allocation, `pane_output_in_scope_mode_is_dropped` in its current framing, the idempotent-double-switch pair) are replaced in C1.5b with focus-navigation equivalents; the Docker subscription-lifecycle tests, ShowToast-routing tests, and CTO test-gap cases all survive.
 
 **Delivered.**
 - `tepegoz-tui/src/app.rs` rewritten:
@@ -165,7 +213,9 @@ Slice C is the heaviest TUI refactor in v1 — it rebuilds the TUI as a two-mode
 - 27 `tepegoz-tui::app::tests` (up from 14) including the 3 CTO-requested gaps (`second_switch_to_pane_is_idempotent`, `ctrl_b_question_in_pane_mode_is_dropped`, and the `DockerActionResult::Success does not toast yet` + `Payload::Error routes to ShowToast` pair for the ShowToast wire) plus navigation (j/k/arrows/g/G/Home/End), filter (narrow/commit/clear/backspace), and Docker subscription lifecycle (subscribe-on-enter, Unsubscribe-on-leave, state transitions).
 - 7 `tepegoz-tui::scope::docker::tests` headless render tests using `ratatui::backend::TestBackend(120×30)`: Available state renders container table with names/images/states + `▶` marker; Connecting message; Unavailable with verbatim reason; Available-but-empty shows distinct "No containers"; filter matching nothing; filter-bar caret when active; ports column renders public + internal mappings (uses 180-wide TestBackend for the port test since port strings overflow 120 cols after the fixed NAME/IMAGE/STATUS columns consume their share).
 
-##### C2 commit 3 — end-to-end test + eyeball demo · 🟡 (automated part landed; eyeball pending user)
+##### C2 commit 3 — end-to-end test + eyeball demo · 🟡 (latency pin survives; eyeball demo replaced by C1.5c)
+
+**C1.5 salvage.** The `crates/tepegoz-core/tests/docker_scope.rs::docker_scope_lists_provisioned_container_within_2s` latency pin is daemon-side and unaffected — stays green unchanged. The eyeball demo originally gated on C2c3 (vim-preservation across Scope→Pane re-attach + CTO §7 engine-unavailable-mid-session) is moot: the synthetic re-attach goes away, and the new user-facing gate is C1.5c (god-view rendering + focus nav + vim-in-pty-tile + tile-coexistence + detach/reattach). The CTO §7 engine-unavailable check moves into C1.5c since the Docker tile is always-subscribed in the tiled layout.
 
 **Delivered (automated).**
 - `crates/tepegoz-core/tests/docker_scope.rs::docker_scope_lists_provisioned_container_within_2s` — opt-in `TEPEGOZ_DOCKER_TEST=1`. Provisions a unique-per-PID `alpine:latest` container (`sleep 120`), subscribes to Docker, asserts the first `ContainerList` arrives in <2 s *and* contains the provisioned container by name. Force-removes on `Drop` so panics don't leak. The 2-second threshold pins the "feels responsive on Ctrl-b s" UX contract; a slip there would make scope view feel broken.

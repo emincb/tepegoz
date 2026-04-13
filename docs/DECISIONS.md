@@ -51,6 +51,43 @@ Full fork-exec graceful restart with pty inheritance is revisited in v2 if real 
 
 **Diagnostic:** `tepegoz doctor --claude-layout` dumps detected signature + known signatures for bug reports.
 
+## 7. UI substrate: tiled god view, opinionated default, vt100 via `vt100` crate
+
+**Decision.** The v1 TUI is a fixed tiled layout. All scopes are visible
+simultaneously; there is no mode switching. Focus moves between tiles;
+content in unfocused tiles continues to update live.
+
+**Default layout (non-configurable in v1).** Rendered on first run of
+`tepegoz tui` with no setup:
+
+- PTY tile: top row, full width
+- Docker tile: bottom-left
+- Ports tile: bottom-middle
+- Fleet tile: bottom-right
+- Claude Code tile: bottom-full-width strip under the scope row
+
+Scopes not yet implemented render a labeled placeholder tile ("Ports —
+Phase 4", etc.) that the user can see but not interact with. As each
+phase lands, the placeholder is replaced by the live tile with no layout
+change.
+
+**vt100 emulation.** The pty tile is rendered via the `vt100` crate: pty
+bytes feed the parser; the parser's screen buffer renders as a ratatui
+widget within the tile's Rect. Raw passthrough is gone.
+
+**Focus.** `Ctrl-b` followed by `h`/`j`/`k`/`l` or arrow keys moves focus
+between adjacent tiles. The focused tile owns the keystroke stream.
+`Ctrl-b d` / `Ctrl-b q` still detach from any focus.
+
+**Configuration.** Zero. The user does not choose a layout, does not
+enable tiles, does not opt in. `tepegoz tui` → god view. User
+configurability of the layout is explicitly deferred; revisit in v2.
+
+**What this supersedes.** The C1 `View::{Pane, Scope}` mode enum and the
+`switch_to_scope`/`switch_to_pane` synthetic-re-attach pattern are
+removed as part of C1.5. The `AppEvent`/`AppAction` bus is retained;
+`View` is redefined as `{ layout: TileLayout, focused: TileId }`.
+
 ---
 
 ## Durable working rules
