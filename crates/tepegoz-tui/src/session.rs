@@ -136,7 +136,7 @@ async fn attach(
 
     // Terminal goes raw for the lifetime of the attach; guard restores it
     // on any exit path.
-    terminal::enter_raw()?;
+    terminal::enter_raw(&format!("tepegoz · pane {pane_id}"))?;
     let _guard = terminal::TerminalGuard;
 
     // Tell the daemon our current size — the pane's initial size might not
@@ -161,7 +161,7 @@ async fn attach(
 
     let mut winch = signal(SignalKind::window_change())?;
 
-    tracing::info!("attach loop starting");
+    debug!("attach loop starting");
 
     let exit_reason: ExitReason = 'attach: loop {
         tokio::select! {
@@ -171,7 +171,7 @@ async fn attach(
                     Ok(n) => n,
                     Err(e) => break 'attach ExitReason::StdinError(e.to_string()),
                 };
-                tracing::info!(
+                debug!(
                     n,
                     preview = %format_bytes(&stdin_buf[..n.min(64)]),
                     "stdin read"
@@ -179,9 +179,8 @@ async fn attach(
                 for action in input_filter.process(&stdin_buf[..n]) {
                     match action {
                         InputAction::Forward(bytes) => {
-                            tracing::info!(
+                            debug!(
                                 len = bytes.len(),
-                                preview = %format_bytes(&bytes[..bytes.len().min(64)]),
                                 "forward to daemon"
                             );
                             let env = Envelope {
@@ -193,7 +192,7 @@ async fn attach(
                             }
                         }
                         InputAction::Detach => {
-                            tracing::warn!("InputFilter produced Detach");
+                            debug!("InputFilter produced Detach");
                             break 'attach ExitReason::UserDetach;
                         }
                     }
