@@ -11,5 +11,8 @@ description = "Ratatui-based TUI client for the Tepegöz daemon."
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+ratatui = "0.28"
+crossterm = "0.28"
 tepegoz-proto = { workspace = true }

@@ -1,1 +1,14 @@
 //! Tepegöz daemon engine — state store, event bus, and command dispatch.
+//!
+//! The daemon binds a Unix socket, accepts clients, and serves the
+//! [`tepegoz-proto`] wire protocol. State lives here; the TUI (and later,
+//! web/phone clients and the AI orchestrator) are clients that observe and
+//! act on this state through the protocol.
+
+mod client;
+mod config;
+mod daemon;
+mod state;
+
+pub use config::DaemonConfig;
+pub use daemon::run_daemon;

@@ -6,6 +6,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Wire protocol types for Tepegöz (rkyv envelope, versioned)."
+description = "Wire protocol types, rkyv codec, and default socket path for Tepegöz."
 
 [dependencies]
+rkyv = "0.8"
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"

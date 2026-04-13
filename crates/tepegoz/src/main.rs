@@ -62,30 +62,42 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    init_tracing(&cli.log_level);
 
     match cli.command {
         Command::Daemon { socket } => {
-            tracing::info!(?socket, "daemon mode — scaffold only");
+            init_stdout_tracing(&cli.log_level);
+            tepegoz_core::run_daemon(tepegoz_core::DaemonConfig {
+                socket_path: socket,
+            })
+            .await
         }
         Command::Tui { socket } => {
-            tracing::info!(?socket, "tui mode — scaffold only");
+            // TUI sets up its own file-backed tracing to avoid corrupting the display.
+            tepegoz_tui::run(tepegoz_tui::TuiConfig {
+                socket_path: socket,
+                log_level: cli.log_level,
+            })
+            .await
         }
         Command::Connect { target } => {
-            tracing::info!(%target, "connect mode — scaffold only");
+            init_stdout_tracing(&cli.log_level);
+            tracing::info!(%target, "connect mode — not yet implemented (Phase 5)");
+            Ok(())
         }
         Command::Agent { stdio } => {
-            tracing::info!(stdio, "agent mode — scaffold only");
+            init_stdout_tracing(&cli.log_level);
+            tracing::info!(stdio, "agent mode — not yet implemented (Phase 6)");
+            Ok(())
         }
         Command::Doctor { claude_layout } => {
-            tracing::info!(claude_layout, "doctor mode — scaffold only");
+            init_stdout_tracing(&cli.log_level);
+            tracing::info!(claude_layout, "doctor mode — not yet implemented");
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
-fn init_tracing(default_level: &str) {
+fn init_stdout_tracing(default_level: &str) {
     use tracing_subscriber::EnvFilter;
 
     let default_directive = default_level

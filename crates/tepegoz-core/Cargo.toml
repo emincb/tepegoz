@@ -13,3 +13,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 tepegoz-proto = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
