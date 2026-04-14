@@ -654,9 +654,22 @@ tools; file mode is `0600` on Unix.
 
 On key mismatch (presented key differs from stored), tepegöz rejects
 the connection with a structured error pointing at the stored record's
-file + line. Recovery path (once 5b's diagnostic lands): `tepegoz
-doctor --ssh-forget <alias>` — intentionally a two-step operation so a
-legitimate key-rotation gets verified before the new key is trusted.
+file + line. Recovery:
+
+```sh
+$ tepegoz doctor --ssh-forget staging
+removed 1 entry(ies) for staging.internal:22 from /Users/alice/Library/Application Support/tepegoz/known_hosts — next connection to 'staging' will re-TOFU the new key
+```
+
+Only exact single-host entries (tepegoz's own writes) are removed.
+Multi-host comma-separated patterns and hashed `|1|…` entries are
+treated as user-owned and preserved — if you maintain those by hand,
+tepegöz won't surgery them. The file mode stays `0600` across the
+rewrite.
+
+**Intentionally a two-step recovery** (`--ssh-forget` then reconnect)
+so a legitimate key rotation gets verified before the new key is
+trusted.
 
 ## Common issues
 

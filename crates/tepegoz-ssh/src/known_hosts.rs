@@ -98,21 +98,90 @@ impl KnownHostsStore {
                 reason: e.to_string(),
             }
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            if let Err(e) = std::fs::set_permissions(&self.path, perms) {
-                // Don't fail the operation — the entry is persisted;
-                // mode is a defense-in-depth nicety. Trace-level log.
-                tracing::debug!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "failed to chmod 0600 on known_hosts (entry was written successfully)"
-                );
-            }
-        }
+        chmod_0600(&self.path);
         Ok(())
+    }
+
+    /// Remove any entries matching `(hostname, port)` from the
+    /// known_hosts file. Returns the number of lines removed.
+    ///
+    /// Matches only simple single-host entries (the shape `trust`
+    /// writes: `host` for port 22, `[host]:port` otherwise). Multi-
+    /// host patterns (comma-separated), negated patterns, and hashed
+    /// `|1|…` entries are preserved — those come from user hand-edits
+    /// or OpenSSH-style hashing and aren't tepegoz's to surgery.
+    ///
+    /// The file mode is re-applied to `0600` on Unix after the rewrite
+    /// so `forget` doesn't loosen perms relative to what `trust` set.
+    pub fn forget(&self, hostname: &str, port: u16) -> Result<usize, SshError> {
+        let target = if port == 22 {
+            hostname.to_string()
+        } else {
+            format!("[{hostname}]:{port}")
+        };
+
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(SshError::KnownHosts {
+                    path: self.path.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        };
+
+        let mut removed = 0;
+        let mut kept = String::with_capacity(raw.len());
+        for line in raw.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                kept.push_str(line);
+                kept.push('\n');
+                continue;
+            }
+            let first_token = trimmed.split_whitespace().next().unwrap_or("");
+            if first_token == target {
+                removed += 1;
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+        }
+
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        std::fs::write(&self.path, kept).map_err(|e| SshError::KnownHosts {
+            path: self.path.clone(),
+            reason: format!("failed to rewrite after forget: {e}"),
+        })?;
+        chmod_0600(&self.path);
+        Ok(removed)
+    }
+}
+
+/// Re-apply `0600` permissions on Unix. Extracted from `trust` + `forget`
+/// so both file-mutating ops land at the same posture. Logs at
+/// debug-level on failure rather than surfacing — the data operation
+/// has already succeeded by the time this runs.
+fn chmod_0600(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(e) = std::fs::set_permissions(path, perms) {
+            tracing::debug!(
+                path = %path.display(),
+                error = %e,
+                "failed to chmod 0600 on known_hosts"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
 
@@ -205,6 +274,104 @@ mod tests {
             mode, 0o600,
             "known_hosts should be 0600 after trust (OpenSSH convention)"
         );
+    }
+
+    #[test]
+    fn forget_removes_matching_entry_and_returns_count() {
+        let dir = TempDir::new().unwrap();
+        let store = KnownHostsStore::open_at(dir.path().join("known_hosts"));
+        store.trust("a.box", 22, &parse(KEY_A)).unwrap();
+        store.trust("b.box", 22, &parse(KEY_A)).unwrap();
+        // Sanity — both are trusted.
+        assert_eq!(
+            store.check("a.box", 22, &parse(KEY_A)).unwrap(),
+            HostKeyVerdict::Trusted
+        );
+        assert_eq!(
+            store.check("b.box", 22, &parse(KEY_A)).unwrap(),
+            HostKeyVerdict::Trusted
+        );
+
+        let removed = store.forget("a.box", 22).unwrap();
+        assert_eq!(
+            removed, 1,
+            "forget should remove exactly the matching entry"
+        );
+
+        // a.box is now unknown; b.box is still trusted.
+        assert_eq!(
+            store.check("a.box", 22, &parse(KEY_A)).unwrap(),
+            HostKeyVerdict::Unknown
+        );
+        assert_eq!(
+            store.check("b.box", 22, &parse(KEY_A)).unwrap(),
+            HostKeyVerdict::Trusted
+        );
+    }
+
+    #[test]
+    fn forget_noop_on_missing_file_returns_zero() {
+        let dir = TempDir::new().unwrap();
+        let store = KnownHostsStore::open_at(dir.path().join("known_hosts"));
+        let removed = store.forget("never.trusted.box", 22).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn forget_encodes_non_default_port_with_brackets() {
+        let dir = TempDir::new().unwrap();
+        let store = KnownHostsStore::open_at(dir.path().join("known_hosts"));
+        store.trust("alt.box", 2222, &parse(KEY_A)).unwrap();
+        // Port 22 forget on same hostname must NOT match.
+        assert_eq!(store.forget("alt.box", 22).unwrap(), 0);
+        // Port 2222 forget removes the entry.
+        assert_eq!(store.forget("alt.box", 2222).unwrap(), 1);
+        assert_eq!(
+            store.check("alt.box", 2222, &parse(KEY_A)).unwrap(),
+            HostKeyVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn forget_preserves_unrelated_multi_host_lines() {
+        // User has hand-edited a multi-host comma-separated entry
+        // (OpenSSH-native format) — tepegöz should NOT surgery it.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(
+            &path,
+            "# user-authored multi-host entry\n\
+             host1.box,host2.box,10.0.0.1 ssh-ed25519 \
+             AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ\n",
+        )
+        .unwrap();
+        let store = KnownHostsStore::open_at(&path);
+        // Asking to forget one of the hosts in the pattern must NOT
+        // remove the line (only exact single-token matches are
+        // touched).
+        let removed = store.forget("host1.box", 22).unwrap();
+        assert_eq!(
+            removed, 0,
+            "multi-host patterns are user-owned and preserved on forget"
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("host1.box,host2.box"),
+            "multi-host line must survive: {contents:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forget_preserves_0600_mode_after_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("known_hosts");
+        let store = KnownHostsStore::open_at(&path);
+        store.trust("mode.box", 22, &parse(KEY_A)).unwrap();
+        store.forget("mode.box", 22).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "forget must re-apply 0600 after the rewrite");
     }
 
     #[test]

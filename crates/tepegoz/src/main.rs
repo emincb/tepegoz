@@ -64,6 +64,14 @@ enum Command {
         /// can't find a host, or to verify an override is active.
         #[arg(long)]
         ssh_hosts: bool,
+        /// Forget the tepegoz-owned host-key entry for an alias.
+        /// Resolves the alias through the current host list, then
+        /// removes matching entries from `known_hosts` (tepegoz's
+        /// own, NOT `~/.ssh/known_hosts`). Recovery path after a
+        /// `HostKeyMismatch` rejection — use only after verifying
+        /// the key change is legitimate.
+        #[arg(long, value_name = "ALIAS")]
+        ssh_forget: Option<String>,
     },
 }
 
@@ -100,9 +108,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor {
             claude_layout,
             ssh_hosts,
+            ssh_forget,
         } => {
             init_stdout_tracing(&cli.log_level);
-            if ssh_hosts {
+            if let Some(alias) = ssh_forget {
+                forget_ssh_host(&alias)
+            } else if ssh_hosts {
                 dump_ssh_hosts()
             } else {
                 tracing::info!(claude_layout, "doctor mode — not yet implemented");
@@ -139,6 +150,39 @@ fn dump_ssh_hosts() -> anyhow::Result<()> {
         if let Some(jump) = &host.proxy_jump {
             println!("    ProxyJump: {jump} (not supported in v1 — Slice 5c surfaces this)");
         }
+    }
+    Ok(())
+}
+
+fn forget_ssh_host(alias: &str) -> anyhow::Result<()> {
+    use tepegoz_ssh::{HostList, KnownHostsStore};
+    let hosts =
+        HostList::discover().map_err(|e| anyhow::anyhow!("ssh host discovery failed: {e}"))?;
+    let entry = hosts.get(alias).ok_or_else(|| {
+        anyhow::anyhow!(
+            "alias '{alias}' not found in host list (source: {})",
+            hosts.source.label()
+        )
+    })?;
+    let store = KnownHostsStore::open().map_err(|e| anyhow::anyhow!("open known_hosts: {e}"))?;
+    let removed = store
+        .forget(&entry.hostname, entry.port)
+        .map_err(|e| anyhow::anyhow!("forget: {e}"))?;
+    if removed == 0 {
+        println!(
+            "no entries for {}:{} in {}",
+            entry.hostname,
+            entry.port,
+            store.path().display()
+        );
+    } else {
+        println!(
+            "removed {removed} entry(ies) for {}:{} from {} — \
+             next connection to '{alias}' will re-TOFU the new key",
+            entry.hostname,
+            entry.port,
+            store.path().display()
+        );
     }
     Ok(())
 }
