@@ -3,25 +3,117 @@
 //! Frame layout: `[4-byte big-endian u32 length] [rkyv bytes]`.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::debug;
 
-use crate::Envelope;
+use crate::{Envelope, Event, Payload};
 
 /// Maximum frame size. Defends against malformed or hostile length prefixes.
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Diagnostic: stable discriminant string for a [`Payload`]. Added during
+/// the Phase 4 4d wire-desync investigation so the writer task + codec can
+/// log exactly which envelope kind was last written / failed to read.
+///
+/// Keeping this as a pure function on the payload ref (no `Debug` cost, no
+/// allocation) so it can sit on every hot-path write without contaminating
+/// profiles when the log level doesn't filter it out.
+fn payload_variant(p: &Payload) -> &'static str {
+    match p {
+        Payload::Hello(_) => "Hello",
+        Payload::Ping => "Ping",
+        Payload::Subscribe(_) => "Subscribe",
+        Payload::Unsubscribe { .. } => "Unsubscribe",
+        Payload::OpenPane(_) => "OpenPane",
+        Payload::AttachPane { .. } => "AttachPane",
+        Payload::ClosePane { .. } => "ClosePane",
+        Payload::ListPanes => "ListPanes",
+        Payload::SendInput { .. } => "SendInput",
+        Payload::ResizePane { .. } => "ResizePane",
+        Payload::DockerAction(_) => "DockerAction",
+        Payload::Welcome(_) => "Welcome",
+        Payload::Pong => "Pong",
+        Payload::Event(frame) => match &frame.event {
+            Event::Status(_) => "Event::Status",
+            Event::PaneSnapshot { .. } => "Event::PaneSnapshot",
+            Event::PaneOutput { .. } => "Event::PaneOutput",
+            Event::PaneExit { .. } => "Event::PaneExit",
+            Event::PaneLagged { .. } => "Event::PaneLagged",
+            Event::ContainerList { .. } => "Event::ContainerList",
+            Event::DockerUnavailable { .. } => "Event::DockerUnavailable",
+            Event::ContainerLog { .. } => "Event::ContainerLog",
+            Event::ContainerStats(_) => "Event::ContainerStats",
+            Event::DockerStreamEnded { .. } => "Event::DockerStreamEnded",
+            Event::PortList { .. } => "Event::PortList",
+            Event::PortsUnavailable { .. } => "Event::PortsUnavailable",
+            Event::ProcessList { .. } => "Event::ProcessList",
+            Event::ProcessesUnavailable { .. } => "Event::ProcessesUnavailable",
+        },
+        Payload::PaneOpened(_) => "PaneOpened",
+        Payload::PaneList { .. } => "PaneList",
+        Payload::DockerActionResult(_) => "DockerActionResult",
+        Payload::Error(_) => "Error",
+    }
+}
+
 /// Encode an [`Envelope`] to rkyv and write it with a length prefix.
+///
+/// Returns the total number of bytes written (4-byte length prefix +
+/// payload). The writer task uses this to maintain a running byte
+/// counter for desync diagnostics — see `spawn_writer_task` in
+/// `tepegoz-core::client`.
 pub async fn write_envelope<W: AsyncWrite + Unpin>(
     writer: &mut W,
     envelope: &Envelope,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(envelope)
         .map_err(|e| anyhow::anyhow!("rkyv serialize: {e}"))?;
     let len = u32::try_from(bytes.len())
         .map_err(|_| anyhow::anyhow!("envelope too large: {} bytes", bytes.len()))?;
+
+    // DIAGNOSTIC (Phase 4 4d desync investigation): before the write,
+    // record exactly what we're about to emit — payload variant, the
+    // logical `bytes.len()` that becomes the wire length prefix, and
+    // the AlignedVec's `capacity()` so we can see whether extra
+    // padding bytes might be leaking past the length boundary. Also
+    // log the first-byte hash of the AlignedVec slice so we can
+    // cross-reference exactly which payload made it onto the wire
+    // when the client reads a mid-stream length prefix.
+    let slice: &[u8] = &bytes;
+    let first_four_hex = {
+        let n = slice.len().min(4);
+        let mut s = String::with_capacity(n * 2);
+        for b in &slice[..n] {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    };
+    debug!(
+        payload_variant = payload_variant(&envelope.payload),
+        bytes_len = bytes.len(),
+        aligned_vec_capacity = bytes.capacity(),
+        wire_slice_len = slice.len(),
+        first_four_hex = %first_four_hex,
+        "write_envelope: serialized"
+    );
+
+    // Sanity check: the slice we hand to `write_all` must have the
+    // same length as the `len` we prefix. If rkyv 0.8's AlignedVec
+    // `Deref<Target = [u8]>` ever returns padded bytes past the
+    // logical length, this `debug_assert_eq!` catches it in dev
+    // builds. (In release it's a no-op; the diagnostic-log variant
+    // above still runs.)
+    debug_assert_eq!(
+        slice.len(),
+        bytes.len(),
+        "AlignedVec deref len must match bytes.len() — if this fires, \
+         write_all writes more than the length prefix promises and the \
+         client desyncs."
+    );
+
     writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(&bytes).await?;
+    writer.write_all(slice).await?;
     writer.flush().await?;
-    Ok(())
+    Ok(4 + slice.len())
 }
 
 /// Read a length prefix and decode the following rkyv payload into an [`Envelope`].
@@ -34,7 +126,29 @@ pub async fn read_envelope<R: AsyncRead + Unpin>(reader: &mut R) -> anyhow::Resu
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_SIZE {
-        anyhow::bail!("frame size {len} exceeds max {MAX_FRAME_SIZE}");
+        // DIAGNOSTIC (Phase 4 4d desync investigation): dump the raw
+        // length-prefix bytes + try to read and dump the next 32 bytes
+        // of the stream so we can see what valid payload we're
+        // mid-stream of when the desync fires. Connection is about
+        // to error out anyway — free to consume.
+        let mut peek_buf = [0u8; 32];
+        let peek_result = reader.read_exact(&mut peek_buf).await;
+        let peek_hex = match peek_result {
+            Ok(_) => hex_dump(&peek_buf),
+            Err(e) => format!("(failed to read next 32 bytes: {e})"),
+        };
+        debug!(
+            len_buf_hex = %hex_dump(&len_buf),
+            len_u32_be = len,
+            next_32_bytes_hex = %peek_hex,
+            "read_envelope: length prefix exceeds MAX_FRAME_SIZE — wire desync"
+        );
+        anyhow::bail!(
+            "frame size {len} exceeds max {MAX_FRAME_SIZE}. \
+             len_buf=[{len_buf_hex}] next32=[{next}]",
+            len_buf_hex = hex_dump(&len_buf),
+            next = peek_hex,
+        );
     }
 
     // rkyv's access path requires aligned storage. Read into a plain Vec,
@@ -47,6 +161,19 @@ pub async fn read_envelope<R: AsyncRead + Unpin>(reader: &mut R) -> anyhow::Resu
 
     rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&aligned)
         .map_err(|e| anyhow::anyhow!("rkyv deserialize: {e}"))
+}
+
+/// Hex-dump a byte slice as lowercase space-separated pairs. Diagnostic
+/// only; not on any hot path.
+fn hex_dump(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 #[cfg(test)]
