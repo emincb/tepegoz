@@ -302,7 +302,7 @@ Users retain `docker exec -it <container> sh` in their local pty tile as the v1 
 
 ---
 
-## Phase 4 — Ports + processes panels (local) · 🟠 (4a landed; 4b/4c/4d pending)
+## Phase 4 — Ports + processes panels (local) · 🟠 (4a + 4b landed; 4c/4d pending)
 
 Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-state within the Ports tile (lowercase `p` toggles between Ports and Processes views) rather than a new Decision #7 tile — solves the "processes without a bound port" flow while respecting the god-view layout; (Q2) probe uses the cross-OS `netstat2` wrapper (procfs on Linux, libproc on macOS) plus `sysinfo` for pid → process name; (Q3) daemon-side correlation so clients stay dumb; (Q4) 2 s refresh cadence matching Docker; (Q5) 4 sub-slices.
 
@@ -310,7 +310,7 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 
 **Slice breakdown.**
 
-### Slice 4a — Daemon Ports probe + wire + correlation + opt-in test · 🟡 (`<4a commit>`)
+### Slice 4a — Daemon Ports probe + wire + correlation + opt-in test · ✅ (`1111bbf`, `8285543`, `4ba452e`)
 
 **Delivered.**
 - Wire protocol bumped to **v5**. New subscription `Subscription::Ports { id }`. New events `Event::PortList { ports, source }` and `Event::PortsUnavailable { reason }`. New struct `ProbePort { local_ip, local_port, protocol, pid, process_name, container_id: Option<String>, partial: bool }`.
@@ -333,13 +333,22 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 - `crates/tepegoz-core/tests/ports_scope.rs::ports_subscription_emits_either_port_list_or_unavailable` — always-on: subscribes, asserts the daemon emits exactly one of `PortList | PortsUnavailable` within 30 s with non-empty `source`/`reason` string.
 - `crates/tepegoz-core/tests/ports_scope.rs::ports_subscription_sees_locally_bound_listener_within_budget` — opt-in `TEPEGOZ_PROBE_TEST=1`: binds an ephemeral TCP listener in the test process, subscribes, drains events until a `PortList` includes the bound `local_port`, asserts the row attributes `pid == std::process::id()`, `protocol == "tcp"`, and non-empty `process_name` within a 6 s budget.
 
-### Slice 4b — Daemon Processes probe + wire + integration test · ⚪
+### Slice 4b — Daemon Processes probe + wire + integration test · 🟡 (`<4b commit>`)
 
-**Scope.**
-- Extend `tepegoz-probe` with a `list_processes()` entry returning `Vec<ProbeProcess>` ({pid, parent_pid, command, cpu_percent, mem_bytes, partial}). `sysinfo` cross-OS for the enumeration; CPU% from a 2 s delta with first-sample-seeds semantics per CTO's note (first `ProcessList` event has `cpu_percent == 0.0` for every row; document in a tile footer on 4c).
-- Wire: `Subscription::Processes { id }` + `Event::ProcessList { rows: Vec<ProbeProcess>, source }` + `Event::ProcessesUnavailable { reason }`. Protocol bump to v6 if no earlier bump lands.
-- Daemon: `forward_processes` task mirroring `forward_ports` in the uniform `HashMap<id, AbortHandle>` pattern.
-- Opt-in integration test `TEPEGOZ_PROBE_TEST=1`: spawns a known child process, subscribes, asserts the row appears with correct cmdline + either non-zero CPU% or zero-with-partial-flag within a 3 s budget.
+**Delivered.**
+- Wire protocol bumped to **v6**. New subscription `Subscription::Processes { id }`. New events `Event::ProcessList { rows: Vec<ProbeProcess>, source }` and `Event::ProcessesUnavailable { reason }`. New struct `ProbeProcess { pid, parent_pid, start_time_unix_secs, command, cpu_percent: Option<f32>, mem_bytes, partial }`. The `Option<f32>` for `cpu_percent` is deliberate — `None` signals "not yet measured" (first sample after subscription, before any delta); `Some(x)` signals a measured value including `Some(0.0)` which correctly means "idle". The TUI renders `None` as an em-dash; wire-level it's a one-byte tag.
+- `tepegoz-probe::processes` module with `ProcessesProbe` struct. Stateful (`{ system: sysinfo::System, first_sample: bool }`) since sysinfo's CPU% comes from a delta between consecutive `refresh_processes_specifics` calls. `ProcessesProbe::sample() -> Result<Vec<ProbeProcess>, ProcessesError>` refreshes the system snapshot and returns one row per visible process. First call emits `cpu_percent: None` (sysinfo has no prior delta); subsequent calls emit `Some(x)`. `start_time_unix_secs` populated from `sysinfo::Process::start_time()` so `(pid, start_time)` can serve as a stable identity for selection persistence under pid-reuse (4c concern; wire is already shaped for it).
+- `tepegoz-probe::processes::SOURCE_LABEL = "sysinfo"` — delivered in `Event::ProcessList { source }` so the TUI can surface the backend in the tile footer.
+- Daemon `forward_processes` task in `tepegoz-core::client`: per-`Subscribe(Processes)` poll loop in the uniform `HashMap<id, AbortHandle>` pattern. Refreshes every 2 s. The probe is stateful, so the task owns the `ProcessesProbe` and moves it into `spawn_blocking` each iteration (sysinfo's refresh is sync /proc reads + syscalls, not async), receiving it back through the closure return tuple to preserve the delta computation across iterations. On `JoinError` (probe task panics) the task resets to a fresh probe — the next emitted event will again carry `cpu_percent: None` (correct per the probe contract).
+- Tests: 3 new proto codec roundtrips (`subscribe_processes_roundtrip`, `process_list_event_roundtrip_preserves_first_sample_cpu_none` pinning `None` ≠ `Some(0.0)`, `processes_unavailable_event_roundtrip`); 3 probe unit tests (first-sample-None invariant, second-sample-Some invariant, own-pid-appears-with-non-empty-command); 1 always-on + 1 opt-in integration test in `crates/tepegoz-core/tests/processes_scope.rs`. 180 total on macOS / 189 on ubuntu-latest.
+
+**No deviations from the CTO's 4b sign-off.** The CTO's three 4b-specific notes all baked in: first-sample CPU% = None semantic (wire carries it via `Option<f32>` + probe emits None on first refresh + integration test pins it); `(pid, start_time)` stable identity for 4c selection persistence (`start_time_unix_secs` shipped on `ProbeProcess`); opt-in test shape (spawned child with cmdline assertion + `ChildGuard` force-kills on Drop).
+
+**Acceptance tests.**
+- `tepegoz-proto::codec::{subscribe_processes_roundtrip, process_list_event_roundtrip_preserves_first_sample_cpu_none, processes_unavailable_event_roundtrip}` — wire integrity including the `None` ≠ `Some(0.0)` invariant (the roundtrip test asserts `r[0].cpu_percent.is_none()` after rkyv serialization / deserialization).
+- `tepegoz-probe::processes::tests::{first_sample_returns_cpu_none_for_every_row, second_sample_returns_cpu_some_for_every_row, sample_contains_current_test_process}` — probe contract + self-attribution.
+- `crates/tepegoz-core/tests/processes_scope.rs::processes_subscription_emits_either_process_list_or_unavailable` (always-on): asserts `ProcessList` xor `ProcessesUnavailable` within 30 s with non-empty source / reason AND that every row in the first `ProcessList` carries `cpu_percent: None`.
+- `crates/tepegoz-core/tests/processes_scope.rs::processes_subscription_sees_spawned_child_within_budget` (opt-in `TEPEGOZ_PROBE_TEST=1`): spawns a known `sleep 30` child (`ChildGuard` force-kills on Drop), subscribes, drains until the child's pid appears with command containing `"sleep"`, non-zero `start_time_unix_secs`, non-zero `mem_bytes` (or `partial: true`). 5 s budget covers one refresh boundary.
 
 ### Slice 4c — Ports tile TUI with Processes toggle · ⚪
 

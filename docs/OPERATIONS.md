@@ -484,6 +484,12 @@ The native ports probe (Phase 4 Slice 4a) attributes listening sockets to proces
 
 Per the project's "root everywhere" user profile this is the expected deployment posture; non-root sessions still produce a useful port list (your own listeners + `partial: true` rows for everyone else's), just with the partial cue for things you can't attribute. Opt-in integration tests run with `TEPEGOZ_PROBE_TEST=1` should therefore be on hosts where you've prepared the access profile the real daemon will have.
 
+### Processes scope rows show first-sample `cpu_percent: None` (em-dash)
+Not a bug. The processes probe (Phase 4 Slice 4b) computes CPU% as a delta between consecutive `sysinfo` refreshes; the first `ProcessList` event after `Subscribe(Processes)` has no prior delta to compute against, so every row carries `cpu_percent: None` and the TUI renders it as an em-dash. Subsequent events (2 s after, 4 s after, ...) carry `Some(x)`. If CPU% stays `None` beyond the first refresh, check the daemon's `forward_processes` task logs — a probe-task panic resets the probe to a fresh state, and the next event again emits `None`.
+
+### Processes scope shows empty / abbreviated cmdlines for other users' processes
+On macOS, `sysinfo`'s `Process::cmd()` sometimes returns a truncated argv (just the binary name, not the full argument list) for processes not owned by the calling user. This is a `libproc` limitation — elevating the daemon (or granting full-disk-access to the terminal) typically fills the rest. The `partial: true` flag is set when `command` ends up empty; a truncated-but-non-empty command does NOT set `partial`, on the theory that "something is better than nothing" for the display.
+
 ## Diagnosing the running daemon
 
 ```sh

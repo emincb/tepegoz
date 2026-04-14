@@ -59,35 +59,40 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## Engineer section
 
-**Last updated:** 2026-04-14, Phase 4 Slice 4a landed (daemon-side Ports probe + wire + correlation).
+**Last updated:** 2026-04-14, Phase 4 Slices 4a + 4b landed (daemon sides of Ports + Processes).
 
 ### Where I left off
 
-Phase 4 Slice 4a shipped. One commit on `main` (awaiting CTO review + cross-OS CI green). 172 tests on macOS / 181 on ubuntu-latest, `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean.
+Phase 4 Slice 4b shipped. Awaiting CTO review + cross-OS CI green. 180 tests on macOS / 189 on ubuntu-latest, `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
-4a covers:
-- Wire v5: `Subscription::Ports { id }`, `Event::PortList { ports, source }`, `Event::PortsUnavailable { reason }`, `ProbePort { local_ip, local_port, protocol, pid, process_name, container_id: Option<String>, partial: bool }`. 3 new proto codec roundtrip tests including a `partial: true` row.
-- `tepegoz-probe::ports::list_ports()` cross-OS facade using `netstat2` (TCP listeners) + `sysinfo` (pid → process name).
-- `tepegoz-probe::linux::container_id_for_pid()` cgroup parser — handles cgroup v1 direct, v1 systemd scope, v2, kubelet-nested. 9 Linux-only unit tests cover edge cases.
-- `tepegoz-core::client::forward_ports` task in the uniform `HashMap<id, AbortHandle>` subscription model. 2 s refresh; once-per-flip `PortsUnavailable`. `tokio::task::spawn_blocking` around `list_ports` so blocking fs work doesn't stall the runtime.
-- macOS port → container correlation: `forward_ports` opens a `tepegoz_docker::Engine` connection when it sees rows needing correlation and matches `local_port` against bollard's container port bindings. Linux skips this entire block (probe already correlated via cgroup) — no redundant Docker round-trip on Linux polls.
-- Integration test `tests/ports_scope.rs`: always-on emits-xor + opt-in `TEPEGOZ_PROBE_TEST=1` provisions a loopback listener in the test process and verifies the probe finds it with correct pid + process_name within 6 s. Opt-in confirmed locally on macOS via libproc backend.
+4b covers:
+- Wire v6: `Subscription::Processes { id }`, `Event::ProcessList { rows, source }`, `Event::ProcessesUnavailable { reason }`, `ProbeProcess { pid, parent_pid, start_time_unix_secs, command, cpu_percent: Option<f32>, mem_bytes, partial }`. The `Option<f32>` for `cpu_percent` is deliberate — `None` encodes "not yet measured" (first sample after subscription, no prior delta); `Some(x)` encodes a real value including `Some(0.0)` which means "idle". Wire roundtrip test pins that `None` doesn't collapse to `Some(0.0)` through rkyv.
+- `tepegoz-probe::ProcessesProbe` — stateful probe that holds a `sysinfo::System` across samples. First `sample()` call emits `cpu_percent: None` for every row (sysinfo has no prior delta); subsequent calls emit `Some(x)`. `start_time_unix_secs` populated from `Process::start_time()` so `(pid, start_time)` forms a stable identity for selection persistence in 4c under pid reuse.
+- `tepegoz-core::client::forward_processes` task — daemon subscription loop in the uniform `HashMap<id, AbortHandle>` pattern. Probe moves into `spawn_blocking` each iteration and comes back via closure return tuple so the stateful delta computation persists while the runtime stays unblocked. On probe-task panic (JoinError), resets to a fresh probe; the next emit will carry `cpu_percent: None` again (correct per the probe contract).
+- Tests: 3 new proto codec roundtrips, 3 probe unit tests, 1 always-on + 1 opt-in integration test in `tests/processes_scope.rs`. Opt-in spawns `sleep 30` as a child with a `ChildGuard` that force-kills on Drop, asserts the child appears with command containing "sleep", non-zero start_time, non-zero mem (or partial:true). Confirmed locally on macOS.
 
-Two deviations from the proposal — both flagged in the 4a commit's ROADMAP section:
-- `netstat2` instead of raw netlink `NETLINK_SOCK_DIAG` on Linux. netstat2 wraps procfs text parsing; cross-OS shape is cleaner; upgrade to sock_diag as polish if profiling demands.
-- TCP-only listeners. UDP deferred because UDP has no LISTEN state so the UX semantics are ambiguous.
+No deviations from the CTO's 4b sign-off.
 
 ### What I'm mid-flight on
 
-_Nothing._ Awaiting CTO review of 4a before starting 4b. Don't start 4b code until sign-off.
+_Nothing._ Awaiting CTO review of 4b before starting 4c. Don't start 4c code until sign-off.
 
 ### What I'm expecting from the CTO next
 
-- **Review + sign-off on 4a**, or redirect. Specific things I flagged as tactical calls: (a) `netstat2` vs raw netlink — CTO may push back since the proposal committed to netlink; the Cargo.toml comment explains the reasoning but it's a legitimate deviation. (b) TCP-only scope — CTO may want UDP in 4a anyway. Either push-back lands as a follow-up commit.
-- **Go-ahead for 4b** (daemon Processes probe + wire). Same shape as 4a: `tepegoz-probe::list_processes()` via sysinfo, `Subscribe(Processes)` + `Event::ProcessList` + `Event::ProcessesUnavailable`, daemon `forward_processes` task, opt-in integration test. Protocol will bump to v6 unless 4b folds into a single v-bump per phase.
-- CI green on both OSes is my own gate; I'll check `gh run` after pushing and ping CTO only once both OSes are confirmed.
+- **Review + sign-off on 4b**, or redirect. I didn't deviate from the sign-off so the only push-back shapes I anticipate are: (a) probe module structure — I made it a stateful `ProcessesProbe` struct rather than a stateless function like `list_ports()`, because sysinfo's delta computation requires state persistence across calls; (b) the `Option<f32>` wire shape — CTO may prefer the Docker-stats convention of `f32` with `0.0` as sentinel, trading type-level clarity for wire simplicity. If either comes back, the change surface is small.
+- **Go-ahead for 4c** (Ports tile TUI with Processes toggle). Four 4c-specific notes from the sign-off are captured in the `docs/ROADMAP.md` Slice 4c section: tile-title-footer `[p] Processes` hint; selection persistence by `(protocol, local_port, pid)` for Ports / `(pid, start_time_unix_secs)` for Processes; em-dash rendering for `cpu_percent: None`; UDP resolution (same-view / toggle / defer-with-footer-hint).
+- CI green on both OSes is my own gate; I'll check `gh run` after pushing and ping CTO only once both OSes are confirmed. Note the 4a Linux-clippy-gotcha is in the surprises list below — I'll be extra paranoid on the next push for cfg-gated Linux-only warnings.
 
 ### Anything that would surprise a fresh-me
+
+4b-era items:
+
+- **`ProcessesProbe` is stateful; `list_ports()` is stateless.** The two probes have different API shapes because sysinfo's CPU% is a delta between consecutive refreshes — drop the probe state and every sample is 0.0. `list_ports()` is `fn() -> Result<Vec<ProbePort>>` (stateless). `ProcessesProbe::sample(&mut self) -> Result<Vec<ProbeProcess>>` (stateful). If you add a third probe kind, ask: is there cross-sample state (deltas, rate averages, cached sockets) → struct; otherwise → function.
+- **`cpu_percent: Option<f32>` on the wire carries semantic meaning `f32` alone can't.** `None` = "first sample, sysinfo had no prior delta, TUI renders em-dash". `Some(0.0)` = "measured as idle". `Some(x)` = "measured as x%". Docker stats uses `f32` with `0.0` as sentinel for the same situation; Processes made a different call per CTO's explicit 4b note. Roundtrip test `process_list_event_roundtrip_preserves_first_sample_cpu_none` pins that `None` doesn't collapse to `Some(0.0)` through rkyv.
+- **`forward_processes` uses move-into-spawn-blocking + return-back-via-tuple** to persist `ProcessesProbe` state across iterations while still running the sync refresh on tokio's blocking pool. On `JoinError` (probe task panicked), the task resets to a fresh probe; this means the NEXT emit after a panic will again carry `cpu_percent: None` for every row — intentional (can't compute a delta across a crash boundary), but worth knowing when debugging "why did CPU% disappear?" events.
+- **macOS cmdline resolution is degraded.** sysinfo's `Process::cmd()` on macOS sometimes returns only `["sleep"]` when the real cmdline was `sleep 30`. The opt-in integration test asserts `command.contains("sleep")` not exact match for this reason. If 4c renders cmdlines and users complain about "truncated args," check sysinfo's macOS libproc backing and whether reads require different privileges.
+- **`ChildGuard` pattern for test-spawned children.** If you spawn a child process in an integration test, wrap it in a `struct ChildGuard(std::process::Child)` with a Drop impl that calls `kill()` + `wait()`. Without it, a panic mid-test leaks the child into the test runner's parent shell. Use this pattern in every probe-ish test going forward (Phase 5 SSH tests, Phase 7 scanner tests).
+- **sysinfo 0.31's `refresh_processes_specifics` takes 2 args, not 3.** Older sysinfo tutorials show `(processes_to_update, remove_dead, refresh_kind)` but 0.31 dropped the middle bool. First compile attempt will surface this — don't spend time on the error, just drop the bool.
 
 4a-era items:
 

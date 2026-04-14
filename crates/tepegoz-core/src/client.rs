@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use tepegoz_proto::{
     DockerActionOutcome, DockerActionRequest, DockerActionResult, DockerContainer, DockerStats,
     Envelope, ErrorInfo, ErrorKind, Event, EventFrame, LogStream, PROTOCOL_VERSION, Payload,
-    ProbePort, Subscription, Welcome,
+    ProbePort, ProbeProcess, Subscription, Welcome,
     codec::{read_envelope, write_envelope},
 };
 use tepegoz_pty::{OpenSpec as PtyOpenSpec, Pane, PaneUpdate};
@@ -38,6 +38,14 @@ const PORTS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Backoff before re-running the probe after a failure (e.g., probe
 /// permission denied, task panic). Mirrors `DOCKER_RECONNECT_INTERVAL`.
 const PORTS_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the processes subscription re-samples sysinfo. Matches the
+/// docker/ports cadence. CPU% is computed as a delta over this interval,
+/// so the first `ProcessList` after subscription has `cpu_percent: None`
+/// and subsequent events carry `Some(x)` — the TUI renders `None` as an
+/// em-dash to disambiguate "not yet measured" from "idle".
+const PROCESSES_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Backoff before restarting the processes probe after a failure.
+const PROCESSES_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) async fn handle_client(
     stream: UnixStream,
@@ -125,6 +133,7 @@ async fn session(
     let mut pane_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut docker_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut ports_subs: HashMap<u64, AbortHandle> = HashMap::new();
+    let mut processes_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut status_sub: Option<u64> = None;
     let mut ticker = tokio::time::interval(Duration::from_millis(1000));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -151,6 +160,7 @@ async fn session(
                     &mut pane_subs,
                     &mut docker_subs,
                     &mut ports_subs,
+                    &mut processes_subs,
                 )
                 .await
                 {
@@ -168,6 +178,9 @@ async fn session(
         handle.abort();
     }
     for (_, handle) in ports_subs.drain() {
+        handle.abort();
+    }
+    for (_, handle) in processes_subs.drain() {
         handle.abort();
     }
     drop(event_tx);
@@ -200,6 +213,7 @@ async fn handle_command(
     pane_subs: &mut HashMap<u64, AbortHandle>,
     docker_subs: &mut HashMap<u64, AbortHandle>,
     ports_subs: &mut HashMap<u64, AbortHandle>,
+    processes_subs: &mut HashMap<u64, AbortHandle>,
 ) -> anyhow::Result<()> {
     match payload {
         Payload::Ping => {
@@ -267,6 +281,18 @@ async fn handle_command(
             ports_subs.insert(id, handle.abort_handle());
         }
 
+        Payload::Subscribe(Subscription::Processes { id }) => {
+            if let Some(prev) = processes_subs.remove(&id) {
+                debug!(id, "replacing existing processes subscription");
+                prev.abort();
+            }
+            let tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                forward_processes(id, tx).await;
+            });
+            processes_subs.insert(id, handle.abort_handle());
+        }
+
         Payload::DockerAction(req) => {
             let tx = event_tx.clone();
             // Spawn so a slow docker daemon doesn't stall the session loop.
@@ -292,6 +318,9 @@ async fn handle_command(
                 handle.abort();
             }
             if let Some(handle) = ports_subs.remove(&id) {
+                handle.abort();
+            }
+            if let Some(handle) = processes_subs.remove(&id) {
                 handle.abort();
             }
         }
@@ -894,6 +923,104 @@ fn ports_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope 
         payload: Payload::Event(EventFrame {
             subscription_id,
             event: Event::PortsUnavailable { reason },
+        }),
+    }
+}
+
+/// Per-subscription processes poll loop.
+///
+/// Holds a [`tepegoz_probe::ProcessesProbe`] across iterations so sysinfo's
+/// CPU% delta computation has a prior sample to compare against. The first
+/// emitted `ProcessList` carries `cpu_percent: None` for every row (by
+/// probe design); subsequent events carry `Some(x)`.
+///
+/// Emits `ProcessesUnavailable { reason }` exactly once per availability
+/// transition and retries every [`PROCESSES_RECONNECT_INTERVAL`] — same
+/// contract as Docker / Ports.
+///
+/// The probe itself is sync (reads /proc on Linux, calls libproc on macOS);
+/// we move it into `spawn_blocking` each iteration and receive it back
+/// through the return tuple so the stateful delta computation persists
+/// while the runtime stays unblocked.
+async fn forward_processes(subscription_id: u64, event_tx: mpsc::UnboundedSender<Envelope>) {
+    let mut last_was_unavailable: Option<bool> = None;
+    let mut probe = tepegoz_probe::ProcessesProbe::new();
+
+    loop {
+        let (probe_back, sample_result) = match tokio::task::spawn_blocking(move || {
+            let mut p = probe;
+            let r = p.sample();
+            (p, r)
+        })
+        .await
+        {
+            Ok((p, r)) => (p, r),
+            Err(join_err) => (
+                // Task panicked — reset probe so the next iteration starts
+                // fresh. The first sample after this reset will again emit
+                // `cpu_percent: None` (correct per the probe contract).
+                tepegoz_probe::ProcessesProbe::new(),
+                Err(tepegoz_probe::ProcessesError::Backend(format!(
+                    "processes probe task panicked: {join_err}"
+                ))),
+            ),
+        };
+        probe = probe_back;
+
+        let rows = match sample_result {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(subscription_id, error = %msg, "processes probe failed");
+                if !matches!(last_was_unavailable, Some(true))
+                    && event_tx
+                        .send(processes_unavailable_envelope(subscription_id, msg))
+                        .is_err()
+                {
+                    return;
+                }
+                last_was_unavailable = Some(true);
+                tokio::time::sleep(PROCESSES_RECONNECT_INTERVAL).await;
+                continue;
+            }
+        };
+
+        if event_tx
+            .send(process_list_envelope(
+                subscription_id,
+                rows,
+                tepegoz_probe::processes::SOURCE_LABEL.to_string(),
+            ))
+            .is_err()
+        {
+            return;
+        }
+        last_was_unavailable = Some(false);
+
+        tokio::time::sleep(PROCESSES_REFRESH_INTERVAL).await;
+    }
+}
+
+fn process_list_envelope(
+    subscription_id: u64,
+    rows: Vec<ProbeProcess>,
+    source: String,
+) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::ProcessList { rows, source },
+        }),
+    }
+}
+
+fn processes_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::ProcessesUnavailable { reason },
         }),
     }
 }

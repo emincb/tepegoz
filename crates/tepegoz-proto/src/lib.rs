@@ -29,7 +29,15 @@ pub mod socket;
 /// - **v5 (Phase 4 Slice 4a)**: `Subscription::Ports`, `Event::PortList`,
 ///   `Event::PortsUnavailable`, `ProbePort`. Daemon-side port → process →
 ///   container correlation delivers pre-joined rows so clients stay dumb.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// - **v6 (Phase 4 Slice 4b)**: `Subscription::Processes`,
+///   `Event::ProcessList`, `Event::ProcessesUnavailable`, `ProbeProcess`.
+///   `cpu_percent: Option<f32>` — `None` on the first sample after
+///   subscription (sysinfo has no prior delta to compute against); the TUI
+///   renders `None` as an em-dash rather than `0.0%` to disambiguate
+///   "not-yet-measured" from "idle". `start_time_unix_secs` pairs with
+///   `pid` to form a stable identity for selection persistence under pid
+///   reuse.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Identifier for a pty pane owned by the daemon.
 pub type PaneId = u64;
@@ -144,6 +152,15 @@ pub enum Subscription {
     Ports {
         id: u64,
     },
+    /// Subscribe to running-process events: per-refresh `ProcessList` events
+    /// with pid, parent, command, cpu%, mem. On probe failure the daemon
+    /// emits a single `ProcessesUnavailable` transition event and retries
+    /// internally. The first `ProcessList` after subscription carries
+    /// `cpu_percent: None` for every row because sysinfo needs a prior
+    /// delta to compute CPU% against.
+    Processes {
+        id: u64,
+    },
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
@@ -218,6 +235,23 @@ pub enum Event {
     /// daemon retries internally and will follow up with a `PortList` once
     /// the probe succeeds again.
     PortsUnavailable {
+        reason: String,
+    },
+    /// Full list of running processes with pid + parent + command + cpu% +
+    /// memory. Delivered under a `Processes` subscription on every poll
+    /// cycle.
+    ProcessList {
+        rows: Vec<ProbeProcess>,
+        /// Which probe produced this list, e.g. `"sysinfo"`. Non-empty so
+        /// clients can surface it in the tile footer (mirrors
+        /// `engine_source` on `ContainerList` and `source` on `PortList`).
+        source: String,
+    },
+    /// The processes probe is unavailable. Sent once on the transition from
+    /// available (or initial) to unavailable — not on every retry. The
+    /// daemon retries internally and will follow up with a `ProcessList`
+    /// once the probe succeeds again.
+    ProcessesUnavailable {
         reason: String,
     },
 }
@@ -413,5 +447,42 @@ pub struct ProbePort {
     /// container_id may be empty or `None`). Typically means insufficient
     /// privilege. TUI renders partial rows with a visual cue so the user
     /// knows to elevate for the full view.
+    pub partial: bool,
+}
+
+/// A single running-process row delivered in `Event::ProcessList`.
+///
+/// Produced by `tepegoz-probe`'s `ProcessesProbe` (sysinfo-backed on both
+/// Linux and macOS). Clients render this directly.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ProbeProcess {
+    /// Owning process id.
+    pub pid: u32,
+    /// Parent pid. `0` when there is no parent (PID 1 / init) or the probe
+    /// couldn't resolve it.
+    pub parent_pid: u32,
+    /// Process start time (Unix seconds). Pairs with `pid` to form a stable
+    /// identity for selection persistence: a short-lived process whose pid
+    /// is reused by a later process has a different `start_time_unix_secs`,
+    /// so the TUI's selection logic can detect the swap rather than
+    /// silently re-targeting.
+    pub start_time_unix_secs: i64,
+    /// Full command line when available (argv joined by spaces), falling
+    /// back to the short process name. Empty string when even the name
+    /// couldn't be read — pairs with `partial: true`.
+    pub command: String,
+    /// CPU usage over the last refresh interval (~2 s), expressed as a
+    /// percentage in `0.0..=N*100` where `N` is the number of CPU cores.
+    /// `None` on the first `ProcessList` event after subscription because
+    /// sysinfo has no prior delta to compute against. The TUI renders
+    /// `None` as an em-dash so "not yet measured" is visually distinct
+    /// from "measured as zero / idle". Subsequent events carry `Some(x)`.
+    pub cpu_percent: Option<f32>,
+    /// Resident memory in bytes at the sample instant.
+    pub mem_bytes: u64,
+    /// `true` if the probe couldn't fill every field (most often `command`
+    /// was empty because `/proc/<pid>/cmdline` or the libproc equivalent
+    /// was unreadable). TUI renders partial rows with a visual cue so the
+    /// user knows to elevate for the full view.
     pub partial: bool,
 }

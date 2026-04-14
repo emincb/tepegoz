@@ -482,4 +482,119 @@ mod tests {
             other => panic!("expected Event(PortsUnavailable), got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn subscribe_processes_roundtrip() {
+        use crate::Subscription;
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::Processes { id: 83 }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::Subscribe(Subscription::Processes { id }) => assert_eq!(id, 83),
+            other => panic!("expected Subscribe(Processes), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_list_event_roundtrip_preserves_first_sample_cpu_none() {
+        use crate::ProbeProcess;
+        let (mut a, mut b) = tokio::io::duplex(8192);
+
+        // Mixed rows: first-sample row (cpu_percent = None), a subsequent-
+        // sample row (Some(12.5)), and a partial row (command empty).
+        // All three must round-trip intact — `None` must not collapse to
+        // `Some(0.0)` or the TUI can't distinguish "not yet measured" from
+        // "idle" per CTO's 4b note.
+        let rows = vec![
+            ProbeProcess {
+                pid: 4242,
+                parent_pid: 1,
+                start_time_unix_secs: 1_700_000_000,
+                command: "nginx: worker process".into(),
+                cpu_percent: None,
+                mem_bytes: 8_388_608,
+                partial: false,
+            },
+            ProbeProcess {
+                pid: 4243,
+                parent_pid: 4242,
+                start_time_unix_secs: 1_700_000_100,
+                command: "bun run dev".into(),
+                cpu_percent: Some(12.5),
+                mem_bytes: 134_217_728,
+                partial: false,
+            },
+            ProbeProcess {
+                pid: 99999,
+                parent_pid: 0,
+                start_time_unix_secs: 0,
+                command: String::new(),
+                cpu_percent: None,
+                mem_bytes: 0,
+                partial: true,
+            },
+        ];
+
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 83,
+                event: Event::ProcessList {
+                    rows: rows.clone(),
+                    source: "sysinfo".into(),
+                },
+            }),
+        };
+
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::ProcessList { rows: r, source },
+            }) => {
+                assert_eq!(subscription_id, 83);
+                assert_eq!(r, rows, "process list survived rkyv roundtrip");
+                assert_eq!(source, "sysinfo");
+                assert!(
+                    r[0].cpu_percent.is_none(),
+                    "first-sample None must not collapse"
+                );
+                assert_eq!(r[1].cpu_percent, Some(12.5));
+                assert!(r[2].partial);
+            }
+            other => panic!("expected Event(ProcessList), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn processes_unavailable_event_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 83,
+                event: Event::ProcessesUnavailable {
+                    reason: "sysinfo refresh panicked: OS error".into(),
+                },
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::ProcessesUnavailable { reason },
+            }) => {
+                assert_eq!(subscription_id, 83);
+                assert!(reason.contains("sysinfo"));
+            }
+            other => panic!("expected Event(ProcessesUnavailable), got {other:?}"),
+        }
+    }
 }
