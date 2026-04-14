@@ -26,7 +26,10 @@ pub mod socket;
 ///   `Payload::DockerActionResult`, `Event::ContainerLog` /
 ///   `Event::ContainerStats` / `Event::DockerStreamEnded`, plus
 ///   `DockerActionKind`, `DockerActionOutcome`, `LogStream`, `DockerStats`.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// - **v5 (Phase 4 Slice 4a)**: `Subscription::Ports`, `Event::PortList`,
+///   `Event::PortsUnavailable`, `ProbePort`. Daemon-side port → process →
+///   container correlation delivers pre-joined rows so clients stay dumb.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Identifier for a pty pane owned by the daemon.
 pub type PaneId = u64;
@@ -133,6 +136,14 @@ pub enum Subscription {
         id: u64,
         container_id: String,
     },
+    /// Subscribe to listening-port events: per-refresh `PortList` events with
+    /// pid / process-name / container correlation. On probe failure the
+    /// daemon emits a single `PortsUnavailable` transition event and retries
+    /// internally, so one `Ports` subscription survives transient failures
+    /// without the client having to resubscribe.
+    Ports {
+        id: u64,
+    },
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
@@ -190,6 +201,23 @@ pub enum Event {
     /// subscription id (it's effectively closed; client may unsubscribe to
     /// free local state, but doesn't have to).
     DockerStreamEnded {
+        reason: String,
+    },
+    /// Full list of listening ports with process + container correlation.
+    /// Delivered under a `Ports` subscription on every poll cycle.
+    PortList {
+        ports: Vec<ProbePort>,
+        /// Which native probe produced this list, e.g. `"linux-procfs"`,
+        /// `"macos-libproc"`, or `"fallback-sysinfo"`. Non-empty so clients
+        /// can surface it in the tile footer (mirrors `engine_source` on
+        /// `ContainerList`).
+        source: String,
+    },
+    /// The ports probe is unavailable. Sent once on the transition from
+    /// available (or initial) to unavailable — not on every retry. The
+    /// daemon retries internally and will follow up with a `PortList` once
+    /// the probe succeeds again.
+    PortsUnavailable {
         reason: String,
     },
 }
@@ -354,4 +382,36 @@ pub struct DockerStats {
     /// Container memory limit in bytes; `0` if no limit (unconstrained — use
     /// host total memory if you want to compute a percent).
     pub mem_limit_bytes: u64,
+}
+
+/// A single listening-socket row delivered in `Event::PortList`.
+///
+/// Produced by `tepegoz-probe` (native per-OS implementation) and optionally
+/// correlated with a Docker container by the daemon before being sent to the
+/// client. Clients render this directly.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProbePort {
+    /// Local bind address. `"0.0.0.0"` / `"::"` for wildcards, else a
+    /// specific IPv4/IPv6 string.
+    pub local_ip: String,
+    /// Local bind port.
+    pub local_port: u16,
+    /// `"tcp"` or `"udp"`. Matches the convention of `DockerPort::protocol`.
+    pub protocol: String,
+    /// Owning process id. `0` if the probe could not determine the owner
+    /// (usually means insufficient privilege — see `partial`).
+    pub pid: u32,
+    /// Short process name, e.g. `"nginx"`, `"bun"`. Empty string if unknown.
+    pub process_name: String,
+    /// Docker container id (short or long form acceptable) if the port is
+    /// bound by a container and the daemon could correlate it. `None` for
+    /// non-containerized listeners, when Docker is unreachable, or when the
+    /// platform cannot correlate (e.g. macOS without Docker Desktop's VM
+    /// exposing the binding through bollard).
+    pub container_id: Option<String>,
+    /// `true` if the probe couldn't fill every field (pid/process_name/
+    /// container_id may be empty or `None`). Typically means insufficient
+    /// privilege. TUI renders partial rows with a visual cue so the user
+    /// knows to elevate for the full view.
+    pub partial: bool,
 }

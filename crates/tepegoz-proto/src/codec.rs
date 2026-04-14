@@ -387,4 +387,99 @@ mod tests {
         let err = read_envelope(&mut b).await.unwrap_err();
         assert!(err.to_string().contains("exceeds max"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn subscribe_ports_roundtrip() {
+        use crate::Subscription;
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::Ports { id: 71 }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::Subscribe(Subscription::Ports { id }) => assert_eq!(id, 71),
+            other => panic!("expected Subscribe(Ports), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn port_list_event_roundtrip() {
+        use crate::ProbePort;
+        let (mut a, mut b) = tokio::io::duplex(8192);
+
+        let ports = vec![
+            ProbePort {
+                local_ip: "0.0.0.0".into(),
+                local_port: 8080,
+                protocol: "tcp".into(),
+                pid: 4242,
+                process_name: "nginx".into(),
+                container_id: Some("abc123def456".into()),
+                partial: false,
+            },
+            ProbePort {
+                local_ip: "127.0.0.1".into(),
+                local_port: 3000,
+                protocol: "tcp".into(),
+                pid: 0,
+                process_name: String::new(),
+                container_id: None,
+                partial: true,
+            },
+        ];
+
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 71,
+                event: Event::PortList {
+                    ports: ports.clone(),
+                    source: "linux-procfs".into(),
+                },
+            }),
+        };
+
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::PortList { ports: p, source },
+            }) => {
+                assert_eq!(subscription_id, 71);
+                assert_eq!(p, ports, "port list survived rkyv roundtrip");
+                assert_eq!(source, "linux-procfs");
+            }
+            other => panic!("expected Event(PortList), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ports_unavailable_event_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 71,
+                event: Event::PortsUnavailable {
+                    reason: "procfs: permission denied (/proc/net/tcp requires root)".into(),
+                },
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::PortsUnavailable { reason },
+            }) => {
+                assert_eq!(subscription_id, 71);
+                assert!(reason.contains("procfs"));
+            }
+            other => panic!("expected Event(PortsUnavailable), got {other:?}"),
+        }
+    }
 }

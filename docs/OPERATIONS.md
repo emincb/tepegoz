@@ -476,6 +476,14 @@ If the TUI's `TerminalGuard` didn't run (rare; only on abort/kill -9), raw mode 
 ### Daemon refuses to start — "Operation not permitted"
 You passed `--socket /tmp/foo.sock` where `/tmp` isn't owned by you. For default path (XDG_RUNTIME_DIR / TMPDIR / /tmp fallback under `tepegoz-<uid>/`), the parent is auto-created 0700.
 
+### Ports scope rows show `partial: true` / empty pid / empty process name
+The native ports probe (Phase 4 Slice 4a) attributes listening sockets to processes using `/proc/<pid>/fd` on Linux and `libproc pidfdinfo` on macOS. Neither requires root to see the caller's own sockets, but enumerating **other users'** sockets is privileged:
+
+- **Linux**: the probe reads `/proc/<pid>/fd` per pid. Non-root users can't read other users' `/proc/<pid>/fd` entries — those sockets surface as rows with `pid == 0`, empty `process_name`, and `partial: true`. For the full view, run the daemon as root (or grant `CAP_SYS_PTRACE` + `CAP_NET_ADMIN` via `setcap`).
+- **macOS**: `libproc` calls for other-user pids fail silently; same `partial: true` fallback. For the full view, run the daemon with elevated privileges or with full-disk-access granted to the terminal.
+
+Per the project's "root everywhere" user profile this is the expected deployment posture; non-root sessions still produce a useful port list (your own listeners + `partial: true` rows for everyone else's), just with the partial cue for things you can't attribute. Opt-in integration tests run with `TEPEGOZ_PROBE_TEST=1` should therefore be on hosts where you've prepared the access profile the real daemon will have.
+
 ## Diagnosing the running daemon
 
 ```sh

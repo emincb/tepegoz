@@ -11,3 +11,19 @@ description = "Cross-platform probes for processes, sockets, and system stats."
 [dependencies]
 tracing = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+tepegoz-proto = { workspace = true }
+
+# Cross-platform listening-socket enumeration. Wraps procfs on Linux and
+# libproc on macOS so we have a single shape above the OS boundary. Phase 4
+# Slice 4a opts for this over raw netlink `NETLINK_SOCK_DIAG` because the
+# wrapper already handles inode → pid correlation and /proc/net/tcp parsing
+# (the "netlink, no parsing overhead" ROADMAP note is a follow-up polish
+# once profiling shows text parsing as hot — not a 4a blocker).
+netstat2 = "0.11"
+
+# Pid → process-name resolution across OSes. netstat2 hands us the owning
+# pid list for each socket but not the command, so we pair it with sysinfo's
+# process table to fill `process_name`. sysinfo is also the intended backend
+# for Slice 4b (Processes panel) and will carry forward.
+sysinfo = "0.31"

@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use tepegoz_proto::{
     DockerActionOutcome, DockerActionRequest, DockerActionResult, DockerContainer, DockerStats,
     Envelope, ErrorInfo, ErrorKind, Event, EventFrame, LogStream, PROTOCOL_VERSION, Payload,
-    Subscription, Welcome,
+    ProbePort, Subscription, Welcome,
     codec::{read_envelope, write_envelope},
 };
 use tepegoz_pty::{OpenSpec as PtyOpenSpec, Pane, PaneUpdate};
@@ -31,6 +31,13 @@ use crate::state::{DAEMON_VERSION, SharedState};
 const DOCKER_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Backoff before re-attempting `Engine::connect` after a failure.
 const DOCKER_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the ports subscription re-runs the native probe. Matches the
+/// docker cadence (Q4 of the Phase 4 proposal): listening ports are stable
+/// over minutes, 2s is enough for live UX without redraw churn.
+const PORTS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Backoff before re-running the probe after a failure (e.g., probe
+/// permission denied, task panic). Mirrors `DOCKER_RECONNECT_INTERVAL`.
+const PORTS_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) async fn handle_client(
     stream: UnixStream,
@@ -109,14 +116,15 @@ async fn session(
         }),
     })?;
 
-    // Both pane and docker subscriptions live in HashMap<id, AbortHandle> so
-    // `Unsubscribe { id }` can cancel either kind by id. Until C2 / Slice C1
+    // Pane, docker, and ports subscriptions all live in HashMap<id, AbortHandle>
+    // so `Unsubscribe { id }` can cancel any kind by id. Until C2 / Slice C1
     // landed we tracked pane subs in a `JoinSet<()>` with no per-id key, so
     // `Unsubscribe` of a pane sub silently no-op'd. The C1 TUI's synthetic
     // re-attach (Unsubscribe(prev_pane_sub) + AttachPane(new_pane_sub) on
     // Scope→Pane switch) was leaking one zombie forwarder per mode switch.
     let mut pane_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut docker_subs: HashMap<u64, AbortHandle> = HashMap::new();
+    let mut ports_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut status_sub: Option<u64> = None;
     let mut ticker = tokio::time::interval(Duration::from_millis(1000));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -142,6 +150,7 @@ async fn session(
                     &mut status_sub,
                     &mut pane_subs,
                     &mut docker_subs,
+                    &mut ports_subs,
                 )
                 .await
                 {
@@ -156,6 +165,9 @@ async fn session(
         handle.abort();
     }
     for (_, handle) in docker_subs.drain() {
+        handle.abort();
+    }
+    for (_, handle) in ports_subs.drain() {
         handle.abort();
     }
     drop(event_tx);
@@ -187,6 +199,7 @@ async fn handle_command(
     status_sub: &mut Option<u64>,
     pane_subs: &mut HashMap<u64, AbortHandle>,
     docker_subs: &mut HashMap<u64, AbortHandle>,
+    ports_subs: &mut HashMap<u64, AbortHandle>,
 ) -> anyhow::Result<()> {
     match payload {
         Payload::Ping => {
@@ -242,6 +255,18 @@ async fn handle_command(
             docker_subs.insert(id, handle.abort_handle());
         }
 
+        Payload::Subscribe(Subscription::Ports { id }) => {
+            if let Some(prev) = ports_subs.remove(&id) {
+                debug!(id, "replacing existing ports subscription");
+                prev.abort();
+            }
+            let tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                forward_ports(id, tx).await;
+            });
+            ports_subs.insert(id, handle.abort_handle());
+        }
+
         Payload::DockerAction(req) => {
             let tx = event_tx.clone();
             // Spawn so a slow docker daemon doesn't stall the session loop.
@@ -264,6 +289,9 @@ async fn handle_command(
                 handle.abort();
             }
             if let Some(handle) = pane_subs.remove(&id) {
+                handle.abort();
+            }
+            if let Some(handle) = ports_subs.remove(&id) {
                 handle.abort();
             }
         }
@@ -705,6 +733,163 @@ fn stats_envelope(subscription_id: u64, stats: DockerStats) -> Envelope {
         payload: Payload::Event(EventFrame {
             subscription_id,
             event: Event::ContainerStats(stats),
+        }),
+    }
+}
+
+/// Per-subscription ports poll loop.
+///
+/// Runs the native probe every [`PORTS_REFRESH_INTERVAL`] and emits a
+/// `PortList` event. On probe failure, emits a single `PortsUnavailable`
+/// transition event (only on the flip from available — or initial — to
+/// unavailable, not on every retry) and retries every
+/// [`PORTS_RECONNECT_INTERVAL`].
+///
+/// macOS correlation: the probe returns rows with `container_id = None`
+/// on macOS because pid → container correlation requires a Docker engine
+/// lookup (macOS pids are Docker Desktop VM host pids, not in-container
+/// pids). This task opportunistically opens a Docker engine connection
+/// when a port can't already be attributed to a container, then matches
+/// `local_port` against each container's `HostConfig.PortBindings` (as
+/// delivered in `DockerContainer::ports`). Engine errors are swallowed —
+/// Docker-down gracefully degrades to `container_id = None` without
+/// blocking the Ports subscription.
+///
+/// Exits when the writer mpsc closes (client disconnected) or the task is
+/// aborted (Unsubscribe).
+async fn forward_ports(subscription_id: u64, event_tx: mpsc::UnboundedSender<Envelope>) {
+    let mut last_was_unavailable: Option<bool> = None;
+    // Cached engine for macOS correlation. Reset to `None` on any error so
+    // the next poll retries `Engine::connect`. Gated to macOS since Linux
+    // does correlation in the probe via /proc/<pid>/cgroup.
+    #[cfg(target_os = "macos")]
+    let mut docker_engine: Option<tepegoz_docker::Engine> = None;
+
+    loop {
+        // `list_ports` does synchronous fs / syscall work. Run on the
+        // blocking pool so we don't stall the runtime.
+        let probe_result = tokio::task::spawn_blocking(tepegoz_probe::list_ports).await;
+
+        let mut ports = match probe_result {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                warn!(subscription_id, error = %msg, "ports probe failed");
+                if !matches!(last_was_unavailable, Some(true))
+                    && event_tx
+                        .send(ports_unavailable_envelope(subscription_id, msg))
+                        .is_err()
+                {
+                    return;
+                }
+                last_was_unavailable = Some(true);
+                tokio::time::sleep(PORTS_RECONNECT_INTERVAL).await;
+                continue;
+            }
+            Err(join_err) => {
+                // spawn_blocking task panicked — unusual but surfaceable.
+                let msg = format!("ports probe task panicked: {join_err}");
+                warn!(subscription_id, error = %msg, "ports probe task panic");
+                if !matches!(last_was_unavailable, Some(true))
+                    && event_tx
+                        .send(ports_unavailable_envelope(subscription_id, msg))
+                        .is_err()
+                {
+                    return;
+                }
+                last_was_unavailable = Some(true);
+                tokio::time::sleep(PORTS_RECONNECT_INTERVAL).await;
+                continue;
+            }
+        };
+
+        // macOS: complete pid → container correlation via Docker engine.
+        // macOS pids are Docker Desktop VM host pids — they can't carry a
+        // cgroup reference, so the probe always returns `container_id: None`
+        // on macOS and the daemon matches port numbers against bollard's
+        // container list instead.
+        //
+        // On Linux the probe already filled `container_id` from cgroup for
+        // containerized processes; non-containerized processes have no
+        // container to correlate to, so the whole block is skipped —
+        // avoids a pointless `Engine::connect` on every Linux poll.
+        #[cfg(target_os = "macos")]
+        {
+            let needs_correlation = ports.iter().any(|p| p.container_id.is_none() && p.pid != 0);
+            if needs_correlation {
+                if docker_engine.is_none() {
+                    docker_engine = tepegoz_docker::Engine::connect().await.ok();
+                }
+                if let Some(engine) = docker_engine.as_ref() {
+                    match engine.list_containers().await {
+                        Ok(containers) => correlate_ports_to_containers(&mut ports, &containers),
+                        Err(e) => {
+                            debug!(
+                                subscription_id,
+                                error = %e,
+                                "docker engine failed during ports correlation; dropping engine handle"
+                            );
+                            docker_engine = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        if event_tx
+            .send(port_list_envelope(
+                subscription_id,
+                ports,
+                tepegoz_probe::SOURCE_LABEL.to_string(),
+            ))
+            .is_err()
+        {
+            return;
+        }
+        last_was_unavailable = Some(false);
+
+        tokio::time::sleep(PORTS_REFRESH_INTERVAL).await;
+    }
+}
+
+/// For every port that doesn't yet know its container, look for a container
+/// with a matching `public_port` in its port bindings. First match wins.
+/// Gated to macOS since Linux correlates inline in the probe via cgroup.
+#[cfg(target_os = "macos")]
+fn correlate_ports_to_containers(ports: &mut [ProbePort], containers: &[DockerContainer]) {
+    for port in ports.iter_mut() {
+        if port.container_id.is_some() {
+            continue;
+        }
+        for container in containers {
+            if container
+                .ports
+                .iter()
+                .any(|cp| cp.public_port == port.local_port && cp.public_port != 0)
+            {
+                port.container_id = Some(container.id.clone());
+                break;
+            }
+        }
+    }
+}
+
+fn port_list_envelope(subscription_id: u64, ports: Vec<ProbePort>, source: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::PortList { ports, source },
+        }),
+    }
+}
+
+fn ports_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::PortsUnavailable { reason },
         }),
     }
 }

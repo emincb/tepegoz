@@ -59,26 +59,46 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## Engineer section
 
-**Last updated:** 2026-04-14, post-defer. Phase 4 proposal pass in flight; no code.
+**Last updated:** 2026-04-14, Phase 4 Slice 4a landed (daemon-side Ports probe + wire + correlation).
 
 ### Where I left off
 
-Phase 3 close commit (`8984456`) landed + pushed. User signed off on deferring Slice D to v1.1; defer commit follows Phase 3 close on `main`. The decisive argument was Q5 (detach/reattach invariant): Docker's exec API ends the session when the hijacked connection closes, so `DockerExec` can't preserve Phase 2's detach/reattach promise without a custom in-container agent, out of scope for v1. Full rationale captured verbatim in `docs/ROADMAP.md` Slice D section. Decision #7 is intact; the pty tile remains single-pane.
+Phase 4 Slice 4a shipped. One commit on `main` (awaiting CTO review + cross-OS CI green). 172 tests on macOS / 181 on ubuntu-latest, `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
-Phase 4 (Ports + Processes panels) is now the next active phase. CTO issued a 5-question proposal pass (same pattern as Slice C1.5's architectural-shape-first flow). No code until proposal is signed off.
+4a covers:
+- Wire v5: `Subscription::Ports { id }`, `Event::PortList { ports, source }`, `Event::PortsUnavailable { reason }`, `ProbePort { local_ip, local_port, protocol, pid, process_name, container_id: Option<String>, partial: bool }`. 3 new proto codec roundtrip tests including a `partial: true` row.
+- `tepegoz-probe::ports::list_ports()` cross-OS facade using `netstat2` (TCP listeners) + `sysinfo` (pid → process name).
+- `tepegoz-probe::linux::container_id_for_pid()` cgroup parser — handles cgroup v1 direct, v1 systemd scope, v2, kubelet-nested. 9 Linux-only unit tests cover edge cases.
+- `tepegoz-core::client::forward_ports` task in the uniform `HashMap<id, AbortHandle>` subscription model. 2 s refresh; once-per-flip `PortsUnavailable`. `tokio::task::spawn_blocking` around `list_ports` so blocking fs work doesn't stall the runtime.
+- macOS port → container correlation: `forward_ports` opens a `tepegoz_docker::Engine` connection when it sees rows needing correlation and matches `local_port` against bollard's container port bindings. Linux skips this entire block (probe already correlated via cgroup) — no redundant Docker round-trip on Linux polls.
+- Integration test `tests/ports_scope.rs`: always-on emits-xor + opt-in `TEPEGOZ_PROBE_TEST=1` provisions a loopback listener in the test process and verifies the probe finds it with correct pid + process_name within 6 s. Opt-in confirmed locally on macOS via libproc backend.
+
+Two deviations from the proposal — both flagged in the 4a commit's ROADMAP section:
+- `netstat2` instead of raw netlink `NETLINK_SOCK_DIAG` on Linux. netstat2 wraps procfs text parsing; cross-OS shape is cleaner; upgrade to sock_diag as polish if profiling demands.
+- TCP-only listeners. UDP deferred because UDP has no LISTEN state so the UX semantics are ambiguous.
 
 ### What I'm mid-flight on
 
-**Phase 4 proposal** answering CTO's five questions: (1) where Processes lives under Decision #7's layout since the god view reserves tiles for PTY + Docker + Ports + SSH Fleet + Claude Code but not a standalone Processes tile — three candidates on the table (drilldown from Ports, toggle-mode within Ports tile, or Processes daemon-only with no v1 TUI); (2) data-source + platform matrix (procfs / netlink / libproc / shelling out to `ss`/`lsof` / `sysinfo` fallback); (3) port → process → container correlation daemon-side vs client-side; (4) subscription refresh cadence (ports change fast; processes faster); (5) sub-slicing (CTO's straw-man: 4a daemon Ports probe + 4b Ports tile + 4c correlation + 4d Processes + 4e e2e test; or propose different).
-
-Ping with the proposal goes out alongside this defer commit. No code until CTO sign-off.
+_Nothing._ Awaiting CTO review of 4a before starting 4b. Don't start 4b code until sign-off.
 
 ### What I'm expecting from the CTO next
 
-- **Review + sign-off on the Phase 4 proposal.** Push-back on individual answers is fine; anything that wants to amend Decision #7 (e.g., introducing a standalone Processes tile would change the 5-tile layout) needs user sign-off before I rework the proposal.
-- **Sub-slice direction once the proposal is signed off.** Landing sequence mirrors Phase 3: each sub-slice green-on-both-OSes, pushed, CTO review before the next starts, integration test where behavior isn't covered by unit tests alone.
+- **Review + sign-off on 4a**, or redirect. Specific things I flagged as tactical calls: (a) `netstat2` vs raw netlink — CTO may push back since the proposal committed to netlink; the Cargo.toml comment explains the reasoning but it's a legitimate deviation. (b) TCP-only scope — CTO may want UDP in 4a anyway. Either push-back lands as a follow-up commit.
+- **Go-ahead for 4b** (daemon Processes probe + wire). Same shape as 4a: `tepegoz-probe::list_processes()` via sysinfo, `Subscribe(Processes)` + `Event::ProcessList` + `Event::ProcessesUnavailable`, daemon `forward_processes` task, opt-in integration test. Protocol will bump to v6 unless 4b folds into a single v-bump per phase.
+- CI green on both OSes is my own gate; I'll check `gh run` after pushing and ping CTO only once both OSes are confirmed.
 
 ### Anything that would surprise a fresh-me
+
+4a-era items:
+
+- **Linux correlates port → container in the probe (via cgroup); macOS correlates in the daemon (via bollard port match).** Not a mistake or asymmetry — macOS pids can't carry a cgroup reference (Docker Desktop runs containers inside a Linux VM, so macOS-visible pids are VM host pids, not in-container pids). The only workable correlation on macOS is `local_port` → `HostConfig.PortBindings`. Linux has both options; we picked cgroup because it needs no Docker engine connection. If you change this, flag it — the two-layer split is easy to miss.
+- **`forward_ports` skips Docker entirely on Linux.** The whole correlation block is `#[cfg(target_os = "macos")]` inside `forward_ports`. This is an optimization: on Linux with non-containerized processes, `container_id == None` is the correct final answer (no container to correlate to), and without the cfg guard the daemon would do a pointless `Engine::connect` on every poll. If you ever need Linux-side Docker correlation for a different reason, remove the cfg guard BUT then avoid triggering it for non-containerized processes.
+- **`netstat2` is the listening-socket backend, not raw netlink.** Deviates from the Phase 4 proposal. The Cargo.toml comment explains why; the wire contract didn't change so an upgrade to `NETLINK_SOCK_DIAG` can happen later without touching the daemon or clients.
+- **`tokio::task::spawn_blocking` wraps every `list_ports` call.** The probe does filesystem reads + libc calls on macOS and is not async. Calling it directly from the tokio runtime would block whatever reactor thread the `forward_ports` task landed on. Mirror this pattern in 4b's processes probe — `sysinfo` has the same blocking shape.
+- **`partial: bool` on ProbePort is the graceful-degradation signal.** When the probe sees a socket but can't attribute it (pid unknown, permission denied, process vanished mid-read), the row comes through with `pid == 0`, empty `process_name`, and `partial: true`. The TUI in 4c renders these with a visual cue (e.g., dimmed or with a `?` prefix) so users know to elevate. Non-partial rows have complete data; don't emit partial rows from newly-added fields without checking this invariant.
+- **Pid reuse across a 2 s refresh is a Phase 4 risk.** Short-lived processes can get a pid that's later reused for another binary. For Ports this is rare (listening ports imply long-lived processes). For Processes (4b) it matters — CTO's selection-persistence note specifically called for `(pid, process_start_time)` tuples. sysinfo exposes `Process::start_time()`; use it for selection persistence, not just pid.
+
+Phase-3-era items still relevant:
 
 - **Capital-discipline rule on action keybinds.** Lowercase = safe / navigation (`r` restart, `s` stop, `j`/`k` navigate, `l` logs); CAPITAL = destructive (`K` kill, `X` remove). Capital `R` and capital `S` are explicit no-ops on the Docker list view — *not* case-insensitive aliases. Rationale: caps-lock can't silently escalate a safe action into something unexpected, and the "caps = stop-to-think" muscle memory stays consistent when Slice D / Phase 4+ add more keybinds. Pinned by the `capital_r_with_docker_focus_is_noop` test. Adding a new destructive action? Bind it to a capital. New safe one? Lowercase only.
 - **K/X during an already-open confirm are ABSORBED, not cancels.** Pressing K then K again keeps the modal showing Kill — does NOT toggle off, does NOT switch to a second Kill with a fresh deadline, does NOT switch target. Same for X during Kill-pending or K during Remove-pending. Rationale: a second K/X is most likely "still intending to confirm" muscle memory; cancelling on repeat keypress would surprise the user. Contract: `y`/`Y` confirms, K/X absorb, anything else cancels. Pinned by `second_k_during_kill_pending_is_absorbed` + `x_during_kill_pending_is_absorbed`.

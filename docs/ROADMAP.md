@@ -302,25 +302,66 @@ Users retain `docker exec -it <container> sh` in their local pty tile as the v1 
 
 ---
 
-## Phase 4 — Ports + processes panels (local) · ⚪
+## Phase 4 — Ports + processes panels (local) · 🟠 (4a landed; 4b/4c/4d pending)
 
-_Proposal pass in flight; no code until CTO sign-off. Slice D (`DockerExec`) is deferred to v1.1 so Phase 4 is the next active phase. Note that Decision #7's god-view layout reserves tiles for PTY + Docker + Ports + SSH Fleet + Claude Code, but not a standalone Processes tile — the proposal pass addresses where Processes lives._
+Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-state within the Ports tile (lowercase `p` toggles between Ports and Processes views) rather than a new Decision #7 tile — solves the "processes without a bound port" flow while respecting the god-view layout; (Q2) probe uses the cross-OS `netstat2` wrapper (procfs on Linux, libproc on macOS) plus `sysinfo` for pid → process name; (Q3) daemon-side correlation so clients stay dumb; (Q4) 2 s refresh cadence matching Docker; (Q5) 4 sub-slices.
 
 **Goal.** Two more scope panels backed by native per-OS probes.
 
+**Slice breakdown.**
+
+### Slice 4a — Daemon Ports probe + wire + correlation + opt-in test · 🟡 (`<4a commit>`)
+
+**Delivered.**
+- Wire protocol bumped to **v5**. New subscription `Subscription::Ports { id }`. New events `Event::PortList { ports, source }` and `Event::PortsUnavailable { reason }`. New struct `ProbePort { local_ip, local_port, protocol, pid, process_name, container_id: Option<String>, partial: bool }`.
+- `tepegoz-probe` crate scaffold filled in:
+  - `ports::list_ports()` facade returns `Vec<ProbePort>` for the current platform. Uses `netstat2` for TCP listener enumeration (wraps procfs on Linux, libproc on macOS); uses `sysinfo` to resolve pid → process name in a single sweep per poll.
+  - `linux::container_id_for_pid()` reads `/proc/<pid>/cgroup` and extracts a docker container id — handles cgroup v1 direct (`/docker/<id>`), v1 systemd (`/system.slice/docker-<id>.scope`), v2 (same suffix under `/system.slice`), and kubelet-nested (`/kubepods/.../docker-<id>.scope`). Accepts 12–64 hex-char ids. Returns `None` for non-docker cgroups.
+  - `SOURCE_LABEL` const: `linux-procfs` / `macos-libproc` / `unsupported`. Delivered as `Event::PortList { source }` so the TUI can surface it in the tile footer (mirrors Docker's `engine_source`).
+- `tepegoz-core::client::forward_ports` task: per-`Subscribe(Ports)` poll loop, hooked into the uniform `HashMap<id, AbortHandle>` subscription model; polls every 2 s via `tokio::task::spawn_blocking(list_ports)` so the blocking filesystem / syscall work doesn't stall the runtime. Emits `PortsUnavailable { reason }` exactly once per availability transition (mirrors Docker's once-per-flip guard).
+- Daemon-side macOS correlation: `forward_ports` opportunistically opens a `tepegoz_docker::Engine` connection when any port row has `container_id == None` and a non-zero pid. Matches `ProbePort.local_port` against each container's `DockerContainer.ports[].public_port` (skipping `public_port == 0`). First match wins. Docker-down gracefully degrades to `container_id = None` without blocking the Ports subscription. Linux skips this block entirely — the probe already correlates via cgroup, so there's no need for a per-poll Docker roundtrip.
+- Tests: 3 new proto codec roundtrips; 2 cross-OS probe smoke tests; 9 Linux-only cgroup-parser cases; 1 always-on + 1 opt-in integration test in `crates/tepegoz-core/tests/ports_scope.rs`. 172 total on macOS / 181 on ubuntu-latest.
+
+**Deviations from the proposal.**
+- Proposal said netlink `NETLINK_SOCK_DIAG` for Linux listening-socket enumeration; 4a uses `netstat2` which wraps procfs `/proc/net/tcp*` text parsing instead. The decision and rationale are captured in `crates/tepegoz-probe/Cargo.toml`: procfs parsing is mature, the API surface is small, and inode → pid correlation is the same work in either direction. Upgrade to `NETLINK_SOCK_DIAG` as a polish commit if profiling ever shows text parsing hot — wire shape does not change.
+- Proposal said TCP + UDP listeners; 4a ships TCP only. UDP is a straightforward addition (toggle `ProtocolFlags::UDP` in the netstat2 call) but brings ambiguity — UDP sockets don't have a LISTEN state — so deferred until the TUI surfaces them meaningfully.
+
+**Acceptance tests.**
+- `tepegoz-proto::codec::{subscribe_ports_roundtrip, port_list_event_roundtrip, ports_unavailable_event_roundtrip}` — wire integrity for all three new variants including `ProbePort` with `container_id: Some(_)` and `partial: true` rows.
+- `tepegoz-probe::ports::tests::{source_label_matches_platform, list_ports_returns_a_vec_without_panicking}` — smoke test that `list_ports()` returns on any supported OS without panicking and emits only TCP rows with non-zero `local_port`.
+- `tepegoz-probe::linux::tests::cgroup_*` (9 cases, Linux-only) — cgroup parser correctness across v1 direct, v1 systemd, v2, kubelet-nested, non-docker, empty, too-short-id, non-hex-after-docker, and containerd-with-docker-substring paths.
+- `crates/tepegoz-core/tests/ports_scope.rs::ports_subscription_emits_either_port_list_or_unavailable` — always-on: subscribes, asserts the daemon emits exactly one of `PortList | PortsUnavailable` within 30 s with non-empty `source`/`reason` string.
+- `crates/tepegoz-core/tests/ports_scope.rs::ports_subscription_sees_locally_bound_listener_within_budget` — opt-in `TEPEGOZ_PROBE_TEST=1`: binds an ephemeral TCP listener in the test process, subscribes, drains events until a `PortList` includes the bound `local_port`, asserts the row attributes `pid == std::process::id()`, `protocol == "tcp"`, and non-empty `process_name` within a 6 s budget.
+
+### Slice 4b — Daemon Processes probe + wire + integration test · ⚪
+
 **Scope.**
-- `tepegoz-probe`: `trait Probe` + per-OS implementations:
-  - **Linux**: `procfs` for processes; netlink `NETLINK_SOCK_DIAG` for listening sockets (no parsing overhead).
-  - **macOS**: `libproc-rs` for processes (`PROC_ALL_PIDS` + `PROC_PIDTASKALLINFO`); `libproc` `PROC_PIDFDSOCKETINFO` per pid for sockets.
-  - Cross-OS fallback via `sysinfo` for CPU/mem/disk.
-- Wire protocol: `Subscribe(Ports)`, `Subscribe(Processes)`; events for list + deltas.
-- TUI panels: tabular views with sort, filter (by port, pid, process name), signal actions on processes.
+- Extend `tepegoz-probe` with a `list_processes()` entry returning `Vec<ProbeProcess>` ({pid, parent_pid, command, cpu_percent, mem_bytes, partial}). `sysinfo` cross-OS for the enumeration; CPU% from a 2 s delta with first-sample-seeds semantics per CTO's note (first `ProcessList` event has `cpu_percent == 0.0` for every row; document in a tile footer on 4c).
+- Wire: `Subscription::Processes { id }` + `Event::ProcessList { rows: Vec<ProbeProcess>, source }` + `Event::ProcessesUnavailable { reason }`. Protocol bump to v6 if no earlier bump lands.
+- Daemon: `forward_processes` task mirroring `forward_ports` in the uniform `HashMap<id, AbortHandle>` pattern.
+- Opt-in integration test `TEPEGOZ_PROBE_TEST=1`: spawns a known child process, subscribes, asserts the row appears with correct cmdline + either non-zero CPU% or zero-with-partial-flag within a 3 s budget.
 
-**Acceptance.** Start a known process and bind a known port; see both in the panels. Kill the process; see it disappear.
+### Slice 4c — Ports tile TUI with Processes toggle · ⚪
 
-**Not in scope.** Remote probes (that's Phase 6 with the agent).
+**Scope.**
+- Render into the existing Ports placeholder's `Rect` per the scope-renderer contract. State: `PortsScope { view: PortsView::{Ports, Processes}, selected, filter }`.
+- Navigation (j/k/g/G/Home/End/arrows), filter (`/`), toggle (`p`). Three-state lifecycle (Connecting / Available / Unavailable) identical to Docker tile.
+- Tile title swaps between "Ports" / "Processes" based on view; help-bar footer advertises `[p] Processes` for discoverability (CTO's note on 4c: new-user-hint invariant).
+- Selection persistence: by `(protocol, local_port, pid)` for Ports (listening ports are stable over minutes); by `(pid, process_start_time)` for Processes (pid reuse across short-lived processes). Clamp to next visible row when the selected entity disappears mid-refresh.
+- State-machine tests + headless render tests per the `scope::docker` precedent (~15 app cases + ~8 scope cases).
+- First-sample CPU% = 0 semantic (per CTO's 4b note) surfaced in the footer/tile — "CPU% settles after first 2 s refresh" — so users don't misread "everything is idle" on first render.
 
-**Risks.** netlink is fast but unfamiliar; libproc is older and less documented. Keep `sysinfo` as fallback.
+### Slice 4d — Phase 4 e2e + manual demo script · ⚪
+
+**Scope.**
+- Pass/fail matrix in `docs/OPERATIONS.md` "Slice 4d manual demo prep": (1) Ports tile populates within 2 s of TUI launch; (2) filter narrows / commits / clears; (3) `p` toggles Processes and back; (4) Docker-bound port shows container column; (5) killing owning process updates within ~2 s; (6) engine-unavailable shows container empty but Ports still works. These 6 scenarios gate Phase 4 close.
+- End-to-end integration test drives a scripted `App` through the wire (C3c pattern): provision a known child process + bound port, subscribe, assert the state transitions occur end-to-end including correlation.
+
+**Acceptance (Phase 4 close).** 6 manual-demo scenarios sign off; `TEPEGOZ_PROBE_TEST=1` opt-in integration tests green on both OSes (macOS + ubuntu-latest); `cargo test --workspace` green on both with the env var unset. Matches Phase 3's precedent.
+
+**Not in scope (Phase 4).** Remote probes (Phase 6 with the agent). Process signal actions (kill keybind) — candidate follow-up for v1.1. Port tied-to-pane navigation (`Enter` on a port row opens a shell / log tail). UDP listeners.
+
+**Risks.** Text parsing of `/proc/net/tcp*` is CPU-cheap but allocates — if hundreds of listeners, check profiling once Phase 5 adds remote probing. macOS libproc pidfdinfo under netstat2 has known flakiness under sandbox restrictions; the `partial: true` pattern is the escape valve.
 
 ---
 
