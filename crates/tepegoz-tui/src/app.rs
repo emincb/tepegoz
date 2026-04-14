@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use ratatui::layout::Rect;
 use tepegoz_proto::{
     DockerActionKind, DockerActionOutcome, DockerActionRequest, DockerContainer, Envelope, Event,
-    EventFrame, HostEntry, HostState, LogStream, PROTOCOL_VERSION, PaneId, Payload, ProbePort,
-    ProbeProcess, Subscription,
+    EventFrame, FleetActionKind, FleetActionOutcome, FleetActionRequest, HostEntry, HostState,
+    LogStream, PROTOCOL_VERSION, PaneId, Payload, ProbePort, ProbeProcess, Subscription,
 };
 use vt100::Parser;
 
@@ -1375,8 +1375,40 @@ impl App {
             ScopeKey::Char(b'g') => self.handle_fleet_key(ScopeKey::Top, actions),
             ScopeKey::Char(b'G') => self.handle_fleet_key(ScopeKey::Bottom, actions),
             ScopeKey::Char(b'/') => self.handle_fleet_key(ScopeKey::FilterStart, actions),
+            // `r` dispatches a FleetAction::Reconnect against the
+            // selected host (lazy-connects that need user action, or
+            // terminal states awaiting a retry). Lowercase per the
+            // capital-discipline rule — reconnecting is safe / non-
+            // destructive. Uppercase `R` is explicitly a no-op.
+            ScopeKey::Char(b'r') => self.dispatch_fleet_reconnect(actions),
             _ => {}
         }
+    }
+
+    /// Lookup the selected Fleet host + dispatch a
+    /// `FleetAction::Reconnect`. Registers a pending action for toast
+    /// correlation (same pattern as `dispatch_docker_action`).
+    fn dispatch_fleet_reconnect(&mut self, actions: &mut Vec<AppAction>) {
+        let Some(host) = self.fleet.selected_host() else {
+            return;
+        };
+        let alias = host.alias.clone();
+        let request_id = self.alloc_sub_id();
+        self.pending_actions.insert(
+            request_id,
+            PendingAction {
+                deadline: Instant::now() + PENDING_ACTION_TIMEOUT,
+                description: format!("reconnect {alias}"),
+            },
+        );
+        actions.push(AppAction::SendEnvelope(envelope(Payload::FleetAction(
+            FleetActionRequest {
+                request_id,
+                alias,
+                kind: FleetActionKind::Reconnect,
+            },
+        ))));
+        actions.push(AppAction::DrawFrame);
     }
 
     fn handle_ports_list_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
@@ -1802,6 +1834,33 @@ impl App {
                     }
                 }
             }
+            Payload::FleetActionResult(result) => {
+                let pending = self.pending_actions.remove(&result.request_id);
+                let description = pending.map(|p| p.description).unwrap_or_else(|| {
+                    format!("{} {}", fleet_action_verb(result.kind), result.alias)
+                });
+                match result.outcome {
+                    FleetActionOutcome::Success => {
+                        // "Dispatched" is the success criterion —
+                        // actual connection outcome arrives via
+                        // HostStateChanged. Keep the toast short so
+                        // it doesn't compete with the state-change
+                        // toast that follows seconds later.
+                        self.push_toast(
+                            ToastKind::Info,
+                            format!("{description} — dispatched"),
+                            actions,
+                        );
+                    }
+                    FleetActionOutcome::Failure { reason } => {
+                        self.push_toast(
+                            ToastKind::Error,
+                            format!("{description} failed: {reason}"),
+                            actions,
+                        );
+                    }
+                }
+            }
             // Welcome, Pong, PaneOpened, PaneList — consumed by the
             // handshake / ensure_pane reads, not the event loop.
             _ => {}
@@ -1933,10 +1992,45 @@ impl App {
                 self.fleet.reanchor_selection(old_key);
                 actions.push(AppAction::DrawFrame);
             }
-            Event::HostStateChanged { alias, state } => {
+            Event::HostStateChanged {
+                alias,
+                state,
+                reason,
+            } => {
                 if let FleetScopeState::Available { states, .. } = &mut self.fleet.state {
-                    states.insert(alias, state);
+                    // Gate red-toast on the *transition* into a terminal
+                    // state, not the post-state — re-emits on ProxyJump
+                    // Reconnect shouldn't silently re-toast if the
+                    // state didn't actually change. Exception: if the
+                    // reason has changed, re-toast (e.g. AuthFailed
+                    // with different reason strings across attempts).
+                    let prev_state = states.get(&alias).copied();
+                    let should_toast =
+                        state.is_terminal() && reason.is_some() && (prev_state != Some(state));
+                    states.insert(alias.clone(), state);
                     actions.push(AppAction::DrawFrame);
+                    if should_toast {
+                        let text = match state {
+                            HostState::AuthFailed => format!(
+                                "{alias}: auth failed — {}",
+                                reason.as_deref().unwrap_or("<no reason>")
+                            ),
+                            HostState::HostKeyMismatch => format!(
+                                "{alias}: host key rejected — {}",
+                                reason.as_deref().unwrap_or("<no reason>")
+                            ),
+                            HostState::AgentNotDeployed => format!(
+                                "{alias}: agent not deployed — {}",
+                                reason.as_deref().unwrap_or("<no reason>")
+                            ),
+                            HostState::AgentVersionMismatch => format!(
+                                "{alias}: agent version mismatch — {}",
+                                reason.as_deref().unwrap_or("<no reason>")
+                            ),
+                            _ => return,
+                        };
+                        self.push_toast(ToastKind::Error, text, actions);
+                    }
                 }
                 // Arriving before HostList — ignore; the supervisor
                 // will re-emit once the tile transitions to Available.
@@ -2035,6 +2129,16 @@ pub(crate) fn action_verb(kind: DockerActionKind) -> &'static str {
         DockerActionKind::Restart => "Restart",
         DockerActionKind::Kill => "Kill",
         DockerActionKind::Remove => "Remove",
+    }
+}
+
+/// Human-readable verb for a `FleetActionKind`. Used only for toast
+/// fallback when a `FleetActionResult` arrives with no matching
+/// `PendingAction` (deadline already fired or stale result).
+pub(crate) fn fleet_action_verb(kind: FleetActionKind) -> &'static str {
+    match kind {
+        FleetActionKind::Reconnect => "Reconnect",
+        FleetActionKind::Disconnect => "Disconnect",
     }
 }
 

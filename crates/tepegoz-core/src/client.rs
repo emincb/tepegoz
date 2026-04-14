@@ -134,7 +134,7 @@ async fn session(
     let mut docker_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut ports_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut processes_subs: HashMap<u64, AbortHandle> = HashMap::new();
-    let mut fleet_subs: HashMap<u64, AbortHandle> = HashMap::new();
+    let mut fleet_subs: HashMap<u64, FleetSubHandle> = HashMap::new();
     let mut status_sub: Option<u64> = None;
     let mut ticker = tokio::time::interval(Duration::from_millis(1000));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -186,7 +186,7 @@ async fn session(
         handle.abort();
     }
     for (_, handle) in fleet_subs.drain() {
-        handle.abort();
+        handle.abort_handle.abort();
     }
     drop(event_tx);
     let _ = writer_handle.await;
@@ -218,7 +218,7 @@ async fn handle_command(
     docker_subs: &mut HashMap<u64, AbortHandle>,
     ports_subs: &mut HashMap<u64, AbortHandle>,
     processes_subs: &mut HashMap<u64, AbortHandle>,
-    fleet_subs: &mut HashMap<u64, AbortHandle>,
+    fleet_subs: &mut HashMap<u64, FleetSubHandle>,
 ) -> anyhow::Result<()> {
     match payload {
         Payload::Ping => {
@@ -301,13 +301,44 @@ async fn handle_command(
         Payload::Subscribe(Subscription::Fleet { id }) => {
             if let Some(prev) = fleet_subs.remove(&id) {
                 debug!(id, "replacing existing fleet subscription");
-                prev.abort();
+                prev.abort_handle.abort();
             }
             let tx = event_tx.clone();
+            let (action_tx, action_rx) = mpsc::unbounded_channel();
             let handle = tokio::spawn(async move {
-                forward_fleet(id, tx).await;
+                forward_fleet(id, tx, action_rx).await;
             });
-            fleet_subs.insert(id, handle.abort_handle());
+            fleet_subs.insert(
+                id,
+                FleetSubHandle {
+                    abort_handle: handle.abort_handle(),
+                    action_tx,
+                },
+            );
+        }
+
+        Payload::FleetAction(req) => {
+            // Broadcast to every active Fleet subscription's
+            // coordinator; each coordinator checks its own alias map
+            // and replies with `FleetActionResult::Success` (dispatched)
+            // or `::Failure` (unknown alias). Clients typically hold
+            // one Fleet subscription, so this is the one coordinator
+            // in practice; the loop tolerates multi-subscription
+            // clients without special-casing.
+            if fleet_subs.is_empty() {
+                let _ = event_tx.send(fleet_action_result_envelope(
+                    req,
+                    tepegoz_proto::FleetActionOutcome::Failure {
+                        reason: "no active Fleet subscription — subscribe before dispatching \
+                                 FleetAction"
+                            .to_string(),
+                    },
+                ));
+            } else {
+                for handle in fleet_subs.values() {
+                    let _ = handle.action_tx.send(req.clone());
+                }
+            }
         }
 
         Payload::DockerAction(req) => {
@@ -341,7 +372,7 @@ async fn handle_command(
                 handle.abort();
             }
             if let Some(handle) = fleet_subs.remove(&id) {
-                handle.abort();
+                handle.abort_handle.abort();
             }
         }
 
@@ -1097,7 +1128,21 @@ const SSH_BACKOFF_LADDER: &[Duration] = &[
 ///
 /// Discovery runs on tokio's blocking pool because ssh_config parsing
 /// does filesystem reads.
-async fn forward_fleet(subscription_id: u64, event_tx: mpsc::UnboundedSender<Envelope>) {
+/// Per-Fleet-subscription handle retained by `handle_client`'s
+/// `fleet_subs` map. `abort_handle` cancels the coordinator task on
+/// Unsubscribe / session shutdown; `action_tx` forwards wire-level
+/// `FleetActionRequest`s from the client into the coordinator's
+/// dispatch loop.
+struct FleetSubHandle {
+    abort_handle: AbortHandle,
+    action_tx: mpsc::UnboundedSender<tepegoz_proto::FleetActionRequest>,
+}
+
+async fn forward_fleet(
+    subscription_id: u64,
+    event_tx: mpsc::UnboundedSender<Envelope>,
+    mut fleet_action_rx: mpsc::UnboundedReceiver<tepegoz_proto::FleetActionRequest>,
+) {
     let list = match tokio::task::spawn_blocking(tepegoz_ssh::HostList::discover).await {
         Ok(Ok(list)) => list,
         Ok(Err(e)) => {
@@ -1131,155 +1176,478 @@ async fn forward_fleet(subscription_id: u64, event_tx: mpsc::UnboundedSender<Env
     // cancellation (coordinator drop) aborts every supervisor
     // automatically. Same aggregate-lifecycle pattern as Phase 3's
     // Docker forwarders — no per-task abort bookkeeping needed.
+    //
+    // Keep the action-sender for each alias so `FleetAction`
+    // messages arriving on `fleet_action_rx` can be routed to the
+    // right supervisor.
     let mut supervisors: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut host_senders: std::collections::HashMap<String, mpsc::UnboundedSender<HostAction>> =
+        std::collections::HashMap::new();
     for host in hosts {
         let should_autoconnect = autoconnect.contains(&host.alias);
         let tx = event_tx.clone();
+        let alias = host.alias.clone();
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
+        host_senders.insert(alias, action_tx);
         supervisors.spawn(async move {
-            host_supervisor(subscription_id, host, should_autoconnect, tx).await;
+            host_supervisor(subscription_id, host, should_autoconnect, tx, action_rx).await;
         });
     }
 
-    // Wait for either (a) all supervisors to complete on their own
-    // (terminal states with no reconnect loop running — only happens
-    // if every host ends in HostKeyMismatch / AuthFailed / ProxyJump-
-    // not-supported and never gets a Reconnect action, which 5c-i
-    // can't receive anyway), or (b) this coordinator gets cancelled
-    // from outside.
-    while supervisors.join_next().await.is_some() {}
+    // Dispatch loop: forward `FleetActionRequest`s from the client to
+    // the matching supervisor; reply with `FleetActionResult`. Success
+    // = "dispatched" — actual connection outcome arrives through
+    // `HostStateChanged` events, not this reply.
+    loop {
+        tokio::select! {
+            biased;
+            msg = fleet_action_rx.recv() => {
+                let Some(req) = msg else { break; };
+                let outcome = match host_senders.get(&req.alias) {
+                    Some(tx) => {
+                        let internal = match req.kind {
+                            tepegoz_proto::FleetActionKind::Reconnect => HostAction::Reconnect,
+                            tepegoz_proto::FleetActionKind::Disconnect => HostAction::Disconnect,
+                        };
+                        match tx.send(internal) {
+                            Ok(()) => tepegoz_proto::FleetActionOutcome::Success,
+                            Err(_) => tepegoz_proto::FleetActionOutcome::Failure {
+                                reason: "supervisor task has exited — subscription may have \
+                                         been torn down mid-action"
+                                    .to_string(),
+                            },
+                        }
+                    }
+                    None => tepegoz_proto::FleetActionOutcome::Failure {
+                        reason: format!(
+                            "unknown alias '{}' — check `tepegoz doctor --ssh-hosts`",
+                            req.alias
+                        ),
+                    },
+                };
+                let _ = event_tx.send(fleet_action_result_envelope(req, outcome));
+            }
+            joined = supervisors.join_next() => {
+                if joined.is_none() {
+                    // All supervisors exited. Park waiting for
+                    // cancellation; the writer task will exit on
+                    // event_tx closure when the client disconnects.
+                    std::future::pending::<()>().await;
+                }
+                // Otherwise one supervisor finished — the other
+                // supervisors keep running. The alias's action_tx
+                // stays in host_senders (sends will now fail with
+                // SendError, which the dispatch arm surfaces as a
+                // clear Failure reason).
+            }
+        }
+    }
     std::future::pending::<()>().await;
 }
 
+fn fleet_action_result_envelope(
+    req: tepegoz_proto::FleetActionRequest,
+    outcome: tepegoz_proto::FleetActionOutcome,
+) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::FleetActionResult(tepegoz_proto::FleetActionResult {
+            request_id: req.request_id,
+            alias: req.alias,
+            kind: req.kind,
+            outcome,
+        }),
+    }
+}
+
+/// Internal supervisor-action message. Carried through a per-host
+/// `mpsc::UnboundedSender<HostAction>` kept by the coordinator in a
+/// `HashMap<alias, _>`; the client's wire-level `FleetAction` is
+/// translated into this by `forward_fleet`'s dispatch loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostAction {
+    /// Reset backoff and (re-)enter the Connecting phase. Works from
+    /// any state, including terminal `AuthFailed` / `HostKeyMismatch`
+    /// (terminal states `park` waiting for exactly this signal).
+    Reconnect,
+    /// Move the supervisor to Disconnected + stay idle until the next
+    /// Reconnect. No-op if already Disconnected or terminal.
+    Disconnect,
+}
+
 /// State-machine loop for a single SSH host. Emits
-/// `Event::HostStateChanged` on every transition; runs heartbeat
-/// while Connected; applies exponential backoff on reconnect.
-///
-/// Phase 5 Slice 5c-i: runs autonomously — no external message
-/// channel (5c-ii adds that for `FleetAction::Reconnect`). Hosts with
-/// `autoconnect = false` emit an initial Disconnected and park
-/// forever in 5c-i; they'll get an action channel in 5c-ii.
+/// `Event::HostStateChanged` on every transition (with `reason` set
+/// on terminal `⚠` states); runs heartbeat while Connected; applies
+/// exponential backoff on reconnect; responds to `HostAction::Reconnect`
+/// / `Disconnect` messages from the coordinator at every select point.
 async fn host_supervisor(
     subscription_id: u64,
     entry: tepegoz_proto::HostEntry,
     autoconnect: bool,
     event_tx: mpsc::UnboundedSender<Envelope>,
+    mut action_rx: mpsc::UnboundedReceiver<HostAction>,
 ) {
     let alias = entry.alias.clone();
 
     // ProxyJump pre-check (5a follow-up #1): we don't speak ProxyJump
     // in Phase 5; transition straight to AuthFailed with the v1.1
-    // reason so the Fleet tile renders ⚠ red + (5c-ii) the red toast
-    // carries the reason verbatim. Terminal state; no reconnect loop.
-    if entry.proxy_jump.is_some() {
+    // reason on the wire. Reconnect won't escape the limitation, but
+    // re-emits so the UI gets a fresh toast explaining why.
+    if let Some(jump) = entry.proxy_jump.as_deref() {
+        let reason =
+            format!("host requires ProxyJump ({jump}) which is not supported in Phase 5 (v1.1)");
+        warn!(alias, proxy_jump = jump, "ProxyJump not supported");
         emit_state(
             &event_tx,
             subscription_id,
             &alias,
             tepegoz_proto::HostState::AuthFailed,
+            Some(reason.clone()),
         );
-        warn!(
-            alias,
-            proxy_jump = entry.proxy_jump.as_deref().unwrap_or("?"),
-            "host requires ProxyJump which is not supported in Phase 5 (v1.1)"
-        );
-        std::future::pending::<()>().await;
-        return;
+        loop {
+            match action_rx.recv().await {
+                Some(HostAction::Reconnect) => {
+                    // Still can't ProxyJump. Re-emit so the user sees
+                    // why.
+                    emit_state(
+                        &event_tx,
+                        subscription_id,
+                        &alias,
+                        tepegoz_proto::HostState::AuthFailed,
+                        Some(reason.clone()),
+                    );
+                }
+                Some(HostAction::Disconnect) => {}
+                None => return,
+            }
+        }
     }
 
-    // Always emit the initial Disconnected so the tile's per-alias
-    // state map is seeded — the renderer depends on it.
+    // Seed the tile's per-alias state map with an initial Disconnected.
     emit_state(
         &event_tx,
         subscription_id,
         &alias,
         tepegoz_proto::HostState::Disconnected,
+        None,
     );
 
-    if !autoconnect {
-        // Lazy-connect hosts wait for user action. 5c-i has no action
-        // channel, so they park here; 5c-ii replaces the pending with
-        // an action-select loop.
-        std::future::pending::<()>().await;
-        return;
-    }
-
+    let mut should_connect = autoconnect;
     let mut backoff_idx: usize = 0;
+
     loop {
+        if !should_connect {
+            // Idle — lazy-connect hosts wait here for Reconnect.
+            match action_rx.recv().await {
+                Some(HostAction::Reconnect) => {
+                    should_connect = true;
+                    backoff_idx = 0;
+                }
+                Some(HostAction::Disconnect) => continue,
+                None => return,
+            }
+        }
+
         emit_state(
             &event_tx,
             subscription_id,
             &alias,
             tepegoz_proto::HostState::Connecting,
+            None,
         );
 
+        // Spawn the connect attempt in a separate task so that a
+        // Reconnect / Disconnect action can abort it mid-flight
+        // without relying on russh's `client::connect` future being
+        // cancellation-safe under a `tokio::select!` drop. Pattern
+        // parallels the Phase 4 desync-lesson: when in doubt about
+        // cancellation safety, spawn + abort rather than select-drop.
+        let entry_for_connect = entry.clone();
+        let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
+        let connect_task = tokio::spawn(async move {
+            let result = try_connect(&entry_for_connect).await;
+            let _ = conn_tx.send(result);
+        });
         let connect_start = std::time::Instant::now();
-        let connect_result = try_connect(&entry).await;
 
-        match connect_result {
+        let connect_outcome = {
+            tokio::pin!(conn_rx);
+            tokio::select! {
+                biased;
+                msg = action_rx.recv() => {
+                    connect_task.abort();
+                    match msg {
+                        Some(HostAction::Reconnect) => {
+                            backoff_idx = 0;
+                            continue;
+                        }
+                        Some(HostAction::Disconnect) => {
+                            emit_state(
+                                &event_tx,
+                                subscription_id,
+                                &alias,
+                                tepegoz_proto::HostState::Disconnected,
+                                None,
+                            );
+                            should_connect = false;
+                            continue;
+                        }
+                        None => return,
+                    }
+                }
+                res = &mut conn_rx => {
+                    match res {
+                        Ok(r) => r,
+                        Err(_) => {
+                            // Connect task was aborted / panicked;
+                            // treat as transient and backoff.
+                            warn!(alias, "connect task aborted or panicked");
+                            emit_state(
+                                &event_tx,
+                                subscription_id,
+                                &alias,
+                                tepegoz_proto::HostState::Disconnected,
+                                None,
+                            );
+                            if let Some(delay) = wait_backoff(
+                                &mut action_rx,
+                                SSH_BACKOFF_LADDER[backoff_idx.min(SSH_BACKOFF_LADDER.len() - 1)],
+                            )
+                            .await
+                            {
+                                match delay {
+                                    BackoffOutcome::Elapsed => {
+                                        backoff_idx =
+                                            (backoff_idx + 1).min(SSH_BACKOFF_LADDER.len() - 1);
+                                    }
+                                    BackoffOutcome::Reconnect => {
+                                        backoff_idx = 0;
+                                    }
+                                    BackoffOutcome::Disconnect => {
+                                        should_connect = false;
+                                    }
+                                }
+                            } else {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+
+        match connect_outcome {
             Ok(session) => {
                 emit_state(
                     &event_tx,
                     subscription_id,
                     &alias,
                     tepegoz_proto::HostState::Connected,
+                    None,
                 );
-                // Run the heartbeat loop until the session dies.
-                run_connected_session(&alias, subscription_id, session, &event_tx).await;
-                // Session ended: reset backoff if the connection held
-                // longer than the threshold, otherwise compound it so
-                // a flapping host doesn't retry every second forever.
-                if connect_start.elapsed() >= SSH_RECONNECT_RESET_THRESHOLD {
-                    backoff_idx = 0;
-                }
-                emit_state(
-                    &event_tx,
-                    subscription_id,
+                let ended = run_connected_session(
                     &alias,
-                    tepegoz_proto::HostState::Disconnected,
-                );
+                    subscription_id,
+                    session,
+                    &event_tx,
+                    &mut action_rx,
+                )
+                .await;
+                match ended {
+                    ConnectedOutcome::HeartbeatFailed => {
+                        if connect_start.elapsed() >= SSH_RECONNECT_RESET_THRESHOLD {
+                            backoff_idx = 0;
+                        }
+                        emit_state(
+                            &event_tx,
+                            subscription_id,
+                            &alias,
+                            tepegoz_proto::HostState::Disconnected,
+                            None,
+                        );
+                    }
+                    ConnectedOutcome::ReconnectRequested => {
+                        backoff_idx = 0;
+                        emit_state(
+                            &event_tx,
+                            subscription_id,
+                            &alias,
+                            tepegoz_proto::HostState::Disconnected,
+                            None,
+                        );
+                        continue;
+                    }
+                    ConnectedOutcome::DisconnectRequested => {
+                        emit_state(
+                            &event_tx,
+                            subscription_id,
+                            &alias,
+                            tepegoz_proto::HostState::Disconnected,
+                            None,
+                        );
+                        should_connect = false;
+                        continue;
+                    }
+                    ConnectedOutcome::Shutdown => return,
+                }
             }
             Err(tepegoz_ssh::SshError::HostKeyMismatch { .. }) => {
+                let reason = connect_outcome_err_reason(&connect_outcome);
                 warn!(
                     alias,
-                    "host-key TOFU rejected — terminal state, awaiting user --ssh-forget"
+                    reason = %reason,
+                    "host-key TOFU rejected — awaiting Reconnect after `tepegoz doctor --ssh-forget`"
                 );
                 emit_state(
                     &event_tx,
                     subscription_id,
                     &alias,
                     tepegoz_proto::HostState::HostKeyMismatch,
+                    Some(reason),
                 );
-                // Terminal; no reconnect until 5c-ii's FleetAction
-                // resets the supervisor after the user runs
-                // --ssh-forget.
-                std::future::pending::<()>().await;
-                return;
+                match await_terminal_reset(&mut action_rx).await {
+                    TerminalReset::Reconnect => {
+                        backoff_idx = 0;
+                        emit_state(
+                            &event_tx,
+                            subscription_id,
+                            &alias,
+                            tepegoz_proto::HostState::Disconnected,
+                            None,
+                        );
+                        continue;
+                    }
+                    TerminalReset::Shutdown => return,
+                }
             }
-            Err(tepegoz_ssh::SshError::AuthFailed { reason, .. }) => {
-                warn!(alias, reason = %reason, "authentication failed — terminal state");
+            Err(tepegoz_ssh::SshError::AuthFailed { .. }) => {
+                let reason = connect_outcome_err_reason(&connect_outcome);
+                warn!(alias, reason = %reason, "authentication failed");
                 emit_state(
                     &event_tx,
                     subscription_id,
                     &alias,
                     tepegoz_proto::HostState::AuthFailed,
+                    Some(reason),
                 );
-                std::future::pending::<()>().await;
-                return;
+                match await_terminal_reset(&mut action_rx).await {
+                    TerminalReset::Reconnect => {
+                        backoff_idx = 0;
+                        emit_state(
+                            &event_tx,
+                            subscription_id,
+                            &alias,
+                            tepegoz_proto::HostState::Disconnected,
+                            None,
+                        );
+                        continue;
+                    }
+                    TerminalReset::Shutdown => return,
+                }
             }
-            Err(e) => {
+            Err(ref e) => {
                 warn!(alias, error = %e, "connect failed — will retry after backoff");
                 emit_state(
                     &event_tx,
                     subscription_id,
                     &alias,
                     tepegoz_proto::HostState::Disconnected,
+                    None,
                 );
             }
         }
 
-        let delay = SSH_BACKOFF_LADDER[backoff_idx.min(SSH_BACKOFF_LADDER.len() - 1)];
-        tokio::time::sleep(delay).await;
-        backoff_idx = (backoff_idx + 1).min(SSH_BACKOFF_LADDER.len() - 1);
+        match wait_backoff(
+            &mut action_rx,
+            SSH_BACKOFF_LADDER[backoff_idx.min(SSH_BACKOFF_LADDER.len() - 1)],
+        )
+        .await
+        {
+            Some(BackoffOutcome::Elapsed) => {
+                backoff_idx = (backoff_idx + 1).min(SSH_BACKOFF_LADDER.len() - 1);
+            }
+            Some(BackoffOutcome::Reconnect) => {
+                backoff_idx = 0;
+            }
+            Some(BackoffOutcome::Disconnect) => {
+                should_connect = false;
+            }
+            None => return,
+        }
+    }
+}
+
+enum ConnectedOutcome {
+    /// Heartbeat loop detected session death — drop into backoff.
+    HeartbeatFailed,
+    /// Coordinator delivered `HostAction::Reconnect` — restart with
+    /// reset backoff.
+    ReconnectRequested,
+    /// Coordinator delivered `HostAction::Disconnect` — drop to idle.
+    DisconnectRequested,
+    /// Action channel closed — supervisor exits.
+    Shutdown,
+}
+
+enum BackoffOutcome {
+    Elapsed,
+    Reconnect,
+    Disconnect,
+}
+
+enum TerminalReset {
+    Reconnect,
+    Shutdown,
+}
+
+/// Extract a human-readable reason from an `SshError` for
+/// `Event::HostStateChanged.reason`. Mirrors `SshError`'s `Display`
+/// but drops redundant framing when the context (alias, hostname,
+/// port) is already implicit in the event.
+fn connect_outcome_err_reason(
+    outcome: &Result<tepegoz_ssh::SshSession, tepegoz_ssh::SshError>,
+) -> String {
+    match outcome {
+        Ok(_) => String::new(),
+        Err(tepegoz_ssh::SshError::AuthFailed { reason, .. }) => reason.clone(),
+        Err(tepegoz_ssh::SshError::HostKeyMismatch { path, line, .. }) => format!(
+            "host-key TOFU rejected — stored key at {}:{line} does not match; \
+             recover with `tepegoz doctor --ssh-forget <alias>` after verifying",
+            path.display()
+        ),
+        Err(e) => e.to_string(),
+    }
+}
+
+async fn wait_backoff(
+    action_rx: &mut mpsc::UnboundedReceiver<HostAction>,
+    delay: Duration,
+) -> Option<BackoffOutcome> {
+    tokio::select! {
+        biased;
+        msg = action_rx.recv() => {
+            match msg {
+                Some(HostAction::Reconnect) => Some(BackoffOutcome::Reconnect),
+                Some(HostAction::Disconnect) => Some(BackoffOutcome::Disconnect),
+                None => None,
+            }
+        }
+        _ = tokio::time::sleep(delay) => Some(BackoffOutcome::Elapsed),
+    }
+}
+
+async fn await_terminal_reset(
+    action_rx: &mut mpsc::UnboundedReceiver<HostAction>,
+) -> TerminalReset {
+    loop {
+        match action_rx.recv().await {
+            Some(HostAction::Reconnect) => return TerminalReset::Reconnect,
+            // Disconnect is a no-op in a terminal state — we're
+            // already not connected. Swallow and keep waiting.
+            Some(HostAction::Disconnect) => continue,
+            None => return TerminalReset::Shutdown,
+        }
     }
 }
 
@@ -1300,16 +1668,18 @@ async fn try_connect(
     tepegoz_ssh::connect_host(&entry.alias, &hosts, &known_hosts).await
 }
 
-/// Heartbeat loop while `Connected`. Runs until the session dies
-/// (heartbeat send fails / handle reports closed). Transitions the
-/// state to `Degraded` after the first miss so the tile renders ◐
-/// yellow before the final cutover.
+/// Heartbeat loop while `Connected`. Runs until either the session
+/// dies (heartbeat send fails / handle reports closed) or the
+/// coordinator sends a `HostAction`. Transitions the state to
+/// `Degraded` after the first miss so the tile renders ◐ yellow
+/// before the final cutover.
 async fn run_connected_session(
     alias: &str,
     subscription_id: u64,
     session: tepegoz_ssh::SshSession,
     event_tx: &mpsc::UnboundedSender<Envelope>,
-) {
+    action_rx: &mut mpsc::UnboundedReceiver<HostAction>,
+) -> ConnectedOutcome {
     let mut interval = tokio::time::interval(SSH_HEARTBEAT_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Consume the first (immediate) tick — we just emitted Connected,
@@ -1321,33 +1691,41 @@ async fn run_connected_session(
     let mut current_state = tepegoz_proto::HostState::Connected;
 
     loop {
-        interval.tick().await;
-
-        let handle = session.handle();
-        let send_ok = if handle.is_closed() {
-            false
-        } else {
-            handle.send_keepalive(true).await.is_ok()
-        };
-
-        if send_ok {
-            if miss_counter > 0 && current_state == tepegoz_proto::HostState::Degraded {
-                current_state = tepegoz_proto::HostState::Connected;
-                emit_state(event_tx, subscription_id, alias, current_state);
+        tokio::select! {
+            biased;
+            msg = action_rx.recv() => {
+                match msg {
+                    Some(HostAction::Reconnect) => return ConnectedOutcome::ReconnectRequested,
+                    Some(HostAction::Disconnect) => return ConnectedOutcome::DisconnectRequested,
+                    None => return ConnectedOutcome::Shutdown,
+                }
             }
-            miss_counter = 0;
-        } else {
-            miss_counter += 1;
-            if miss_counter >= SSH_DISCONNECTED_THRESHOLD {
-                // Disconnect path — caller emits Disconnected on
-                // return and starts the backoff retry.
-                return;
-            }
-            if miss_counter >= SSH_DEGRADED_THRESHOLD
-                && current_state != tepegoz_proto::HostState::Degraded
-            {
-                current_state = tepegoz_proto::HostState::Degraded;
-                emit_state(event_tx, subscription_id, alias, current_state);
+            _ = interval.tick() => {
+                let handle = session.handle();
+                let send_ok = if handle.is_closed() {
+                    false
+                } else {
+                    handle.send_keepalive(true).await.is_ok()
+                };
+
+                if send_ok {
+                    if miss_counter > 0 && current_state == tepegoz_proto::HostState::Degraded {
+                        current_state = tepegoz_proto::HostState::Connected;
+                        emit_state(event_tx, subscription_id, alias, current_state, None);
+                    }
+                    miss_counter = 0;
+                } else {
+                    miss_counter += 1;
+                    if miss_counter >= SSH_DISCONNECTED_THRESHOLD {
+                        return ConnectedOutcome::HeartbeatFailed;
+                    }
+                    if miss_counter >= SSH_DEGRADED_THRESHOLD
+                        && current_state != tepegoz_proto::HostState::Degraded
+                    {
+                        current_state = tepegoz_proto::HostState::Degraded;
+                        emit_state(event_tx, subscription_id, alias, current_state, None);
+                    }
+                }
             }
         }
     }
@@ -1358,7 +1736,12 @@ fn emit_state(
     subscription_id: u64,
     alias: &str,
     state: tepegoz_proto::HostState,
+    reason: Option<String>,
 ) {
+    debug_assert!(
+        reason.is_none() || state.is_terminal(),
+        "reason is only populated on terminal HostState variants; got state={state:?} reason={reason:?}"
+    );
     let _ = event_tx.send(Envelope {
         version: PROTOCOL_VERSION,
         payload: Payload::Event(EventFrame {
@@ -1366,6 +1749,7 @@ fn emit_state(
             event: Event::HostStateChanged {
                 alias: alias.to_string(),
                 state,
+                reason,
             },
         }),
     });

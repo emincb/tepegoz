@@ -103,7 +103,12 @@ async fn fleet_subscription_emits_host_list_then_one_state_per_host() {
             .expect("read");
         if let Payload::Event(EventFrame {
             subscription_id,
-            event: Event::HostStateChanged { alias, state },
+            event:
+                Event::HostStateChanged {
+                    alias,
+                    state,
+                    reason: _,
+                },
         }) = env.payload
             && subscription_id == FLEET_SUB_ID
         {
@@ -334,7 +339,12 @@ autoconnect = true
             .expect("read");
         if let Payload::Event(EventFrame {
             subscription_id,
-            event: Event::HostStateChanged { alias, state },
+            event:
+                Event::HostStateChanged {
+                    alias,
+                    state,
+                    reason: _,
+                },
         }) = env.payload
             && subscription_id == FLEET_SUB_ID
             && alias == "supervisor-test"
@@ -374,7 +384,12 @@ autoconnect = true
             .expect("read");
         if let Payload::Event(EventFrame {
             subscription_id,
-            event: Event::HostStateChanged { alias, state },
+            event:
+                Event::HostStateChanged {
+                    alias,
+                    state,
+                    reason: _,
+                },
         }) = env.payload
             && subscription_id == FLEET_SUB_ID
             && alias == "supervisor-test"
@@ -404,6 +419,97 @@ autoconnect = true
             "did not see Degraded transition — TCP close was fast enough to \
              skip the miss-1 → Degraded step"
         );
+    }
+
+    // Phase 5 Slice 5c-ii extension: exercise the FleetAction wire.
+    // The supervisor is currently cycling through backoff + reconnect
+    // attempts against the dead container. Send FleetAction::Reconnect
+    // with a known request_id; assert FleetActionResult::Success
+    // comes back (dispatched). Supervisor's per-host channel receives
+    // the action, resets backoff_idx to 0, and continues its loop.
+    const RECONNECT_REQUEST_ID: u64 = 9001;
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::FleetAction(tepegoz_proto::FleetActionRequest {
+                request_id: RECONNECT_REQUEST_ID,
+                alias: "supervisor-test".into(),
+                kind: tepegoz_proto::FleetActionKind::Reconnect,
+            }),
+        },
+    )
+    .await
+    .expect("fleet action");
+
+    let action_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_result = false;
+    while !saw_result {
+        let remaining = action_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "did not receive FleetActionResult within 5s"
+        );
+        let env = tokio::time::timeout(remaining, read_envelope(&mut r))
+            .await
+            .expect("read")
+            .expect("read");
+        if let Payload::FleetActionResult(res) = env.payload
+            && res.request_id == RECONNECT_REQUEST_ID
+        {
+            assert_eq!(res.alias, "supervisor-test");
+            assert_eq!(res.kind, tepegoz_proto::FleetActionKind::Reconnect);
+            assert!(
+                matches!(res.outcome, tepegoz_proto::FleetActionOutcome::Success),
+                "Reconnect against a known alias should dispatch cleanly; got {:?}",
+                res.outcome
+            );
+            saw_result = true;
+        }
+    }
+
+    // Also verify an unknown alias returns Failure with a clear reason.
+    const UNKNOWN_REQUEST_ID: u64 = 9002;
+    write_envelope(
+        &mut w,
+        &Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::FleetAction(tepegoz_proto::FleetActionRequest {
+                request_id: UNKNOWN_REQUEST_ID,
+                alias: "does-not-exist".into(),
+                kind: tepegoz_proto::FleetActionKind::Reconnect,
+            }),
+        },
+    )
+    .await
+    .expect("fleet action (unknown alias)");
+
+    let unknown_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_failure = false;
+    while !saw_failure {
+        let remaining = unknown_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "did not receive FleetActionResult (unknown alias) within 5s"
+        );
+        let env = tokio::time::timeout(remaining, read_envelope(&mut r))
+            .await
+            .expect("read")
+            .expect("read");
+        if let Payload::FleetActionResult(res) = env.payload
+            && res.request_id == UNKNOWN_REQUEST_ID
+        {
+            match res.outcome {
+                tepegoz_proto::FleetActionOutcome::Failure { reason } => {
+                    assert!(
+                        reason.contains("unknown alias"),
+                        "expected 'unknown alias' in failure reason, got {reason:?}"
+                    );
+                }
+                other => panic!("expected Failure for unknown alias, got {other:?}"),
+            }
+            saw_failure = true;
+        }
     }
 
     daemon_handle.abort();

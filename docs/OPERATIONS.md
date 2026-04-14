@@ -566,12 +566,22 @@ precedence (**first non-empty source wins — no merging**):
    user = "deploy"
    port = 22
    identity_file = "~/.ssh/id_ed25519_prod"   # ~ expansion supported
+   autoconnect = true                          # daemon dials on startup
 
    [[ssh.hosts]]
    alias = "bench-01"
    hostname = "10.0.2.5"
    user = "bench"
+   # autoconnect omitted → defaults to false (lazy-connect —
+   # waits for `Ctrl-b r` on the focused Fleet row, or
+   # `tepegoz connect bench-01` from the CLI in Slice 5d).
    ```
+
+   **`autoconnect`** is a per-host policy flag, not a wire field.
+   Clients render Fleet connection states (`●` / `◐` / `○` / `⚠`),
+   not per-host policy — the daemon consults `autoconnect` only
+   during supervisor spawn. ssh_config- and env-sourced hosts are
+   always lazy-connect (ssh_config has no autoconnect concept).
 
 2. **`TEPEGOZ_SSH_HOSTS` env** — comma-separated list of aliases.
    Aliases are looked up in `~/.ssh/config`, so this is the right knob
@@ -594,6 +604,25 @@ avoids surprise-merging behavior where adding one override silently
 changes the rest of the list. The Fleet tile's footer renders the
 resolved source when it's an override (tepegoz config.toml / env),
 hidden when the source is the user's ssh_config.
+
+### Env overrides for config + data dirs (Phase 5 Slice 5c-i)
+
+Two env vars short-circuit the `dirs` crate's platform lookup:
+
+- `TEPEGOZ_CONFIG_DIR=<dir>` — makes the config file `<dir>/config.toml`.
+- `TEPEGOZ_DATA_DIR=<dir>` — makes the SSH known_hosts file
+  `<dir>/known_hosts` (and, later, the state DB + recordings under
+  Phase 8).
+
+Primary use is **portable integration tests on macOS**: `dirs::config_dir()`
+ignores `XDG_CONFIG_HOME` on macOS (returns
+`~/Library/Application Support` unconditionally), so a test that needs
+to land a tepegoz `config.toml` without mutating the user's real
+directory relies on `TEPEGOZ_CONFIG_DIR` pointing at a tempdir.
+Secondary use is headless containers (no standard home layout).
+
+Setting either env var is the user's choice — production installs
+shouldn't need them.
 
 ### Diagnostic: `tepegoz doctor --ssh-hosts`
 

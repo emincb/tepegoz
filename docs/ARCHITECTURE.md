@@ -124,11 +124,12 @@ tepegoz (binary)
 |---|---|---|
 | Daemon socket | `$XDG_RUNTIME_DIR/tepegoz-<uid>/daemon.sock` | `$TMPDIR/tepegoz-<uid>/daemon.sock` (falls through to `/tmp/...`) |
 | TUI log | `${XDG_CACHE_HOME:-$HOME/.cache}/tepegoz/tui.log` | same |
-| Config | `$XDG_CONFIG_HOME/tepegoz/config.toml` (planned) | `~/Library/Application Support/tepegoz/config.toml` |
+| Config | `$XDG_CONFIG_HOME/tepegoz/config.toml` | `~/Library/Application Support/tepegoz/config.toml` |
+| SSH host-key TOFU (Phase 5) | `$XDG_DATA_HOME/tepegoz/known_hosts` | `~/Library/Application Support/tepegoz/known_hosts` |
 | State DB (Phase 8+) | `$XDG_DATA_HOME/tepegoz/state.redb` | `~/Library/Application Support/tepegoz/state.redb` |
 | Recordings (Phase 8) | `$XDG_DATA_HOME/tepegoz/recordings/` | `~/Library/Application Support/tepegoz/recordings/` |
 
-Overrides: `TEPEGOZ_LOG_FILE` env for TUI log; `--socket` flag for daemon socket path.
+Overrides: `TEPEGOZ_LOG_FILE` env for TUI log; `--socket` flag for daemon socket path; `TEPEGOZ_CONFIG_DIR` env overrides the config dir root (makes the config file `<dir>/config.toml`, bypassing the `dirs` crate's platform lookup); `TEPEGOZ_DATA_DIR` env overrides the data dir root for the SSH known_hosts file and (later) the state DB + recordings. Primary use of the `*_DIR` envs is portable integration tests on macOS — `dirs::config_dir()` ignores `XDG_CONFIG_HOME` there — and headless containers without a standard home layout.
 
 Permissions: parent dir `0700` and socket `0600` **when default path** (daemon is confident it owns the parent). For `--socket` overrides, parent perms are left alone — the user chose the path, don't second-guess.
 

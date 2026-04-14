@@ -37,7 +37,7 @@ pub mod socket;
 ///   "not-yet-measured" from "idle". `start_time_unix_secs` pairs with
 ///   `pid` to form a stable identity for selection persistence under pid
 ///   reuse.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Identifier for a pty pane owned by the daemon.
 pub type PaneId = u64;
@@ -85,6 +85,13 @@ pub enum Payload {
     /// matching `DockerActionResult` carrying the same `request_id`.
     DockerAction(DockerActionRequest),
 
+    // fleet commands (client → daemon)
+    /// Request the daemon's Fleet supervisor to dial or hang up a host
+    /// by alias. Daemon replies with a matching `FleetActionResult`
+    /// carrying the same `request_id`. Mirrors the `DockerAction`
+    /// shape for pending-action correlation + toast UX.
+    FleetAction(FleetActionRequest),
+
     // ---- daemon → client ----
     Welcome(Welcome),
     Pong,
@@ -96,6 +103,11 @@ pub enum Payload {
     /// Response to a `DockerAction` command. `request_id` mirrors the
     /// originating request so clients can multiplex multiple in-flight actions.
     DockerActionResult(DockerActionResult),
+    /// Response to a `FleetAction` command. `request_id` mirrors the
+    /// originating request. Success means "dispatched to the
+    /// supervisor" — actual connection outcome arrives via
+    /// `HostStateChanged` events, not this reply.
+    FleetActionResult(FleetActionResult),
     Error(ErrorInfo),
 }
 
@@ -278,9 +290,18 @@ pub enum Event {
     /// Disconnected }` per host right after the initial `HostList` —
     /// 5c replaces that with real connection-supervisor transitions
     /// through Connecting → Connected → Degraded → Disconnected.
+    ///
+    /// `reason` is populated only for terminal `⚠` states
+    /// (`AuthFailed`, `HostKeyMismatch`, Phase 6's `AgentNotDeployed` /
+    /// `AgentVersionMismatch`). For transient states
+    /// (`Disconnected`/`Connecting`/`Connected`/`Degraded`) it is
+    /// always `None`. Clients render the reason as a red toast on the
+    /// transition into terminal; logs, error messages, or hovering
+    /// the Fleet row surfaces the field at the tile level.
     HostStateChanged {
         alias: String,
         state: HostState,
+        reason: Option<String>,
     },
 }
 
@@ -575,4 +596,61 @@ pub enum HostState {
     /// (Phase 6) Agent protocol version doesn't match controller's.
     /// Rendered as ⚠ red.
     AgentVersionMismatch,
+}
+
+impl HostState {
+    /// `true` for `⚠` red states — the ones that carry a `reason`
+    /// string on `Event::HostStateChanged` and trigger a red toast on
+    /// the transition. Helper for TUI code that branches on the state
+    /// shape rather than spelling out every variant.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            HostState::AuthFailed
+                | HostState::HostKeyMismatch
+                | HostState::AgentNotDeployed
+                | HostState::AgentVersionMismatch
+        )
+    }
+}
+
+/// Action the client asks the daemon's Fleet supervisor to take
+/// against a host.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetActionKind {
+    /// Reset backoff and jump the supervisor to `Connecting`
+    /// (recovers from terminal `AuthFailed` / `HostKeyMismatch` too —
+    /// pairs with `tepegoz doctor --ssh-forget` for the latter).
+    Reconnect,
+    /// Move the supervisor to `Disconnected` without triggering a
+    /// reconnect. Pairs with a per-host `autoconnect = true` that
+    /// the user wants to override for the session.
+    Disconnect,
+}
+
+/// One-shot Fleet command carrying a client-assigned id.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct FleetActionRequest {
+    pub request_id: u64,
+    pub alias: String,
+    pub kind: FleetActionKind,
+}
+
+/// Daemon's reply to a `FleetAction`. `Success` means "dispatched to
+/// the supervisor" — actual connection outcome arrives as
+/// `Event::HostStateChanged`, not as a `Success` here. `Failure` is
+/// returned when the alias is unknown or the supervisor task has
+/// terminated.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct FleetActionResult {
+    pub request_id: u64,
+    pub alias: String,
+    pub kind: FleetActionKind,
+    pub outcome: FleetActionOutcome,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub enum FleetActionOutcome {
+    Success,
+    Failure { reason: String },
 }

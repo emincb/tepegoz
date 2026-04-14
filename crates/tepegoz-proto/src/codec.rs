@@ -32,6 +32,7 @@ fn payload_variant(p: &Payload) -> &'static str {
         Payload::SendInput { .. } => "SendInput",
         Payload::ResizePane { .. } => "ResizePane",
         Payload::DockerAction(_) => "DockerAction",
+        Payload::FleetAction(_) => "FleetAction",
         Payload::Welcome(_) => "Welcome",
         Payload::Pong => "Pong",
         Payload::Event(frame) => match &frame.event {
@@ -55,6 +56,7 @@ fn payload_variant(p: &Payload) -> &'static str {
         Payload::PaneOpened(_) => "PaneOpened",
         Payload::PaneList { .. } => "PaneList",
         Payload::DockerActionResult(_) => "DockerActionResult",
+        Payload::FleetActionResult(_) => "FleetActionResult",
         Payload::Error(_) => "Error",
     }
 }
@@ -784,6 +786,11 @@ mod tests {
                     event: Event::HostStateChanged {
                         alias: "staging".into(),
                         state,
+                        reason: if state.is_terminal() {
+                            Some(format!("synthetic reason for {state:?}"))
+                        } else {
+                            None
+                        },
                     },
                 }),
             };
@@ -796,14 +803,99 @@ mod tests {
                         Event::HostStateChanged {
                             alias,
                             state: decoded_state,
+                            reason,
                         },
                 }) => {
                     assert_eq!(subscription_id, 97);
                     assert_eq!(alias, "staging");
                     assert_eq!(decoded_state, state);
+                    // Terminal states carry a reason; transient states
+                    // never do. Verifies the wire shape's Option<String>
+                    // field round-trips correctly for both Some and None.
+                    assert_eq!(reason.is_some(), state.is_terminal());
                 }
                 other => panic!("expected Event(HostStateChanged), got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_action_request_roundtrip_covers_both_kinds() {
+        use crate::{FleetActionKind, FleetActionRequest};
+        for kind in [FleetActionKind::Reconnect, FleetActionKind::Disconnect] {
+            let (mut a, mut b) = tokio::io::duplex(1024);
+            let original = Envelope {
+                version: PROTOCOL_VERSION,
+                payload: Payload::FleetAction(FleetActionRequest {
+                    request_id: 42,
+                    alias: "prod-api".into(),
+                    kind,
+                }),
+            };
+            write_envelope(&mut a, &original).await.unwrap();
+            let decoded = read_envelope(&mut b).await.unwrap();
+            match decoded.payload {
+                Payload::FleetAction(req) => {
+                    assert_eq!(req.request_id, 42);
+                    assert_eq!(req.alias, "prod-api");
+                    assert_eq!(req.kind, kind);
+                }
+                other => panic!("expected FleetAction, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_action_result_roundtrip_success_and_failure() {
+        use crate::{FleetActionKind, FleetActionOutcome, FleetActionResult};
+        // Success
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::FleetActionResult(FleetActionResult {
+                request_id: 17,
+                alias: "staging".into(),
+                kind: FleetActionKind::Reconnect,
+                outcome: FleetActionOutcome::Success,
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::FleetActionResult(res) => {
+                assert_eq!(res.request_id, 17);
+                assert_eq!(res.alias, "staging");
+                assert_eq!(res.kind, FleetActionKind::Reconnect);
+                assert!(matches!(res.outcome, FleetActionOutcome::Success));
+            }
+            other => panic!("expected FleetActionResult, got {other:?}"),
+        }
+        // Failure
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::FleetActionResult(FleetActionResult {
+                request_id: 18,
+                alias: "gone".into(),
+                kind: FleetActionKind::Disconnect,
+                outcome: FleetActionOutcome::Failure {
+                    reason: "unknown alias 'gone'".into(),
+                },
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::FleetActionResult(res) => {
+                assert_eq!(res.request_id, 18);
+                match res.outcome {
+                    FleetActionOutcome::Failure { reason } => {
+                        assert!(reason.contains("unknown alias"));
+                    }
+                    FleetActionOutcome::Success => panic!("expected Failure, got Success"),
+                }
+            }
+            other => panic!("expected FleetActionResult, got {other:?}"),
         }
     }
 }
