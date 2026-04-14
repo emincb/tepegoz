@@ -19,7 +19,14 @@ tepegoz-proto = { workspace = true }
 # russh so versioning tracks cleanly; `ssh2-config` is the alternative
 # and can be swapped in with minimal surface change if russh-config ever
 # misses a field we need.
-russh = "0.60"
+#
+# Crypto backend: `ring` (default is `aws-lc-rs`, which needs a full C
+# toolchain with assembler support — cross-building from Linux to
+# x86_64-apple-darwin via cargo-zigbuild fails at the aws-lc-sys link
+# step). `ring` is mostly-pure-Rust with well-tested cross-compile
+# support and covers every algorithm russh negotiates against modern
+# OpenSSH servers (ed25519, ecdsa-p256/384/521, RSA-with-SHA-256+).
+russh = { version = "0.60", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-config = "0.58"
 
 # OS-split config / data dirs. `dirs::config_dir()` maps to
