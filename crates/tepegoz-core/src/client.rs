@@ -195,85 +195,13 @@ fn spawn_writer_task(
     state: Arc<SharedState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // DIAGNOSTIC (Phase 4 4d desync investigation): log the
-        // payload-kind of every envelope we write, and a running
-        // byte counter. Paired with the codec's per-envelope
-        // `write_envelope: serialized` trace, the combination lets
-        // us reconstruct the exact byte offset of the last
-        // successful write before the client's desync — so we can
-        // tell whether the daemon wrote an off-by-N amount.
-        let mut bytes_written_total: u64 = 0;
-        let mut envelope_count: u64 = 0;
         while let Some(env) = event_rx.recv().await {
-            let variant = payload_variant_name(&env.payload);
-            match write_envelope(&mut writer, &env).await {
-                Ok(bytes) => {
-                    envelope_count += 1;
-                    bytes_written_total += bytes as u64;
-                    debug!(
-                        envelope_seq = envelope_count,
-                        payload_variant = variant,
-                        bytes_this_write = bytes,
-                        bytes_written_total,
-                        "writer_task: wrote envelope"
-                    );
-                }
-                Err(e) => {
-                    debug!(
-                        envelope_seq = envelope_count + 1,
-                        payload_variant = variant,
-                        error = %e,
-                        "writer_task: write_envelope failed; writer task ending"
-                    );
-                    break;
-                }
+            if write_envelope(&mut writer, &env).await.is_err() {
+                break;
             }
             state.events_sent.fetch_add(1, Ordering::Relaxed);
         }
     })
-}
-
-/// Discriminant name for a `Payload`, duplicated here (rather than
-/// re-exported from the proto crate) so the writer task can log
-/// variant strings without making `payload_variant` a proto public API.
-/// DIAGNOSTIC ONLY — remove with the Phase 4 4d tracing commit once the
-/// desync root cause is identified.
-fn payload_variant_name(p: &Payload) -> &'static str {
-    match p {
-        Payload::Hello(_) => "Hello",
-        Payload::Ping => "Ping",
-        Payload::Subscribe(_) => "Subscribe",
-        Payload::Unsubscribe { .. } => "Unsubscribe",
-        Payload::OpenPane(_) => "OpenPane",
-        Payload::AttachPane { .. } => "AttachPane",
-        Payload::ClosePane { .. } => "ClosePane",
-        Payload::ListPanes => "ListPanes",
-        Payload::SendInput { .. } => "SendInput",
-        Payload::ResizePane { .. } => "ResizePane",
-        Payload::DockerAction(_) => "DockerAction",
-        Payload::Welcome(_) => "Welcome",
-        Payload::Pong => "Pong",
-        Payload::Event(frame) => match &frame.event {
-            Event::Status(_) => "Event::Status",
-            Event::PaneSnapshot { .. } => "Event::PaneSnapshot",
-            Event::PaneOutput { .. } => "Event::PaneOutput",
-            Event::PaneExit { .. } => "Event::PaneExit",
-            Event::PaneLagged { .. } => "Event::PaneLagged",
-            Event::ContainerList { .. } => "Event::ContainerList",
-            Event::DockerUnavailable { .. } => "Event::DockerUnavailable",
-            Event::ContainerLog { .. } => "Event::ContainerLog",
-            Event::ContainerStats(_) => "Event::ContainerStats",
-            Event::DockerStreamEnded { .. } => "Event::DockerStreamEnded",
-            Event::PortList { .. } => "Event::PortList",
-            Event::PortsUnavailable { .. } => "Event::PortsUnavailable",
-            Event::ProcessList { .. } => "Event::ProcessList",
-            Event::ProcessesUnavailable { .. } => "Event::ProcessesUnavailable",
-        },
-        Payload::PaneOpened(_) => "PaneOpened",
-        Payload::PaneList { .. } => "PaneList",
-        Payload::DockerActionResult(_) => "DockerActionResult",
-        Payload::Error(_) => "Error",
-    }
 }
 
 async fn handle_command(

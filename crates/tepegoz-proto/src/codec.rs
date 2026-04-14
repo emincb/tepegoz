@@ -10,13 +10,15 @@ use crate::{Envelope, Event, Payload};
 /// Maximum frame size. Defends against malformed or hostile length prefixes.
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
-/// Diagnostic: stable discriminant string for a [`Payload`]. Added during
-/// the Phase 4 4d wire-desync investigation so the writer task + codec can
-/// log exactly which envelope kind was last written / failed to read.
+/// Stable discriminant string for a [`Payload`] — added during the Phase 4
+/// 4d wire-desync investigation and kept as a permanent diagnostic helper.
+/// If a future desync surfaces, per-envelope call sites can log this to
+/// attribute the payload kind without reaching for `{:?}` (which allocates
+/// and unfolds the whole payload tree).
 ///
-/// Keeping this as a pure function on the payload ref (no `Debug` cost, no
-/// allocation) so it can sit on every hot-path write without contaminating
-/// profiles when the log level doesn't filter it out.
+/// Currently unused in the hot path; reinstate at a future diagnostic site
+/// rather than recreating it from scratch.
+#[allow(dead_code)]
 fn payload_variant(p: &Payload) -> &'static str {
     match p {
         Payload::Hello(_) => "Hello",
@@ -56,64 +58,31 @@ fn payload_variant(p: &Payload) -> &'static str {
 }
 
 /// Encode an [`Envelope`] to rkyv and write it with a length prefix.
-///
-/// Returns the total number of bytes written (4-byte length prefix +
-/// payload). The writer task uses this to maintain a running byte
-/// counter for desync diagnostics — see `spawn_writer_task` in
-/// `tepegoz-core::client`.
 pub async fn write_envelope<W: AsyncWrite + Unpin>(
     writer: &mut W,
     envelope: &Envelope,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<()> {
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(envelope)
         .map_err(|e| anyhow::anyhow!("rkyv serialize: {e}"))?;
     let len = u32::try_from(bytes.len())
         .map_err(|_| anyhow::anyhow!("envelope too large: {} bytes", bytes.len()))?;
 
-    // DIAGNOSTIC (Phase 4 4d desync investigation): before the write,
-    // record exactly what we're about to emit — payload variant, the
-    // logical `bytes.len()` that becomes the wire length prefix, and
-    // the AlignedVec's `capacity()` so we can see whether extra
-    // padding bytes might be leaking past the length boundary. Also
-    // log the first-byte hash of the AlignedVec slice so we can
-    // cross-reference exactly which payload made it onto the wire
-    // when the client reads a mid-stream length prefix.
+    // Defend against AlignedVec's Deref returning bytes past the logical
+    // length — that would make `write_all` write more than the length
+    // prefix promises and desync the client. The assertion falsified the
+    // AlignedVec-padding hypothesis during the Phase 4 4d wire-desync
+    // investigation; keeping it as a cheap dev-build invariant check.
     let slice: &[u8] = &bytes;
-    let first_four_hex = {
-        let n = slice.len().min(4);
-        let mut s = String::with_capacity(n * 2);
-        for b in &slice[..n] {
-            s.push_str(&format!("{b:02x}"));
-        }
-        s
-    };
-    debug!(
-        payload_variant = payload_variant(&envelope.payload),
-        bytes_len = bytes.len(),
-        aligned_vec_capacity = bytes.capacity(),
-        wire_slice_len = slice.len(),
-        first_four_hex = %first_four_hex,
-        "write_envelope: serialized"
-    );
-
-    // Sanity check: the slice we hand to `write_all` must have the
-    // same length as the `len` we prefix. If rkyv 0.8's AlignedVec
-    // `Deref<Target = [u8]>` ever returns padded bytes past the
-    // logical length, this `debug_assert_eq!` catches it in dev
-    // builds. (In release it's a no-op; the diagnostic-log variant
-    // above still runs.)
     debug_assert_eq!(
         slice.len(),
         bytes.len(),
-        "AlignedVec deref len must match bytes.len() — if this fires, \
-         write_all writes more than the length prefix promises and the \
-         client desyncs."
+        "AlignedVec deref len must match bytes.len()"
     );
 
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(slice).await?;
     writer.flush().await?;
-    Ok(4 + slice.len())
+    Ok(())
 }
 
 /// Read a length prefix and decode the following rkyv payload into an [`Envelope`].
