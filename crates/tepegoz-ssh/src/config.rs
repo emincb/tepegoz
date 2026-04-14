@@ -15,7 +15,7 @@
 //! merge rules + percent-token expansion for Hostname. Tepegöz does not
 //! re-implement the parser.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -62,6 +62,13 @@ impl HostSource {
 pub struct HostList {
     pub hosts: Vec<HostEntry>,
     pub source: HostSource,
+    /// Phase 5 Slice 5c-i: set of aliases with `autoconnect = true` in
+    /// the winning source. Populated only when the source is
+    /// `HostSource::TepegozConfig` — ssh_config and env sources have
+    /// no autoconnect concept (always lazy-connect). The daemon's
+    /// Fleet supervisor consults this on spawn to decide whether to
+    /// dial immediately vs. wait for a user action.
+    pub autoconnect: HashSet<String>,
 }
 
 impl HostList {
@@ -71,11 +78,12 @@ impl HostList {
     pub fn discover() -> Result<Self, SshError> {
         if let Some(path) = paths::config_path() {
             if path.exists() {
-                let hosts = parse_tepegoz_config(&path)?;
+                let (hosts, autoconnect) = parse_tepegoz_config(&path)?;
                 if !hosts.is_empty() {
                     return Ok(Self {
                         hosts,
                         source: HostSource::TepegozConfig(path),
+                        autoconnect,
                     });
                 }
             }
@@ -93,6 +101,7 @@ impl HostList {
                 return Ok(Self {
                     hosts,
                     source: HostSource::Env,
+                    autoconnect: HashSet::new(),
                 });
             }
         }
@@ -103,6 +112,7 @@ impl HostList {
                 return Ok(Self {
                     hosts,
                     source: HostSource::SshConfig(path),
+                    autoconnect: HashSet::new(),
                 });
             }
         }
@@ -110,6 +120,7 @@ impl HostList {
         Ok(Self {
             hosts: Vec::new(),
             source: HostSource::None,
+            autoconnect: HashSet::new(),
         })
     }
 
@@ -153,21 +164,30 @@ struct TepegozHostEntry {
     identity_file: Option<String>,
     #[serde(default)]
     proxy_jump: Option<String>,
+    /// Phase 5 Slice 5c-i: daemon-side autoconnect policy. `true` asks
+    /// the supervisor to dial this host on startup without waiting for
+    /// a user action; `false` (default) is lazy-connect. Kept off the
+    /// wire because clients don't render per-host policy — they render
+    /// states.
+    #[serde(default)]
+    autoconnect: Option<bool>,
 }
 
-fn parse_tepegoz_config(path: &Path) -> Result<Vec<HostEntry>, SshError> {
+fn parse_tepegoz_config(path: &Path) -> Result<(Vec<HostEntry>, HashSet<String>), SshError> {
     let raw = std::fs::read_to_string(path)?;
     let cfg: TepegozConfig = toml::from_str(&raw).map_err(|e| SshError::TepegozConfig {
         path: path.to_path_buf(),
         reason: e.to_string(),
     })?;
     let default_user = current_user();
-    Ok(cfg
-        .ssh
-        .and_then(|s| s.hosts)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|h| HostEntry {
+    let raw_hosts = cfg.ssh.and_then(|s| s.hosts).unwrap_or_default();
+    let mut autoconnect = HashSet::new();
+    let mut hosts = Vec::with_capacity(raw_hosts.len());
+    for h in raw_hosts {
+        if h.autoconnect.unwrap_or(false) {
+            autoconnect.insert(h.alias.clone());
+        }
+        hosts.push(HostEntry {
             alias: h.alias,
             hostname: h.hostname,
             user: h.user.unwrap_or_else(|| default_user.clone()),
@@ -183,8 +203,9 @@ fn parse_tepegoz_config(path: &Path) -> Result<Vec<HostEntry>, SshError> {
                 .map(|p| vec![expand_tilde(&p)])
                 .unwrap_or_default(),
             proxy_jump: h.proxy_jump,
-        })
-        .collect())
+        });
+    }
+    Ok((hosts, autoconnect))
 }
 
 /// Expand a leading `~/` or literal `~` into the user's home directory.
@@ -448,14 +469,49 @@ hostname = "10.0.0.6"
 port = 5432
 "#,
         );
-        let hosts = parse_tepegoz_config(&path).unwrap();
+        let (hosts, autoconnect) = parse_tepegoz_config(&path).unwrap();
         assert_eq!(hosts.len(), 2);
+        assert!(
+            autoconnect.is_empty(),
+            "no host set autoconnect=true, so the set is empty"
+        );
         let api = hosts.iter().find(|h| h.alias == "prod-api").unwrap();
         assert_eq!(api.hostname, "10.0.0.5");
         assert_eq!(api.user, "deploy");
         assert_eq!(api.port, 22);
         let db = hosts.iter().find(|h| h.alias == "prod-db").unwrap();
         assert_eq!(db.port, 5432);
+    }
+
+    #[test]
+    fn tepegoz_config_autoconnect_flag_populates_set() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            &dir,
+            "tepegoz.toml",
+            r#"
+[[ssh.hosts]]
+alias = "always-on"
+hostname = "10.0.0.8"
+autoconnect = true
+
+[[ssh.hosts]]
+alias = "lazy"
+hostname = "10.0.0.9"
+# autoconnect omitted — defaults to false
+
+[[ssh.hosts]]
+alias = "explicit-lazy"
+hostname = "10.0.0.10"
+autoconnect = false
+"#,
+        );
+        let (hosts, autoconnect) = parse_tepegoz_config(&path).unwrap();
+        assert_eq!(hosts.len(), 3);
+        assert_eq!(autoconnect.len(), 1);
+        assert!(autoconnect.contains("always-on"));
+        assert!(!autoconnect.contains("lazy"));
+        assert!(!autoconnect.contains("explicit-lazy"));
     }
 
     #[test]
@@ -471,7 +527,7 @@ hostname = "10.0.0.7"
 identity_file = "~/.ssh/id_ed25519_test"
 "#,
         );
-        let hosts = parse_tepegoz_config(&path).unwrap();
+        let (hosts, _autoconnect) = parse_tepegoz_config(&path).unwrap();
         assert_eq!(hosts.len(), 1);
         let idf = &hosts[0].identity_files[0];
         assert!(
@@ -490,8 +546,9 @@ identity_file = "~/.ssh/id_ed25519_test"
     fn tepegoz_config_empty_ssh_section_is_not_an_error() {
         let dir = TempDir::new().unwrap();
         let path = write_file(&dir, "tepegoz.toml", "# no ssh section\n");
-        let hosts = parse_tepegoz_config(&path).unwrap();
+        let (hosts, autoconnect) = parse_tepegoz_config(&path).unwrap();
         assert!(hosts.is_empty());
+        assert!(autoconnect.is_empty());
     }
 
     #[test]

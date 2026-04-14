@@ -428,9 +428,25 @@ Proposal pass signed off 2026-04-14: Q1 ssh concrete + trait-in-Phase-10; Q2 ssh
 
 **5b-to-5c gap** (explicit — not a bug): Fleet renders `all Disconnected` between this slice and 5c's merge because the connection supervisor isn't up yet. Same degrade-gracefully shape as Phase 3's `DockerUnavailable`. 5c replaces the parked `forward_fleet` task body with real state transitions.
 
-### Slice 5c — Per-host connection supervisor + heartbeat + reconnect · ⚪
+### Slice 5c-i — Supervisor state machine + heartbeat + backoff + autoconnect · ✅ (`<5c-i commit>`)
 
-Upcoming. Daemon-side per-host `tokio::task` with state machine; `keepalive@openssh.com` heartbeat (30 s; three misses → Degraded → Disconnected); exponential backoff (1/2/5/15/60 s cap); `Payload::FleetAction { alias, kind: Reconnect|Disconnect }`; `FleetActionResult`; ProxyJump detection surfaces `SshError::ConnectFailed { reason: "ProxyJump not supported in v1" }` (follow-up #1 from 5a review).
+**Delivered.**
+- Per-host `host_supervisor` task spawned inside a `tokio::task::JoinSet` by the rewritten `forward_fleet` coordinator. Subscription cancellation drops the JoinSet, which aborts every supervisor — same aggregate-lifecycle pattern as Phase 3's Docker forwarders.
+- State machine: `Disconnected` → `Connecting` → `Connected` → `Degraded` (on first heartbeat miss) → `Disconnected` → (backoff) → `Connecting` …. Emits `Event::HostStateChanged` on every transition.
+- Heartbeat: `keepalive@openssh.com` every 30 s via `russh::client::Handle::send_keepalive(want_reply=true)`. Miss counter increments on send-Err or `handle.is_closed()`; miss ≥ 1 → `Degraded`; miss ≥ 3 → `Disconnected` + trigger reconnect. russh 0.60's keepalive is fire-and-forget (no Future resolves on server ack), so the Degraded step may be skipped under clean TCP close — the wire/state-machine shape is correct either way, and Phase 6's agent can track ACKs natively.
+- Reconnect backoff ladder: 1 / 2 / 5 / 15 / 60 s; cap at 60 s; resets to 1 s when a connection held ≥ 30 s before dying (so transient failures don't permanently elevate the next-retry for a healthy host).
+- Lazy-connect default: `autoconnect = false`. Hosts with `autoconnect = true` in tepegoz `config.toml` dial on startup; ssh_config-sourced and env-sourced hosts always wait (no autoconnect concept there). 5c-ii's `FleetAction::Reconnect` wakes lazy hosts.
+- ProxyJump pre-check (5a follow-up #1): hosts with `ProxyJump` set in ssh_config transition straight to `AuthFailed` (terminal) with a warn-level log naming the unsupported directive. 5c-ii's red toast reads the `AuthFailed` state as the ⚠ trigger; reason is visible in daemon logs for now.
+- Terminal states (`AuthFailed`, `HostKeyMismatch`) park the supervisor forever in 5c-i (no action channel yet); 5c-ii adds Reconnect to reset them.
+- Env-var overrides: `TEPEGOZ_CONFIG_DIR` + `TEPEGOZ_DATA_DIR` override the `dirs` crate's config/data paths. Primary use is portable integration tests on macOS (where `dirs::config_dir()` ignores `XDG_CONFIG_HOME`); also useful for headless containers.
+- `HostList::autoconnect: HashSet<String>` — daemon-side only (not on the wire); populated only when the source is `HostSource::TepegozConfig`.
+- **Tests**: 1 new autoconnect-parse unit test; 1 new opt-in integration test (`TEPEGOZ_SSH_TEST=1 + TEPEGOZ_DOCKER_TEST=1`) that provisions a tepegoz config.toml with `autoconnect = true`, starts an openssh-server container, observes the full `Disconnected → Connecting → Connected` happy path, kills the container, observes `Disconnected` within 90 s + at least one reconnect attempt. 5b fleet_scope test relaxed to accept any structurally-valid `HostState` since ProxyJump hosts in the test machine's ssh_config now emit `AuthFailed` directly.
+
+No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetActionResult`.
+
+### Slice 5c-ii — FleetAction wire + Ctrl-b r reconnect UX · ⚪
+
+Upcoming. Wire protocol v8: `Payload::FleetAction { alias, kind: FleetActionKind::{Reconnect, Disconnect} }` + `Payload::FleetActionResult { alias, kind, outcome: Success | Failure { reason } }`. Daemon dispatches to the appropriate supervisor via per-host mpsc channels kept in `forward_fleet`'s coordinator scope. TUI `Ctrl-b r` keybind on a focused Fleet row dispatches Reconnect; toast on `AuthFailed` / `HostKeyMismatch` / ProxyJump surfaces the reason verbatim.
 
 ### Slice 5d — Remote pty open + pane-stack + `tepegoz connect <alias>` · ⚪
 

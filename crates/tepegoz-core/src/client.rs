@@ -1045,39 +1045,68 @@ fn processes_unavailable_envelope(subscription_id: u64, reason: String) -> Envel
     }
 }
 
-/// Forwarder for `Subscription::Fleet`.
+/// How often the supervisor probes a live SSH session with a
+/// `keepalive@openssh.com` global request. Matches OpenSSH's
+/// `ServerAliveInterval` default.
+const SSH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Miss count that transitions a healthy host to Degraded. A "miss"
+/// is a keepalive send that returned Err or a closed-handle check
+/// that reported true.
+const SSH_DEGRADED_THRESHOLD: u32 = 1;
+/// Miss count that transitions to Disconnected + triggers reconnect.
+/// Matches the CTO-spec "three consecutive misses" shape exactly.
+/// russh 0.60's `send_keepalive` is fire-and-forget — there's no
+/// Future that resolves on server ack — so a miss is a send that
+/// returned Err OR `handle.is_closed()`. Against a cleanly-killed
+/// TCP connection every miss fires fast (TCP RST), so the whole
+/// window from first miss → disconnect is ~90 s worst case: one
+/// heartbeat interval each.
+const SSH_DISCONNECTED_THRESHOLD: u32 = 3;
+/// Minimum dwell time in `Connected` to reset the reconnect backoff.
+/// A connection that holds longer than this before dying is treated
+/// as "healthy, then transient failure" — next retry starts from 1 s.
+/// Shorter connections compound backoff so a perpetually-broken host
+/// doesn't spin.
+const SSH_RECONNECT_RESET_THRESHOLD: Duration = Duration::from_secs(30);
+/// Exponential-backoff ladder for reconnect attempts. Cap at the
+/// final entry; healthy-connection reset on hold > 30 s drops back to
+/// the first entry.
+const SSH_BACKOFF_LADDER: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+];
+
+/// Coordinator for `Subscription::Fleet`.
 ///
-/// Phase 5 Slice 5b: discover SSH hosts (ssh_config / tepegoz config.toml
-/// / env) and deliver one `HostList` snapshot, then one
-/// `HostStateChanged { state: Disconnected }` per host. After that the
-/// task parks — actual per-host connection supervision lands in Slice 5c.
+/// Discovers SSH hosts (ssh_config / tepegoz config.toml / env),
+/// emits an initial `HostList` snapshot, then spawns a per-host
+/// [`host_supervisor`] task inside a tokio `JoinSet`. When this
+/// coordinator is cancelled (Unsubscribe / client disconnect / daemon
+/// shutdown), the `JoinSet` drops → all supervisor tasks abort
+/// cleanly.
 ///
-/// Until 5c ships, Fleet renders "all Disconnected" — same degrade-
-/// gracefully shape as Phase 3's `DockerUnavailable`.
+/// Phase 5 Slice 5c-i: supervisors own the Disconnected → Connecting
+/// → Connected → (Degraded) → Disconnected state machine with
+/// exponential backoff reconnect. No user-driven FleetAction yet —
+/// that ships in 5c-ii with wire v8. Hosts with `autoconnect = true`
+/// in tepegoz `config.toml` dial on startup; everything else waits
+/// for 5c-ii's `FleetAction::Reconnect`.
 ///
 /// Discovery runs on tokio's blocking pool because ssh_config parsing
-/// does filesystem reads; it's bounded and fast, but keeps the async
-/// runtime clean.
+/// does filesystem reads.
 async fn forward_fleet(subscription_id: u64, event_tx: mpsc::UnboundedSender<Envelope>) {
     let list = match tokio::task::spawn_blocking(tepegoz_ssh::HostList::discover).await {
         Ok(Ok(list)) => list,
         Ok(Err(e)) => {
-            // Rare — ssh_config malformed, or config.toml garbage.
-            // Surface via the same "empty list with source label" shape
-            // a real empty host list would use, then park. UI renders
-            // the tile's empty-list hint. Log the reason so the daemon
-            // operator can diagnose.
             warn!(subscription_id, error = %e, "fleet discovery failed");
-            let _ = event_tx.send(Envelope {
-                version: PROTOCOL_VERSION,
-                payload: Payload::Event(EventFrame {
-                    subscription_id,
-                    event: Event::HostList {
-                        hosts: Vec::new(),
-                        source: format!("discovery error: {e}"),
-                    },
-                }),
-            });
+            let _ = event_tx.send(host_list_envelope(
+                subscription_id,
+                Vec::new(),
+                format!("discovery error: {e}"),
+            ));
             std::future::pending::<()>().await;
             return;
         }
@@ -1089,45 +1118,269 @@ async fn forward_fleet(subscription_id: u64, event_tx: mpsc::UnboundedSender<Env
 
     let hosts = list.hosts;
     let source = list.source.label();
+    let autoconnect = list.autoconnect;
 
     if event_tx
-        .send(Envelope {
-            version: PROTOCOL_VERSION,
-            payload: Payload::Event(EventFrame {
-                subscription_id,
-                event: Event::HostList {
-                    hosts: hosts.clone(),
-                    source,
-                },
-            }),
-        })
+        .send(host_list_envelope(subscription_id, hosts.clone(), source))
         .is_err()
     {
         return;
     }
 
-    // Emit an initial Disconnected transition per host so the tile
-    // knows the state marker starts at ○. 5c's supervisor drives real
-    // transitions after this.
-    for host in &hosts {
-        if event_tx
-            .send(Envelope {
-                version: PROTOCOL_VERSION,
-                payload: Payload::Event(EventFrame {
-                    subscription_id,
-                    event: Event::HostStateChanged {
-                        alias: host.alias.clone(),
-                        state: tepegoz_proto::HostState::Disconnected,
-                    },
-                }),
-            })
-            .is_err()
-        {
-            return;
-        }
+    // Spawn one supervisor per host in a JoinSet so subscription
+    // cancellation (coordinator drop) aborts every supervisor
+    // automatically. Same aggregate-lifecycle pattern as Phase 3's
+    // Docker forwarders — no per-task abort bookkeeping needed.
+    let mut supervisors: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    for host in hosts {
+        let should_autoconnect = autoconnect.contains(&host.alias);
+        let tx = event_tx.clone();
+        supervisors.spawn(async move {
+            host_supervisor(subscription_id, host, should_autoconnect, tx).await;
+        });
     }
 
-    // Park until the subscription is cancelled. 5c replaces this with
-    // the per-host supervisor loop that drives real state transitions.
+    // Wait for either (a) all supervisors to complete on their own
+    // (terminal states with no reconnect loop running — only happens
+    // if every host ends in HostKeyMismatch / AuthFailed / ProxyJump-
+    // not-supported and never gets a Reconnect action, which 5c-i
+    // can't receive anyway), or (b) this coordinator gets cancelled
+    // from outside.
+    while supervisors.join_next().await.is_some() {}
     std::future::pending::<()>().await;
+}
+
+/// State-machine loop for a single SSH host. Emits
+/// `Event::HostStateChanged` on every transition; runs heartbeat
+/// while Connected; applies exponential backoff on reconnect.
+///
+/// Phase 5 Slice 5c-i: runs autonomously — no external message
+/// channel (5c-ii adds that for `FleetAction::Reconnect`). Hosts with
+/// `autoconnect = false` emit an initial Disconnected and park
+/// forever in 5c-i; they'll get an action channel in 5c-ii.
+async fn host_supervisor(
+    subscription_id: u64,
+    entry: tepegoz_proto::HostEntry,
+    autoconnect: bool,
+    event_tx: mpsc::UnboundedSender<Envelope>,
+) {
+    let alias = entry.alias.clone();
+
+    // ProxyJump pre-check (5a follow-up #1): we don't speak ProxyJump
+    // in Phase 5; transition straight to AuthFailed with the v1.1
+    // reason so the Fleet tile renders ⚠ red + (5c-ii) the red toast
+    // carries the reason verbatim. Terminal state; no reconnect loop.
+    if entry.proxy_jump.is_some() {
+        emit_state(
+            &event_tx,
+            subscription_id,
+            &alias,
+            tepegoz_proto::HostState::AuthFailed,
+        );
+        warn!(
+            alias,
+            proxy_jump = entry.proxy_jump.as_deref().unwrap_or("?"),
+            "host requires ProxyJump which is not supported in Phase 5 (v1.1)"
+        );
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    // Always emit the initial Disconnected so the tile's per-alias
+    // state map is seeded — the renderer depends on it.
+    emit_state(
+        &event_tx,
+        subscription_id,
+        &alias,
+        tepegoz_proto::HostState::Disconnected,
+    );
+
+    if !autoconnect {
+        // Lazy-connect hosts wait for user action. 5c-i has no action
+        // channel, so they park here; 5c-ii replaces the pending with
+        // an action-select loop.
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    let mut backoff_idx: usize = 0;
+    loop {
+        emit_state(
+            &event_tx,
+            subscription_id,
+            &alias,
+            tepegoz_proto::HostState::Connecting,
+        );
+
+        let connect_start = std::time::Instant::now();
+        let connect_result = try_connect(&entry).await;
+
+        match connect_result {
+            Ok(session) => {
+                emit_state(
+                    &event_tx,
+                    subscription_id,
+                    &alias,
+                    tepegoz_proto::HostState::Connected,
+                );
+                // Run the heartbeat loop until the session dies.
+                run_connected_session(&alias, subscription_id, session, &event_tx).await;
+                // Session ended: reset backoff if the connection held
+                // longer than the threshold, otherwise compound it so
+                // a flapping host doesn't retry every second forever.
+                if connect_start.elapsed() >= SSH_RECONNECT_RESET_THRESHOLD {
+                    backoff_idx = 0;
+                }
+                emit_state(
+                    &event_tx,
+                    subscription_id,
+                    &alias,
+                    tepegoz_proto::HostState::Disconnected,
+                );
+            }
+            Err(tepegoz_ssh::SshError::HostKeyMismatch { .. }) => {
+                warn!(
+                    alias,
+                    "host-key TOFU rejected — terminal state, awaiting user --ssh-forget"
+                );
+                emit_state(
+                    &event_tx,
+                    subscription_id,
+                    &alias,
+                    tepegoz_proto::HostState::HostKeyMismatch,
+                );
+                // Terminal; no reconnect until 5c-ii's FleetAction
+                // resets the supervisor after the user runs
+                // --ssh-forget.
+                std::future::pending::<()>().await;
+                return;
+            }
+            Err(tepegoz_ssh::SshError::AuthFailed { reason, .. }) => {
+                warn!(alias, reason = %reason, "authentication failed — terminal state");
+                emit_state(
+                    &event_tx,
+                    subscription_id,
+                    &alias,
+                    tepegoz_proto::HostState::AuthFailed,
+                );
+                std::future::pending::<()>().await;
+                return;
+            }
+            Err(e) => {
+                warn!(alias, error = %e, "connect failed — will retry after backoff");
+                emit_state(
+                    &event_tx,
+                    subscription_id,
+                    &alias,
+                    tepegoz_proto::HostState::Disconnected,
+                );
+            }
+        }
+
+        let delay = SSH_BACKOFF_LADDER[backoff_idx.min(SSH_BACKOFF_LADDER.len() - 1)];
+        tokio::time::sleep(delay).await;
+        backoff_idx = (backoff_idx + 1).min(SSH_BACKOFF_LADDER.len() - 1);
+    }
+}
+
+/// Thin wrapper around `tepegoz_ssh::connect_host` that builds a one-
+/// entry `HostList` + opens a `KnownHostsStore`. Discovery already ran
+/// in the coordinator; we rebuild a single-host list here just for the
+/// connect_host API shape (alias → lookup).
+async fn try_connect(
+    entry: &tepegoz_proto::HostEntry,
+) -> Result<tepegoz_ssh::SshSession, tepegoz_ssh::SshError> {
+    use std::collections::HashSet;
+    let hosts = tepegoz_ssh::HostList {
+        hosts: vec![entry.clone()],
+        source: tepegoz_ssh::HostSource::None,
+        autoconnect: HashSet::new(),
+    };
+    let known_hosts = tepegoz_ssh::KnownHostsStore::open()?;
+    tepegoz_ssh::connect_host(&entry.alias, &hosts, &known_hosts).await
+}
+
+/// Heartbeat loop while `Connected`. Runs until the session dies
+/// (heartbeat send fails / handle reports closed). Transitions the
+/// state to `Degraded` after the first miss so the tile renders ◐
+/// yellow before the final cutover.
+async fn run_connected_session(
+    alias: &str,
+    subscription_id: u64,
+    session: tepegoz_ssh::SshSession,
+    event_tx: &mpsc::UnboundedSender<Envelope>,
+) {
+    let mut interval = tokio::time::interval(SSH_HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the first (immediate) tick — we just emitted Connected,
+    // no point in sending a keepalive before we've held the connection
+    // for even one interval.
+    interval.tick().await;
+
+    let mut miss_counter: u32 = 0;
+    let mut current_state = tepegoz_proto::HostState::Connected;
+
+    loop {
+        interval.tick().await;
+
+        let handle = session.handle();
+        let send_ok = if handle.is_closed() {
+            false
+        } else {
+            handle.send_keepalive(true).await.is_ok()
+        };
+
+        if send_ok {
+            if miss_counter > 0 && current_state == tepegoz_proto::HostState::Degraded {
+                current_state = tepegoz_proto::HostState::Connected;
+                emit_state(event_tx, subscription_id, alias, current_state);
+            }
+            miss_counter = 0;
+        } else {
+            miss_counter += 1;
+            if miss_counter >= SSH_DISCONNECTED_THRESHOLD {
+                // Disconnect path — caller emits Disconnected on
+                // return and starts the backoff retry.
+                return;
+            }
+            if miss_counter >= SSH_DEGRADED_THRESHOLD
+                && current_state != tepegoz_proto::HostState::Degraded
+            {
+                current_state = tepegoz_proto::HostState::Degraded;
+                emit_state(event_tx, subscription_id, alias, current_state);
+            }
+        }
+    }
+}
+
+fn emit_state(
+    event_tx: &mpsc::UnboundedSender<Envelope>,
+    subscription_id: u64,
+    alias: &str,
+    state: tepegoz_proto::HostState,
+) {
+    let _ = event_tx.send(Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::HostStateChanged {
+                alias: alias.to_string(),
+                state,
+            },
+        }),
+    });
+}
+
+fn host_list_envelope(
+    subscription_id: u64,
+    hosts: Vec<tepegoz_proto::HostEntry>,
+    source: String,
+) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::HostList { hosts, source },
+        }),
+    }
 }

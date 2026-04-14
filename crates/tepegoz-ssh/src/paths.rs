@@ -14,12 +14,29 @@ use crate::error::SshError;
 
 /// Path to the tepegoz `config.toml`. `None` when no home directory can
 /// be resolved (headless environments without `$HOME`).
+///
+/// **Env override**: `TEPEGOZ_CONFIG_DIR=<dir>` makes the path
+/// `<dir>/config.toml`. Primary use is integration tests that need to
+/// land a tepegoz config.toml without mutating the user's real
+/// directory (`dirs::config_dir()` doesn't honor `XDG_CONFIG_HOME` on
+/// macOS — tests on macOS would otherwise be stuck at
+/// `~/Library/Application Support`). Non-test use: headless containers
+/// without a standard home / config dir layout.
 pub fn config_path() -> Option<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("TEPEGOZ_CONFIG_DIR") {
+        return Some(PathBuf::from(override_dir).join("config.toml"));
+    }
     dirs::config_dir().map(|d| d.join("tepegoz").join("config.toml"))
 }
 
 /// Path to the tepegoz-owned known_hosts file used for host-key TOFU.
+///
+/// **Env override**: `TEPEGOZ_DATA_DIR=<dir>` makes the path
+/// `<dir>/known_hosts`. Same rationale as `TEPEGOZ_CONFIG_DIR`.
 pub fn known_hosts_path() -> Option<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("TEPEGOZ_DATA_DIR") {
+        return Some(PathBuf::from(override_dir).join("known_hosts"));
+    }
     dirs::data_dir().map(|d| d.join("tepegoz").join("known_hosts"))
 }
 

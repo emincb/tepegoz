@@ -152,6 +152,7 @@ async fn ssh_connect_exec_roundtrip() {
             proxy_jump: None,
         }],
         source: HostSource::None,
+        autoconnect: std::collections::HashSet::new(),
     };
 
     let known_hosts_path = tmp.path().join("known_hosts");
