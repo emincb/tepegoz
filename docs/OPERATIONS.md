@@ -450,6 +450,103 @@ Sign off on rows 1–8 closes Phase 3 (row 3 in `docs/STATUS.md` → ✅). Row 9
 docker rm -f tepegoz-slice-c-victim tepegoz-stream-ended-victim 2>/dev/null
 ```
 
+## Slice 4d manual demo prep (Phase 4)
+
+Closes Phase 4. Same shape as C3: 8 scenarios, pass/fail matrix, all rows are the gate (rows 7 and 8 are the 4c-deliverable eyeball confirmations that tests can't fully exercise).
+
+### Prep
+
+```sh
+# Terminal 0 — build + run daemon
+cargo build
+./target/debug/tepegoz daemon
+
+# Terminal 1 — standing Docker victim (gives scenario 4 a real :13000 → container row)
+docker run -d --name tepegoz-slice-4d-victim -p 13000:80 alpine sleep 600
+
+# Terminal 2 — TUI
+./target/debug/tepegoz tui
+```
+
+Expected initial state on TUI launch: the Ports tile (bottom-middle, no longer a placeholder) shows `connecting…` briefly, then a populated table within ~2 s. `Ctrl-b j` → `Ctrl-b l` focuses the Ports tile; the border brightens to cyan.
+
+### Demo sequence
+
+**Step 1 — Ports populates within 2 s; first-render CPU% is em-dash.**
+
+Fresh `tepegoz tui`. The Ports tile transitions from `connecting…` to a table of listening ports within ~2 s. Press `p` to toggle to Processes view. First render: every row's CPU% column shows `—` (em-dash), NOT `0.0`. Sanity: toggle back with `p` to Ports view.
+
+→ Pass: table populates ≤ 2 s; em-dash visible on first render; toggling doesn't reset either view's selection.
+
+**Step 2 — Filter narrows / commits / clears in both views.**
+
+On Ports view with focus: press `/`, type `post` (or any substring matching at least one listener's process_name / local_port / container_id). Filter bar shows `filter: post_` with yellow caret; table narrows to matching rows. Press Enter: caret disappears, filter stays applied ("N/M port(s) · ... · filter: post"). Press `/`, then Esc: filter clears, table returns to full list.
+
+Repeat on Processes view (`p` toggles there). Filter matches on `command` or `pid`.
+
+→ Pass: both views narrow/commit/clear independently; each keeps its own filter state across toggle.
+
+**Step 3 — `p` toggles views; title swaps; help-bar hint matches active view.**
+
+On Ports view: border title reads `ports`; help-bar footer reads `[j/k] nav · [/] filter · [p] Processes`. Press `p`: title swaps to `processes`; help-bar reads `[j/k] nav · [/] filter · [p] Ports`. Press `p` again: back to Ports.
+
+→ Pass: title, help-bar hint, and active view all swap together; no flicker, no stale title.
+
+**Step 4 — Docker-bound port shows container column.**
+
+The standing `tepegoz-slice-4d-victim` container publishes port 13000 → container's :80. Focus Ports tile; filter `13000` (or scroll to find it). The row for `tcp 0.0.0.0:13000` (or equivalent) has a non-empty CONTAINER column (first 12 hex chars of the alpine container's id).
+
+→ Pass: the :13000 row carries a container column entry (short id). No other loopback-only listener shows a container entry.
+
+**Step 5 — Kill the owning process externally; rows disappear within ~3 s.**
+
+Note a non-system process's pid from the Ports or Processes view (e.g. a browser helper, your editor). From a third terminal: `kill <pid>`. Within ~3 s, the Ports row AND the Processes row for that pid disappear. Selection re-anchors to a neighboring row (doesn't stick on the deleted entity).
+
+Safer alternative: `python3 -c "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',24001)); s.listen(); time.sleep(300)" &` (records the PID in `$!`). Then `kill $!` and watch 127.0.0.1:24001 disappear from Ports + python3 disappear from Processes.
+
+→ Pass: both rows disappear within ~3 s; selection doesn't crash the TUI; the tile re-renders cleanly.
+
+**Step 6 — Kill Docker externally; Ports tile keeps working, container column empties.**
+
+From another terminal: Docker Desktop → Quit, or `colima stop`, or `sudo systemctl stop docker`. Watch the Ports tile for the next ~4 s: it does NOT flash unavailable / crash / stall. The CONTAINER column for previously-correlated rows (like the :13000 row) goes empty. The Docker tile (separate scope) transitions to Unavailable — expected, not a Ports concern. Restart Docker: the Ports tile's container column refills within one refresh cycle.
+
+→ Pass: Ports keeps serving live data through a Docker outage; correlation gracefully degrades to empty; recovers on Docker restart.
+
+**Step 7 — UDP footer hint visible and unambiguous at 120×40.**
+
+On the Ports view status bar (bottom of the status row): the text `UDP coming v1.1` appears at the end, not truncated by tile width. At the standing demo terminal size (at least 120×40), the full phrase is legible.
+
+→ Pass: `UDP coming v1.1` renders in full; user understands UDP is deferred, not broken.
+
+**Step 8 — Second-sample CPU% transitions em-dash → number.**
+
+On Processes view, first render has every row at `—`. Wait at least 2 s (ideally 4 s). At least one row (typically `tepegoz`, your shell, or a visible-activity process like `Electron Helper`) transitions from `—` to a real number (e.g. `0.2`, `12.5`). The em-dash disappears for measured processes.
+
+→ Pass: at least one row's CPU% is a non-`—` number after the second refresh; em-dash is transient, not permanent.
+
+### Pass/fail matrix
+
+| # | Scenario | Pass |
+|---|---|---|
+| 1 | Ports populates ≤ 2 s; first-render Processes CPU% = em-dash | ☐ |
+| 2 | Filter narrows/commits/clears in both views independently | ☐ |
+| 3 | `p` toggles views; title swaps; help-bar hint matches active view | ☐ |
+| 4 | `:13000` row shows a CONTAINER column entry (short docker id) | ☐ |
+| 5 | Killing a process externally removes it from both Ports + Processes ≤ 3 s without crashing | ☐ |
+| 6 | Ports keeps working through a Docker outage; CONTAINER column empties, recovers on restart | ☐ |
+| 7 | `UDP coming v1.1` footer hint visible and un-truncated at 120×40 | ☐ |
+| 8 | Second-sample CPU% transitions from `—` to a number for at least one row | ☐ |
+
+**All 8 scenarios are the gate.** Rows 7 and 8 pin 4c-deliverable behavior that the integration tests don't fully exercise. If any fail, record the gotcha in `docs/ISSUES.md` as a Phase-4 polish item — fix before the Phase 4 close commit flips row 4 to ✅.
+
+### Tear down
+
+```sh
+docker rm -f tepegoz-slice-4d-victim 2>/dev/null
+pkill -f "python3 -c import socket" 2>/dev/null
+pkill -f "tepegoz daemon" 2>/dev/null
+```
+
 ## Common issues
 
 ### POSIX `printf` portability in integration tests

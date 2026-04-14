@@ -59,31 +59,30 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## Engineer section
 
-**Last updated:** 2026-04-14, Phase 4 Slice 4c landed (Ports tile TUI with Processes toggle).
+**Last updated:** 2026-04-14, Phase 4 all four sub-slices landed (Phase 4 close pending user's 8-scenario manual demo).
 
 ### Where I left off
 
-Phase 4 Slice 4c shipped. Awaiting CTO review + cross-OS CI green. 207 tests on macOS / 216 on ubuntu-latest, `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean. All four CTO-flagged 4c notes landed — details in `docs/ROADMAP.md` Slice 4c section.
+Phase 4 Slice 4d shipped. 209 tests on macOS / 218 on ubuntu-latest, `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean. 4d consists of: (1) a combined e2e integration test `crates/tepegoz-core/tests/ports_processes_e2e.rs` with an opt-in `TEPEGOZ_PROBE_TEST=1` child-round-trip case + an opt-in-on-both-envs Docker-correlation case (confirmed locally — child pid found in both Ports + Processes within 6 s; docker-bound port correlated with its container id within 6 s); (2) an 8-scenario manual demo in `docs/OPERATIONS.md` "Slice 4d manual demo prep". All 8 are the gate.
 
-4c covers:
-- New `ScopeKind::Ports`; Ports tile in the god view flipped from `Placeholder` to `Scope(ScopeKind::Ports)`. Render dispatch in `session.rs` gains a `Scope(Ports)` arm routing to `scope::ports::render`.
-- `PortsScope` state struct in `app.rs` wraps two coequal views (`PortsView` + `ProcessesView`), each with its own three-state lifecycle (`Connecting` / `Available { rows, source }` / `Unavailable { reason }`), filter, and selection. `active: PortsActiveView` toggles which view renders; both subscriptions stay live regardless.
-- `PortKey { protocol, local_port, pid }` and `ProcessKey { pid, start_time_unix_secs }` are the stable identities. `reanchor_selection(old_key)` on every state change places the cursor on the matching key when present; clamps into the new visible range otherwise. Pid-reuse with different `start_time` doesn't silently retarget selection (state-machine test pins it).
-- Input routing: `handle_forward_bytes` is now a two-arm dispatch by `routes_to_scope(focused)`. `handle_ports_key` absorbs `p` as the outer toggle (unless filter is active, where `p` is a filter character), then delegates to `handle_ports_list_key` or `handle_processes_list_key` by `active`.
-- Renderer in `scope::ports::render` mirrors `scope::docker::render`'s shape. Processes table renders `cpu_percent: None` as em-dash (`—`), `Some(x)` as `x` formatted to one decimal. Ports status bar carries the `UDP coming v1.1` footer hint per the 4c UDP-resolution (option c: defer to v1.1 with explicit user-visible indication).
-- Tests: 13 new app state-machine + 14 new scope::ports render = 27 total 4c additions on top of 180 from 4b.
+Previous slices remain valid — 4a (daemon Ports probe), 4b (daemon Processes probe), 4c (Ports tile TUI with Processes toggle). Details in `docs/ROADMAP.md` per-slice sections.
 
-No deviations from the CTO's 4c sign-off beyond the optional 5th (cmdline-truncation visual hint) — skipped because it would require either a wire flag (protocol bump for a cosmetic hint) or a heuristic (false-positive prone). `docs/OPERATIONS.md` Common Issues already documents the macOS-truncation behavior so users have an answer.
+4d covers:
+- Combined E2E integration test `crates/tepegoz-core/tests/ports_processes_e2e.rs` with two opt-in cases. Main: spawn python3 child binding a TCP port, wait for the child's readiness handshake (port printed to stdout + flushed), subscribe to BOTH Ports + Processes, assert child appears in both within 6 s, kill child, assert disappears from both within 6 s. Bonus: gated on `TEPEGOZ_PROBE_TEST=1 + TEPEGOZ_DOCKER_TEST=1`, starts a `docker run -d -p <port>:80 alpine sleep 120`, subscribes to Ports, asserts the row carries `container: Some(<id>)` within 6 s. Pins the README mockup's distinguishing `:3000 web (docker)` feature — most likely to silently regress since it spans three subsystems. Confirmed locally against Docker Desktop.
+- 8-scenario manual demo in `docs/OPERATIONS.md` "Slice 4d manual demo prep". Scenarios 1–6 are the 6 staked out in the CTO's 4c sign-off; 7 (`UDP coming v1.1` footer hint legibility at 120×40) and 8 (second-sample CPU% transition from em-dash to number) are 4c-deliverable eyeball confirmations that the integration tests can't fully exercise. Unlike C3's 1–8-gate + 9-advisory split, all 8 here are the gate — they pin the 4c invariants plus the Phase 4 overall "scopes degrade gracefully under Docker outage" story.
+- `tokio::process::Command::kill_on_drop(true)` handles the child-leak problem without a hand-rolled ChildGuard struct. Sync `DockerContainerGuard` Drop impl handles the container.
 
 ### What I'm mid-flight on
 
-_Nothing._ Awaiting CTO review of 4c before starting 4d. Don't start 4d code until sign-off.
+_Nothing._ Awaiting CTO review of 4d + user's 8-scenario manual demo. Don't start any Phase 5 work until Phase 4 closes via the post-demo close commit.
 
 ### What I'm expecting from the CTO next
 
-- **Review + sign-off on 4c**, or redirect. Specific things I flagged as tactical calls: (a) UDP resolution (c) with a footer hint — CTO said "pick one and I'll sign off in review," so this is the reviewable call. (b) Skipping the optional 5th cmdline-truncation hint — defensible on wire-cost grounds, but CTO may prefer the hint even at protocol-bump cost. (c) The two-arm `handle_forward_bytes` dispatch is a small refactor of the existing `Some(ScopeKind::Docker)` arm; it scales cleanly to Phase 5+ but could grow unwieldy if we end up with 6+ scope kinds — worth revisiting shape if scope growth accelerates.
-- **Go-ahead for 4d** (Phase 4 e2e + manual demo script). 4d is the Phase 4 close artifact: 6-scenario pass/fail matrix in `docs/OPERATIONS.md`, end-to-end integration test driving a scripted `App` through the wire. Acceptance scenarios are already staked out in `docs/ROADMAP.md` Slice 4d section.
-- CI green on both OSes is my own gate; I'll check `gh run` after pushing.
+- **Review + sign-off on 4d**, or redirect. No deviations from the CTO's 4d directive (matched the scenario list 1–8 exactly; integration test file name + opt-in env var scheme match the instructions).
+- **User runs the 8-scenario manual demo** per `docs/OPERATIONS.md` "Slice 4d manual demo prep" against the standing Docker victim. All 8 are the gate.
+- **On user sign-off:** I land a separate close commit flipping STATUS row 4 to ✅ + ROADMAP Phase 4 marker to ✅ with date + HANDOFF CTO + engineer sections for post-Phase-4-close state (Phase 5 proposal pass pending). Per CTO: close is user-action-triggered, NOT bundled with the 4d feature commit — same shape as Phase 3 close `8984456`.
+- **If any scenario fails:** inline fix commit before the close, same pattern as C1.5c's potential fallback.
+- CI green on both OSes is my own gate; I'll check `gh run` after pushing and ping only once both OSes are confirmed.
 
 ### Anything that would surprise a fresh-me
 

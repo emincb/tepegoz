@@ -302,7 +302,7 @@ Users retain `docker exec -it <container> sh` in their local pty tile as the v1 
 
 ---
 
-## Phase 4 — Ports + processes panels (local) · 🟠 (4a + 4b + 4c landed; 4d pending)
+## Phase 4 — Ports + processes panels (local) · 🟠 (all 4 sub-slices landed; 8-scenario user demo pending)
 
 Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-state within the Ports tile (lowercase `p` toggles between Ports and Processes views) rather than a new Decision #7 tile — solves the "processes without a bound port" flow while respecting the god-view layout; (Q2) probe uses the cross-OS `netstat2` wrapper (procfs on Linux, libproc on macOS) plus `sysinfo` for pid → process name; (Q3) daemon-side correlation so clients stay dumb; (Q4) 2 s refresh cadence matching Docker; (Q5) 4 sub-slices.
 
@@ -350,7 +350,7 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 - `crates/tepegoz-core/tests/processes_scope.rs::processes_subscription_emits_either_process_list_or_unavailable` (always-on): asserts `ProcessList` xor `ProcessesUnavailable` within 30 s with non-empty source / reason AND that every row in the first `ProcessList` carries `cpu_percent: None`.
 - `crates/tepegoz-core/tests/processes_scope.rs::processes_subscription_sees_spawned_child_within_budget` (opt-in `TEPEGOZ_PROBE_TEST=1`): spawns a known `sleep 30` child (`ChildGuard` force-kills on Drop), subscribes, drains until the child's pid appears with command containing `"sleep"`, non-zero `start_time_unix_secs`, non-zero `mem_bytes` (or `partial: true`). 5 s budget covers one refresh boundary.
 
-### Slice 4c — Ports tile TUI with Processes toggle · 🟡 (`<4c commit>`)
+### Slice 4c — Ports tile TUI with Processes toggle · ✅ (`4b850c1`)
 
 **Delivered.**
 - New `ScopeKind::Ports` variant; Ports tile in the god-view layout flipped from `Placeholder` to `Scope(ScopeKind::Ports)` (`tile.rs`) with render dispatch in `session.rs`.
@@ -377,13 +377,21 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 
 **Gate.** CI green on macOS + ubuntu-latest, then CTO review before 4d.
 
-### Slice 4d — Phase 4 e2e + manual demo script · ⚪
+### Slice 4d — Phase 4 e2e + manual demo script · 🟡 (`<4d commit>`)
 
-**Scope.**
-- Pass/fail matrix in `docs/OPERATIONS.md` "Slice 4d manual demo prep": (1) Ports tile populates within 2 s of TUI launch; (2) filter narrows / commits / clears; (3) `p` toggles Processes and back; (4) Docker-bound port shows container column; (5) killing owning process updates within ~2 s; (6) engine-unavailable shows container empty but Ports still works. These 6 scenarios gate Phase 4 close.
-- End-to-end integration test drives a scripted `App` through the wire (C3c pattern): provision a known child process + bound port, subscribe, assert the state transitions occur end-to-end including correlation.
+**Delivered.**
+- **Combined E2E integration test** at `crates/tepegoz-core/tests/ports_processes_e2e.rs`:
+  - `ports_and_processes_see_spawned_child_and_see_it_disappear` (opt-in `TEPEGOZ_PROBE_TEST=1`): spawns a python3 child that binds a loopback TCP port and sleeps, reads the assigned port from the child's stdout (handshake to avoid racing the probe against the bind), subscribes to BOTH Ports + Processes, asserts the child pid appears in both within 6 s, kills the child, asserts it disappears from both within 6 s. 6 s budget = 2 s cadence + one refresh boundary + slack.
+  - `docker_bound_port_surfaces_with_container_correlation` (opt-in on BOTH `TEPEGOZ_PROBE_TEST=1` AND `TEPEGOZ_DOCKER_TEST=1`): starts an alpine container publishing `<host_port>:80`, subscribes to Ports, asserts the row for that port carries `container: Some(<id>)` within 6 s. Pins the README mockup's `:3000 web (docker)` feature — the one most likely to silently regress since it spans three subsystems (probe, daemon, docker).
+  - `tokio::process::Command::kill_on_drop(true)` handles subprocess cleanup without a hand-rolled `ChildGuard`; a sync `DockerContainerGuard` Drop handles the container.
+- **Manual demo script** in `docs/OPERATIONS.md` "Slice 4d manual demo prep": 8 scenarios + pass/fail matrix. All 8 are the gate (unlike C3's 1–8-gate + 9-advisory). Scenarios 7 and 8 specifically pin 4c-deliverable behavior that the integration tests can't fully exercise — UDP footer hint legibility at 120×40, and second-sample CPU% transition from em-dash to number.
 
-**Acceptance (Phase 4 close).** 6 manual-demo scenarios sign off; `TEPEGOZ_PROBE_TEST=1` opt-in integration tests green on both OSes (macOS + ubuntu-latest); `cargo test --workspace` green on both with the env var unset. Matches Phase 3's precedent.
+**Acceptance tests.**
+- 2 new opt-in integration tests in `ports_processes_e2e.rs` (see above).
+- Both skip cleanly when env vars are unset so CI stays green without provisioning probes or Docker.
+- 209 total tests on macOS / 218 on ubuntu-latest (207 + 2 always-on skip paths; opt-in paths add nothing to the default count).
+
+**Acceptance (Phase 4 close).** All 8 manual-demo scenarios sign off; `TEPEGOZ_PROBE_TEST=1` opt-in integration tests green locally + on the hosts where user preps elevated access; `cargo test --workspace` green on both OSes with env vars unset. On user sign-off, a separate close commit flips STATUS row 4 to ✅ (not bundled into the 4d feature commit — the close is triggered by user action per the Phase 3 precedent).
 
 **Not in scope (Phase 4).** Remote probes (Phase 6 with the agent). Process signal actions (kill keybind) — candidate follow-up for v1.1. Port tied-to-pane navigation (`Enter` on a port row opens a shell / log tail). UDP listeners.
 
