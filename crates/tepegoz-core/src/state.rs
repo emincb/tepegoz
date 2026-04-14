@@ -10,6 +10,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tepegoz_proto::StatusSnapshot;
 use tepegoz_pty::PtyManager;
 
+use crate::remote_pane::RemotePaneManager;
+
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct SharedState {
@@ -21,6 +23,11 @@ pub struct SharedState {
     pub daemon_pid: u32,
     pub socket_path: PathBuf,
     pub pty: PtyManager,
+    /// Phase 5 Slice 5d-i: remote pty panes (SSH-backed). Parallel to
+    /// `pty` so existing local-pty code paths stay unchanged; the
+    /// daemon's command handlers check `remote_pty` first for a given
+    /// `PaneId` and fall through to `pty` when not found.
+    pub remote_pty: RemotePaneManager,
 }
 
 impl SharedState {
@@ -39,11 +46,14 @@ impl SharedState {
             daemon_pid: std::process::id(),
             socket_path,
             pty: PtyManager::new(),
+            remote_pty: RemotePaneManager::new(),
         }
     }
 
     pub async fn snapshot(&self) -> StatusSnapshot {
-        let panes_open = u32::try_from(self.pty.count().await).unwrap_or(u32::MAX);
+        let local = u32::try_from(self.pty.count().await).unwrap_or(u32::MAX);
+        let remote = u32::try_from(self.remote_pty.count().await).unwrap_or(u32::MAX);
+        let panes_open = local.saturating_add(remote);
         StatusSnapshot {
             daemon_pid: self.daemon_pid,
             daemon_version: DAEMON_VERSION.to_string(),

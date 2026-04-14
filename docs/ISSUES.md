@@ -10,6 +10,73 @@ _(none)_
 
 ---
 
+## Known limitations, Phase 6 upgrade path
+
+Documented gaps that are **not bugs** — they're accepted scope
+boundaries for Phase 5's russh-direct remote pty design, with a named
+mechanism that closes the gap in a later phase without changing the
+wire protocol. If one of these starts behaving like a bug (user reports
+crash, wrong data, security issue), re-classify and move up to Active.
+
+### Remote pane dies on SSH disconnect (Phase 5 → Phase 6)
+
+Phase 5 Slice 5d-i wires each `OpenPane { target: Remote { alias } }`
+to a **fresh SSH session** opened via `tepegoz_ssh::connect_host` with
+`channel.request_pty` + `request_shell`. When the TCP connection drops
+(network flap, server restart, explicit disconnect), russh's session
+task ends; the channel closes; our `RemotePane` driver task emits
+`PaneUpdate::Exit`; the pane is dead. Client renders the terminal
+pane with its accumulated scrollback intact; user must open a fresh
+remote pane to reconnect.
+
+**This is not persistence**. There's no server-side session
+continuity; a user running `vim` on a flappy connection loses their
+edit state at every flap.
+
+**Phase 6 upgrade path**. Phase 6 deploys a `tepegoz-agent` binary
+to the remote host via `scp` + exec over SSH. The agent runs as a
+long-lived process that owns the actual local pty on the remote;
+SSH carries our wire protocol over stdio to the agent. When SSH
+flaps, the agent stays up (local shell process still running); on
+reconnect, the daemon reopens the SSH channel to the same agent
+pid and re-attaches. Full persistence of the remote shell across
+network disruption — same shape as local panes' Phase 2 detach-
+and-reattach invariant.
+
+The wire protocol does NOT change between Phase 5 and Phase 6 for
+this — `OpenPane { target: Remote { alias } }` continues to mean
+"open a remote pty against this host." Only the daemon-side
+`RemotePane::open` implementation swaps from "open russh channel
+with pty-req" to "forward OpenPane to agent over SSH stdio."
+
+Q3 of the Phase 5 proposal (signed off 2026-04-14) accepted this
+staging explicitly: "Phase 5 ships russh-direct; Phase 6 swaps to
+agent-backed without changing the wire shape."
+
+### Per-pane SSH connection overhead (Phase 5 → Phase 6)
+
+Each Phase-5-era `RemotePane` opens its own fresh TCP + TLS-equivalent
+handshake + auth round. Three panes against `staging` = three
+independent SSH connections. The Fleet supervisor's session (managed
+by 5c's `host_supervisor`) is **not reused** — that session exists
+for keepalive + state-marker tracking, not pane-bytes proxying.
+
+**Phase 6 upgrade path**. Agent deployment opens one SSH session
+per host; the agent multiplexes multiple panes over that one stdio
+channel. Panes become cheap (one `OpenPane` wire frame each), and
+the "how many connections am I opening?" question disappears from
+the user's mental model.
+
+### `Ctrl-b w` pane-list overlay deferred (5d-ii → 5e or v1.1)
+
+5d-ii lands the pane-stack with `Ctrl-b 0..9` jump + `Ctrl-b n`/`p`
+cycle. The list-view overlay for >9 panes is scoped for 5e polish.
+Users with >9 concurrent panes today can still navigate via cycling;
+jump-by-number just wraps at 9. Not a bug, but flag as a v1.1 polish
+item if real-world usage surfaces it.
+
+---
+
 ## Resolved
 
 ### ✅ Vim-preservation across Scope→Pane re-attach — moot after Decision #7

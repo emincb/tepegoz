@@ -116,6 +116,7 @@ async fn open_pane(
     let env = Envelope {
         version: PROTOCOL_VERSION,
         payload: Payload::OpenPane(OpenPaneSpec {
+            target: tepegoz_proto::PaneTarget::Local,
             shell: Some("/bin/sh".into()),
             cwd: None,
             env: Vec::new(),

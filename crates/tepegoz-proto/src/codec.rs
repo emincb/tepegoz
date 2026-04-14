@@ -898,4 +898,59 @@ mod tests {
             other => panic!("expected FleetActionResult, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn open_pane_target_roundtrip_covers_local_and_remote() {
+        use crate::{OpenPaneSpec, PaneTarget};
+        // Local (default target) — v9 wire must preserve it explicitly
+        // even though prior wire versions encoded it implicitly.
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::OpenPane(OpenPaneSpec {
+                shell: None,
+                cwd: Some("/tmp".into()),
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                target: PaneTarget::Local,
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::OpenPane(spec) => {
+                assert_eq!(spec.target, PaneTarget::Local);
+                assert_eq!(spec.cwd.as_deref(), Some("/tmp"));
+                assert_eq!(spec.rows, 24);
+            }
+            other => panic!("expected OpenPane, got {other:?}"),
+        }
+
+        // Remote — the Phase 5 Slice 5d addition. Alias round-trips
+        // intact, no truncation / re-encoding surprises.
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::OpenPane(OpenPaneSpec {
+                shell: None,
+                cwd: None,
+                env: Vec::new(),
+                rows: 50,
+                cols: 132,
+                target: PaneTarget::Remote {
+                    alias: "staging-eu".into(),
+                },
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::OpenPane(spec) => match spec.target {
+                PaneTarget::Remote { alias } => assert_eq!(alias, "staging-eu"),
+                other => panic!("expected Remote target, got {other:?}"),
+            },
+            other => panic!("expected OpenPane, got {other:?}"),
+        }
+    }
 }

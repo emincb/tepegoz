@@ -462,9 +462,25 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
   - `docs/OPERATIONS.md` "SSH Fleet discovery" section gains an `autoconnect = true` example in the `config.toml` block + a new "Env overrides for config + data dirs" subsection explaining when to reach for `TEPEGOZ_CONFIG_DIR` / `TEPEGOZ_DATA_DIR` (portable tests on macOS; headless containers).
 - **Tests**: 3 new proto codec tests (`host_state_changed` roundtrip now covers `reason.is_some() == state.is_terminal()` invariant; `fleet_action_request_roundtrip_covers_both_kinds`; `fleet_action_result_roundtrip_success_and_failure`). Integration test adds 2 new wire paths (Reconnect dispatch, unknown-alias failure). 250 total tests on macOS (+2 vs 5c-i).
 
-### Slice 5d — Remote pty open + pane-stack + `tepegoz connect <alias>` · ⚪
+### Slice 5d-i — Remote pty open (daemon-side) · ✅ (`<5d-i commit>`)
 
-Upcoming. `OpenPane` grows `target: PaneTarget::{Local, Remote { alias }}` (wire v8); daemon `RemotePane` wraps an SSH channel with `request_pty` + `request_shell`; TUI pane-stack lands (Q5's tab strip inside the PTY tile — `[N label*]` format + desaturation for inactive; `Ctrl-b 0..9`/`n`/`p`/`&`/`w`); `tepegoz connect <alias>` CLI subcommand.
+**Delivered.**
+- Wire protocol v9. `OpenPaneSpec` gains `target: PaneTarget` field; `PaneTarget::{Local, Remote { alias }}` enum with `#[default] Local`. Codec round-trip test pins both variants.
+- `tepegoz-core::remote_pane` module: `RemotePaneManager` (per-pane HashMap, parallel to `tepegoz_pty::PtyManager`) + `RemotePane` struct with identical `subscribe / size / is_alive / exit_code / send_input / resize` surface as local `tepegoz_pty::Pane`. Broadcast channel + scrollback ring match `tepegoz_pty`'s shape exactly — the forwarder's `PaneUpdate::{Bytes, Exit}` events flow unchanged.
+- Per-pane SSH connection: each `RemotePane::open` calls `tepegoz_ssh::connect_host` + `open_session`, then `channel.request_pty + request_shell`. One dedicated tokio task per pane owns the russh channel and `tokio::select!`s between outbound command mpsc (`RemotePaneCmd::{Data, Resize, Close}`) and inbound `channel.wait()` events. `ChannelMsg::Data`/`ExtendedData` forward as `PaneUpdate::Bytes`; `Close`/`Eof` trigger a final `PaneUpdate::Exit`.
+- Per-pane fresh SSH session (wasteful but simple for Phase 5 — Phase 6's agent consolidates per-host connections through a shared session proxying our wire protocol over stdio).
+- `SharedState` gains `remote_pty: RemotePaneManager`. `handle_command`'s pane-ops (`OpenPane`, `AttachPane`, `SendInput`, `ResizePane`, `ClosePane`, `ListPanes`) check `remote_pty` first by `PaneId` and fall through to local `pty` when not found. `PaneId` namespaces stay disjoint (local starts at 1, remote starts at `1 << 32`) so per-manager lookup is an O(1) `contains_key`.
+- `forward_remote_pane` mirrors `forward_pane` exactly — duplication tracked as a 5d-ii / Phase 6 refactor to a shared `PaneBackend` trait.
+- Opt-in integration test `crates/tepegoz-core/tests/remote_pane.rs::remote_pane_open_attach_exec_roundtrip` on `TEPEGOZ_SSH_TEST=1 + TEPEGOZ_DOCKER_TEST=1`: provisions a fresh ed25519 keypair + openssh-server container, lands a tepegoz config.toml pointing at it, opens a remote pane via `Payload::OpenPane { target: Remote { alias } }`, attaches + sends `echo tepegoz-marker-5d\n`, drains pane events until the marker appears in the byte stream.
+- Proto codec test `open_pane_target_roundtrip_covers_local_and_remote` pins both variants + nested `alias` string round-trip.
+
+**Not in this slice.** TUI-side pane-stack + tab strip + keybinds (5d-ii). `tepegoz connect <alias>` CLI (5d-ii). Shared `PaneBackend` trait refactor (deferred — see duplication note above).
+
+**Phase 5 limitation**: dropped SSH connection kills the pane. Client renders a terminal `PaneExit` event and the pane is dead; user must open a fresh one. Phase 6's agent-backed pty (same wire shape) survives SSH flaps. Documented in `docs/ISSUES.md` under "Known limitations, Phase 6 upgrade path".
+
+### Slice 5d-ii — Pane-stack + tab strip + Ctrl-b keybinds + `tepegoz connect <alias>` · ⚪
+
+Upcoming. TUI `pane_stack: Vec<PaneId>` + `active_pane: usize`; 1-line tab strip inside the PTY tile's Rect (active marked with `*` suffix, inactive rendered with `Modifier::DIM` — not bright cyan, reserved for tile-focus); `Ctrl-b 0..9` jump, `Ctrl-b n`/`p` cycle, `Ctrl-b &` close current (re-opens local root if stack would empty); `Ctrl-b Enter` on focused Fleet row opens a remote pane + pushes + focuses. `tepegoz connect <alias>` CLI subcommand. 5e's manual demo gates Phase 5 close.
 
 ### Slice 5e — Error surfaces + disconnect recovery + e2e manual demo · ⚪
 

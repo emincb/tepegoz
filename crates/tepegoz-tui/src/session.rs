@@ -142,6 +142,7 @@ async fn ensure_pane(
                 env: Vec::new(),
                 rows,
                 cols,
+                target: tepegoz_proto::PaneTarget::Local,
             }),
         },
     )

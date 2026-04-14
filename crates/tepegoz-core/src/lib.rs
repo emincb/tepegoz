@@ -8,6 +8,7 @@
 mod client;
 mod config;
 mod daemon;
+mod remote_pane;
 mod state;
 
 pub use config::DaemonConfig;

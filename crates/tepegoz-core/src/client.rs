@@ -376,32 +376,62 @@ async fn handle_command(
             }
         }
 
-        Payload::OpenPane(spec) => {
-            let pty_spec = PtyOpenSpec {
-                shell: spec.shell,
-                cwd: spec.cwd.map(std::path::PathBuf::from),
-                env: spec.env.into_iter().map(|e| (e.key, e.value)).collect(),
-                rows: spec.rows,
-                cols: spec.cols,
-            };
-            match state.pty.open(pty_spec).await {
-                Ok(pane) => {
-                    event_tx.send(Envelope {
-                        version: PROTOCOL_VERSION,
-                        payload: Payload::PaneOpened(pane.info()),
-                    })?;
-                }
-                Err(e) => {
-                    event_tx.send(error_envelope(
-                        ErrorKind::Internal,
-                        &format!("open pane: {e}"),
-                    ))?;
+        Payload::OpenPane(spec) => match spec.target {
+            tepegoz_proto::PaneTarget::Local => {
+                let pty_spec = PtyOpenSpec {
+                    shell: spec.shell,
+                    cwd: spec.cwd.map(std::path::PathBuf::from),
+                    env: spec.env.into_iter().map(|e| (e.key, e.value)).collect(),
+                    rows: spec.rows,
+                    cols: spec.cols,
+                };
+                match state.pty.open(pty_spec).await {
+                    Ok(pane) => {
+                        event_tx.send(Envelope {
+                            version: PROTOCOL_VERSION,
+                            payload: Payload::PaneOpened(pane.info()),
+                        })?;
+                    }
+                    Err(e) => {
+                        event_tx.send(error_envelope(
+                            ErrorKind::Internal,
+                            &format!("open pane: {e}"),
+                        ))?;
+                    }
                 }
             }
-        }
+            tepegoz_proto::PaneTarget::Remote { alias } => {
+                // SSH dial + pty request happens inline — this is slow
+                // enough (~1 s handshake + auth + pty alloc) that a
+                // client waiting for PaneOpened will feel it, but
+                // spawning would complicate the ordering with subsequent
+                // AttachPane commands. The session loop is fine blocking
+                // here; other clients keep making progress via other
+                // client handlers.
+                match state
+                    .remote_pty
+                    .open(alias.clone(), spec.rows, spec.cols)
+                    .await
+                {
+                    Ok(pane) => {
+                        event_tx.send(Envelope {
+                            version: PROTOCOL_VERSION,
+                            payload: Payload::PaneOpened(pane.info()),
+                        })?;
+                    }
+                    Err(e) => {
+                        event_tx.send(error_envelope(
+                            ErrorKind::Internal,
+                            &format!("open remote pane ({alias}): {e}"),
+                        ))?;
+                    }
+                }
+            }
+        },
 
         Payload::ListPanes => {
-            let panes = state.pty.list().await;
+            let mut panes = state.pty.list().await;
+            panes.extend(state.remote_pty.list().await);
             event_tx.send(Envelope {
                 version: PROTOCOL_VERSION,
                 payload: Payload::PaneList { panes },
@@ -411,31 +441,40 @@ async fn handle_command(
         Payload::AttachPane {
             pane_id,
             subscription_id,
-        } => match state.pty.get(pane_id).await {
-            Some(pane) => {
-                if let Some(prev) = pane_subs.remove(&subscription_id) {
-                    debug!(
-                        subscription_id,
-                        "replacing existing pane attachment on same id"
-                    );
-                    prev.abort();
-                }
+        } => {
+            if let Some(prev) = pane_subs.remove(&subscription_id) {
+                debug!(
+                    subscription_id,
+                    "replacing existing pane attachment on same id"
+                );
+                prev.abort();
+            }
+            if let Some(pane) = state.remote_pty.get(pane_id).await {
+                let tx = event_tx.clone();
+                let handle = tokio::spawn(async move {
+                    forward_remote_pane(pane, subscription_id, tx).await;
+                });
+                pane_subs.insert(subscription_id, handle.abort_handle());
+            } else if let Some(pane) = state.pty.get(pane_id).await {
                 let tx = event_tx.clone();
                 let handle = tokio::spawn(async move {
                     forward_pane(pane, subscription_id, tx).await;
                 });
                 pane_subs.insert(subscription_id, handle.abort_handle());
-            }
-            None => {
+            } else {
                 event_tx.send(error_envelope(
                     ErrorKind::UnknownPane,
                     &format!("no pane {pane_id}"),
                 ))?;
             }
-        },
+        }
 
         Payload::SendInput { pane_id, data } => {
-            if let Some(pane) = state.pty.get(pane_id).await {
+            if let Some(pane) = state.remote_pty.get(pane_id).await {
+                if let Err(e) = pane.send_input(&data) {
+                    debug!(pane_id, error = %e, "remote send_input failed");
+                }
+            } else if let Some(pane) = state.pty.get(pane_id).await {
                 if let Err(e) = pane.send_input(&data) {
                     debug!(pane_id, error = %e, "send_input failed (pane may be dead)");
                 }
@@ -447,7 +486,11 @@ async fn handle_command(
             rows,
             cols,
         } => {
-            if let Some(pane) = state.pty.get(pane_id).await {
+            if let Some(pane) = state.remote_pty.get(pane_id).await {
+                if let Err(e) = pane.resize(rows, cols) {
+                    debug!(pane_id, error = %e, "remote resize failed");
+                }
+            } else if let Some(pane) = state.pty.get(pane_id).await {
                 if let Err(e) = pane.resize(rows, cols) {
                     debug!(pane_id, error = %e, "resize failed");
                 }
@@ -455,7 +498,11 @@ async fn handle_command(
         }
 
         Payload::ClosePane { pane_id } => {
-            if let Err(e) = state.pty.close(pane_id).await {
+            if state.remote_pty.contains(pane_id).await {
+                if let Err(e) = state.remote_pty.close(pane_id).await {
+                    debug!(pane_id, error = %e, "remote close failed");
+                }
+            } else if let Err(e) = state.pty.close(pane_id).await {
                 debug!(pane_id, error = %e, "close failed");
             }
         }
@@ -487,6 +534,79 @@ async fn send_status(
 
 /// Forward a pane's live output to a client subscription until the pane
 /// exits or the client disconnects.
+/// Mirror of `forward_pane` for SSH-backed remote panes. `RemotePane`
+/// exposes the same `subscribe / size / is_alive / exit_code` surface
+/// as `tepegoz_pty::Pane`, so the body is structurally identical —
+/// a future refactor into a shared `PaneBackend` trait eliminates the
+/// duplication (tracked as 5d-ii / Phase 6 cleanup).
+async fn forward_remote_pane(
+    pane: Arc<crate::remote_pane::RemotePane>,
+    subscription_id: u64,
+    event_tx: mpsc::UnboundedSender<Envelope>,
+) {
+    let (scrollback, mut rx) = pane.subscribe();
+    let (rows, cols) = pane.size();
+
+    let initial = Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::PaneSnapshot {
+                scrollback: scrollback.to_vec(),
+                rows,
+                cols,
+            },
+        }),
+    };
+    if event_tx.send(initial).is_err() {
+        return;
+    }
+
+    if !pane.is_alive() {
+        let _ = event_tx.send(exit_envelope(subscription_id, pane.exit_code()));
+        return;
+    }
+
+    loop {
+        match rx.recv().await {
+            Ok(PaneUpdate::Bytes(b)) => {
+                let env = Envelope {
+                    version: PROTOCOL_VERSION,
+                    payload: Payload::Event(EventFrame {
+                        subscription_id,
+                        event: Event::PaneOutput { data: b.to_vec() },
+                    }),
+                };
+                if event_tx.send(env).is_err() {
+                    return;
+                }
+            }
+            Ok(PaneUpdate::Exit { exit_code }) => {
+                let _ = event_tx.send(exit_envelope(subscription_id, exit_code));
+                return;
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                let env = Envelope {
+                    version: PROTOCOL_VERSION,
+                    payload: Payload::Event(EventFrame {
+                        subscription_id,
+                        event: Event::PaneLagged { dropped_bytes: n },
+                    }),
+                };
+                if event_tx.send(env).is_err() {
+                    return;
+                }
+                warn!(
+                    subscription_id,
+                    skipped = n,
+                    "remote pane subscriber lagged"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
 async fn forward_pane(
     pane: Arc<Pane>,
     subscription_id: u64,

@@ -73,6 +73,7 @@ async fn desync_repro_with_select_tick_interrupting_read_envelope() {
         &Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::OpenPane(tepegoz_proto::OpenPaneSpec {
+                target: tepegoz_proto::PaneTarget::Local,
                 shell: Some("/bin/sh".into()),
                 cwd: None,
                 env: vec![],

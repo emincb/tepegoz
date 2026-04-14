@@ -13,6 +13,13 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 futures-util = "0.3"
+# Reused from tepegoz-pty's public API — Scrollback snapshots come out as
+# `bytes::Bytes` and `RemotePane` builds its own local ring-buffer.
+bytes = "1"
+# russh is already pulled in transitively via tepegoz-ssh; naming it
+# here makes the direct use in `remote_pane` explicit + pins the same
+# feature set (`ring` crypto backend) so cross-build stays green.
+russh = { version = "0.60", default-features = false, features = ["flate2", "ring", "rsa"] }
 tepegoz-proto = { workspace = true }
 tepegoz-pty = { workspace = true }
 tepegoz-docker = { workspace = true }

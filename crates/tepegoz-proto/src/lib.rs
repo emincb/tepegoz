@@ -37,7 +37,7 @@ pub mod socket;
 ///   "not-yet-measured" from "idle". `start_time_unix_secs` pairs with
 ///   `pid` to form a stable identity for selection persistence under pid
 ///   reuse.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Identifier for a pty pane owned by the daemon.
 pub type PaneId = u64;
@@ -326,6 +326,27 @@ pub struct OpenPaneSpec {
     pub env: Vec<EnvVar>,
     pub rows: u16,
     pub cols: u16,
+    /// Where the pane's backing process runs. Phase 5 Slice 5d-i adds
+    /// `Remote { alias }`; prior versions all meant `Local`. Added as
+    /// a non-Option field with an explicit `Local` default to keep
+    /// ergonomics clean — wire v9 is the version that introduces the
+    /// concept, so there's no back-compat burden.
+    pub target: PaneTarget,
+}
+
+/// Where a pane's backing process lives. `Local` spawns a shell in
+/// the daemon's host process via `portable-pty`; `Remote { alias }`
+/// opens an SSH session to the named Fleet host, requests a pty on a
+/// session channel, and proxies bytes both ways (Phase 5 russh-
+/// direct; Phase 6 replaces with agent-stdio without changing this
+/// wire shape).
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub enum PaneTarget {
+    #[default]
+    Local,
+    Remote {
+        alias: String,
+    },
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
