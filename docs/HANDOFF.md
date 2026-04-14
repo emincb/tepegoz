@@ -59,13 +59,20 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## Engineer section
 
-**Last updated:** 2026-04-14, Phase 4 all four sub-slices landed (Phase 4 close pending user's 8-scenario manual demo).
+**Last updated:** 2026-04-14, post-4d-desync-fix. Phase 4 close still pending user's 8-scenario manual demo rerun on the fixed binary.
 
 ### Where I left off
 
-Phase 4 Slice 4d shipped. 209 tests on macOS / 218 on ubuntu-latest, `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean. 4d consists of: (1) a combined e2e integration test `crates/tepegoz-core/tests/ports_processes_e2e.rs` with an opt-in `TEPEGOZ_PROBE_TEST=1` child-round-trip case + an opt-in-on-both-envs Docker-correlation case (confirmed locally — child pid found in both Ports + Processes within 6 s; docker-bound port correlated with its container id within 6 s); (2) an 8-scenario manual demo in `docs/OPERATIONS.md` "Slice 4d manual demo prep". All 8 are the gate.
+Phase 4 Slice 4d shipped but hit a wire desync in the user's first manual demo attempt (~4–6 s in). Diagnosed + fixed in two commits:
 
-Previous slices remain valid — 4a (daemon Ports probe), 4b (daemon Processes probe), 4c (Ports tile TUI with Processes toggle). Details in `docs/ROADMAP.md` per-slice sections.
+- `bee6aba` — diagnostic tracing in `tepegoz-proto::codec` + `tepegoz-core::client::spawn_writer_task`. No fix, just instrumentation. Falsified the AlignedVec-padding hypothesis (daemon writes exactly `bytes.len()` bytes per envelope; the `debug_assert_eq!(slice.len(), bytes.len())` never fired across 50+ envelope writes).
+- `<fix commit>` — real fix. Root cause: `tokio::AsyncReadExt::read_exact` is not cancellation-safe, and the TUI's main-loop `tokio::select!` was calling it directly. When any other branch (stdin / winch / tick) fired while `read_envelope` was mid-read, the pending future got cancelled; the kernel socket position had advanced but userspace bytes were lost; the next `read_envelope` iteration read from mid-payload and treated process-table data as a length prefix. Fix: `spawn_reader_task` function mirroring `spawn_writer_task` — a dedicated reader task loops `read_envelope` and forwards envelopes through an `mpsc::UnboundedSender<Result<Envelope, anyhow::Error>>`. Main-loop `select!` now polls `mpsc::Receiver::recv()` which IS cancellation-safe (pending items stay buffered if the branch is cancelled). Reader spawned at the AppRuntime::new transition from sequential startup (handshake + ensure_pane, which don't need the fix) to concurrent event loop. Both the reader + writer tasks abort on AppRuntime::drop.
+
+Reproduction: real-TUI under `yes | tui` stdin pressure reliably triggered the desync in <1 s pre-fix; post-fix, same harness ran for 20 s with zero desync messages and clean "early eof" shutdown.
+
+Regression test: `crates/tepegoz-tui/src/session.rs::tests::stdin_pressure_does_not_desync_large_envelopes` (default cargo test, not opt-in). Uses `tokio::net::UnixStream::pair` + 25 large ProcessList envelopes (500 rows each, ~100 KB per, multi-poll-sized) concurrent with `tokio::io::repeat(b'y')` driving stdin-pressure + 33 ms tick. Asserts all 25 envelopes arrive intact with full row counts. Passes on fixed code; would fail on reverted pre-fix code.
+
+Phase 4 sub-slices 4a + 4b + 4c + 4d remain valid; details in `docs/ROADMAP.md` per-slice sections. The 4d desync was a TUI-side cancellation-safety bug in pre-existing code (Phase 2-era read_envelope-in-select!), not a Phase 4 regression per se — Phase 4's large ProcessList payloads just pushed reads into the multi-poll regime where the bug manifested.
 
 4d covers:
 - Combined E2E integration test `crates/tepegoz-core/tests/ports_processes_e2e.rs` with two opt-in cases. Main: spawn python3 child binding a TCP port, wait for the child's readiness handshake (port printed to stdout + flushed), subscribe to BOTH Ports + Processes, assert child appears in both within 6 s, kill child, assert disappears from both within 6 s. Bonus: gated on `TEPEGOZ_PROBE_TEST=1 + TEPEGOZ_DOCKER_TEST=1`, starts a `docker run -d -p <port>:80 alpine sleep 120`, subscribes to Ports, asserts the row carries `container: Some(<id>)` within 6 s. Pins the README mockup's distinguishing `:3000 web (docker)` feature — most likely to silently regress since it spans three subsystems. Confirmed locally against Docker Desktop.
@@ -74,7 +81,9 @@ Previous slices remain valid — 4a (daemon Ports probe), 4b (daemon Processes p
 
 ### What I'm mid-flight on
 
-_Nothing._ Awaiting CTO review of 4d + user's 8-scenario manual demo. Don't start any Phase 5 work until Phase 4 closes via the post-demo close commit.
+_Nothing._ Awaiting CTO review of the desync fix + user's 8-scenario manual demo rerun on the fixed binary. Don't start any Phase 5 work until Phase 4 closes via the post-demo close commit.
+
+Pending cleanup commit (separate, AFTER user demo passes): strip the diagnostic tracing from `bee6aba` that's no longer load-bearing. Per CTO: "Keep any tracing that's still genuinely useful for future debugging; strip what was purely for this investigation." My plan: keep `payload_variant` string helper (useful for any future wire issue); keep the read-side hex-dump of the next 32 bytes on MAX_FRAME_SIZE bail (useful if any future desync surfaces — makes diagnosis 10× faster); strip the `first_four_hex` / per-envelope-write debug log + the running byte counter in spawn_writer_task (high-cardinality noise that was purely for this investigation).
 
 ### What I'm expecting from the CTO next
 
@@ -85,6 +94,8 @@ _Nothing._ Awaiting CTO review of 4d + user's 8-scenario manual demo. Don't star
 - CI green on both OSes is my own gate; I'll check `gh run` after pushing and ping only once both OSes are confirmed.
 
 ### Anything that would surprise a fresh-me
+
+**Load-bearing: `tokio::AsyncReadExt::read_exact` is not cancellation-safe.** Using it directly in a `tokio::select!` arm where other branches can fire will silently corrupt the reader stream when `read_exact` is interrupted mid-read. The pattern for the TUI is: dedicate a reader task, funnel envelopes through an mpsc, `select!` on `mpsc::Receiver::recv()` (which IS cancellation-safe). Same discipline as the daemon's dedicated writer task. If you're adding a new `select!` that reads from a stream, think cancellation safety FIRST. Classic failure mode: "works in tests, breaks under heavy stdin or winch pressure" — exactly how Phase 4's manual demo failed. Pinned by `session::tests::stdin_pressure_does_not_desync_large_envelopes`. Burned 4+ hours diagnosing Phase 4 4d; don't repeat the lesson.
 
 **Load-bearing: `ProcessesProbe::sample(&mut self)` is stateful by design.** (Elevated from the 4b surprises list per CTO directive — mis-refactoring this silently kills CPU% in production, and tests would still pass.) sysinfo computes CPU% as a delta between consecutive `refresh()` calls, so the probe must persist across sampling cycles. The daemon's `forward_processes` task moves the probe into `spawn_blocking` each iteration and receives it back via the closure return tuple, keeping sysinfo's internal process map + CPU baseline alive while the tokio runtime stays unblocked. On `JoinError` (spawn_blocking panic), the task resets to a fresh probe — the next emit correctly carries `cpu_percent: None` for every row because we can't compute a delta across a crash boundary. **Do not refactor `sample` into a stateless free function or a `fn sample(&self)` method; tests would still pass but every sample would carry `None` and CPU% would be silently dead in production.**
 

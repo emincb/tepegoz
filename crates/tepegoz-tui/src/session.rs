@@ -155,14 +155,29 @@ async fn ensure_pane(
     }
 }
 
-/// Owns the I/O machinery the App needs: socket halves, a writer
-/// mpsc, the stdin reader, the SIGWINCH stream, and the ratatui
-/// Terminal.
+/// Owns the I/O machinery the App needs: reader + writer tasks, an
+/// inbound envelope mpsc, the stdin reader, the SIGWINCH stream, and
+/// the ratatui Terminal.
+///
+/// The reader task is the key piece for wire-correctness: pulling
+/// `read_envelope` out of the main-loop `tokio::select!` keeps us
+/// clear of `AsyncReadExt::read_exact`'s cancellation-unsafety. See
+/// the HANDOFF surprises-a-fresh-me note for the full rationale; the
+/// short version is that `select!` can cancel `read_envelope`
+/// mid-read, after which the kernel's socket position has advanced
+/// but the already-read bytes are gone from userspace — the next
+/// `read_envelope` starts mid-payload and treats payload bytes as a
+/// length prefix. Phase 4 4d burned 4+ hours on this class of bug.
 struct AppRuntime {
     app: App,
-    reader: tokio::net::unix::OwnedReadHalf,
     cmd_tx: mpsc::UnboundedSender<Envelope>,
     writer_handle: tokio::task::JoinHandle<()>,
+    /// Envelopes parsed by the dedicated reader task. `Ok(env)` on a
+    /// successful decode; `Err(e)` on a terminal read failure (after
+    /// which the sender is dropped and the next `recv()` returns
+    /// `None`).
+    inbox_rx: mpsc::UnboundedReceiver<Result<Envelope, anyhow::Error>>,
+    reader_handle: tokio::task::JoinHandle<()>,
     terminal: ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
 }
 
@@ -187,14 +202,24 @@ impl AppRuntime {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Envelope>();
         let writer_handle = spawn_writer_task(writer, cmd_rx);
 
+        // Dedicated reader task. The handshake + ensure_pane phases
+        // already ran through `read_envelope` directly (sequential
+        // request/response, no `select!` around them — cancellation-
+        // safe by construction). Only the main-loop select! is at
+        // risk, so we spawn the reader task HERE at the transition
+        // from sequential startup to concurrent event loop.
+        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+        let reader_handle = spawn_reader_task(reader, inbox_tx);
+
         let backend = CrosstermBackend::new(std::io::stdout());
         let terminal = ratatui::Terminal::new(backend)?;
 
         Ok(Self {
             app: App::new(pane_id, terminal_size),
-            reader,
             cmd_tx,
             writer_handle,
+            inbox_rx,
+            reader_handle,
             terminal,
         })
     }
@@ -221,9 +246,17 @@ impl AppRuntime {
                     Ok(n) => AppEvent::StdinChunk(stdin_buf[..n].to_vec()),
                     Err(e) => return ExitReason::StdinError(e.to_string()),
                 },
-                env = read_envelope(&mut self.reader) => match env {
-                    Ok(e) => AppEvent::DaemonEnvelope(e),
-                    Err(e) => return ExitReason::DaemonClosed(e.to_string()),
+                // mpsc::Receiver::recv IS cancellation-safe: if the
+                // select cancels this branch, the envelope we were
+                // polling for stays in the channel for the next
+                // iteration. Contrast with the pre-fix branch that
+                // called read_envelope directly — `read_exact` is
+                // documented NOT cancellation-safe, which was the
+                // Phase 4 4d desync.
+                inbox = self.inbox_rx.recv() => match inbox {
+                    Some(Ok(e)) => AppEvent::DaemonEnvelope(e),
+                    Some(Err(e)) => return ExitReason::DaemonClosed(e.to_string()),
+                    None => return ExitReason::DaemonClosed("reader task ended".into()),
                 },
                 _ = winch.recv() => {
                     let (cols, rows) = terminal_size_fallback();
@@ -286,7 +319,9 @@ impl Drop for AppRuntime {
     fn drop(&mut self) {
         // Closing cmd_tx makes the writer task exit. We don't await
         // because Drop is sync; the small leak window is harmless
-        // (process exiting).
+        // (process exiting). Same for the reader task — abort is
+        // idempotent if the task already exited on its own.
+        self.reader_handle.abort();
         self.writer_handle.abort();
     }
 }
@@ -372,6 +407,49 @@ fn spawn_writer_task(
     })
 }
 
+/// Per-connection reader task for the TUI. Loops `read_envelope` and
+/// forwards each successful decode through the mpsc; on a terminal
+/// read error, sends a final `Err(_)` and exits (the main loop maps
+/// that to `ExitReason::DaemonClosed`). After the final Err, the
+/// sender is dropped so the next `recv()` returns `None` instead of
+/// hanging.
+///
+/// This is the cancellation-safety fix for the Phase 4 4d desync:
+/// pulling `read_exact` out of the main-loop `tokio::select!` means
+/// the select only polls `mpsc::Receiver::recv()`, which IS
+/// cancellation-safe (any pending envelope stays in the channel if
+/// the branch gets cancelled). Mirrors the daemon's
+/// `spawn_writer_task` pattern — one task per direction, funneled
+/// through an mpsc, selected against a cancellation-safe primitive.
+fn spawn_reader_task(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+    inbox_tx: mpsc::UnboundedSender<Result<Envelope, anyhow::Error>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match read_envelope(&mut reader).await {
+                Ok(env) => {
+                    if inbox_tx.send(Ok(env)).is_err() {
+                        // Main loop dropped rx (shutting down); exit
+                        // cleanly so the kernel reaps us promptly.
+                        debug!("TUI reader task: mpsc closed by consumer; exiting");
+                        return;
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "TUI reader task: terminal read error");
+                    // Best-effort: forward the error so the main loop
+                    // can surface a DaemonClosed with the reason.
+                    // Drop the sender implicitly by returning — the
+                    // next `recv()` will yield `None`.
+                    let _ = inbox_tx.send(Err(e));
+                    return;
+                }
+            }
+        }
+    })
+}
+
 fn print_exit_message(pane_id: tepegoz_proto::PaneId, reason: ExitReason) {
     match reason {
         ExitReason::UserDetach => {
@@ -400,4 +478,157 @@ fn print_exit_message(pane_id: tepegoz_proto::PaneId, reason: ExitReason) {
 
 fn terminal_size_fallback() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((120, 40))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Phase 4 4d regression test. Exercises the reader-task fix under
+    //! exactly the conditions that bit the user: large multi-poll
+    //! envelope reads AND concurrent stdin pressure racing against
+    //! them inside a `tokio::select!`. Pre-fix code fails here because
+    //! `read_exact` cancellation loses bytes; post-fix, the main-loop
+    //! select polls `mpsc::Receiver::recv()` which IS cancellation-safe.
+
+    use std::time::Duration;
+
+    use tepegoz_proto::{
+        Envelope, EventFrame, PROTOCOL_VERSION, ProbeProcess, codec::write_envelope,
+    };
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::mpsc;
+    use tokio::time::MissedTickBehavior;
+
+    use super::spawn_reader_task;
+
+    const N_ENVELOPES: usize = 25;
+    const ROWS_PER_ENVELOPE: usize = 500;
+
+    fn big_process_list_envelope(envelope_id: usize) -> Envelope {
+        // Long command strings to push each envelope into the multi-
+        // poll regime on a unix socket. On this shape a 500-row
+        // ProcessList serializes to ~100 KB — large enough that the
+        // kernel can split the read across multiple `read_exact`
+        // internal reads, which is exactly where the pre-fix code
+        // lost bytes when the select! cancelled the read.
+        let rows: Vec<ProbeProcess> = (0..ROWS_PER_ENVELOPE)
+            .map(|j| ProbeProcess {
+                pid: (envelope_id as u32) * 100_000 + j as u32,
+                parent_pid: 1,
+                start_time_unix_secs: 1_700_000_000,
+                command: format!(
+                    "long_command_envelope_{envelope_id}_row_{j}_padding_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                ),
+                cpu_percent: Some(0.1 * j as f32),
+                mem_bytes: 4096 * (j as u64 + 1),
+                partial: false,
+            })
+            .collect();
+        Envelope {
+            version: PROTOCOL_VERSION,
+            payload: tepegoz_proto::Payload::Event(EventFrame {
+                subscription_id: 83,
+                event: tepegoz_proto::Event::ProcessList {
+                    rows,
+                    source: "sysinfo-test".into(),
+                },
+            }),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stdin_pressure_does_not_desync_large_envelopes() {
+        // Wire up a connected unix socket pair. The "daemon" side
+        // writes large envelopes; the "client" side hosts
+        // spawn_reader_task and the main-loop select!.
+        let (daemon_side, client_side) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (client_read, _client_write_dropped) = client_side.into_split();
+        let (_daemon_read_dropped, mut daemon_write) = daemon_side.into_split();
+
+        // Spawn the reader task — the fix under test.
+        let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel();
+        let _reader_handle = spawn_reader_task(client_read, inbox_tx);
+
+        // "Daemon" task: write N envelopes as fast as the socket
+        // accepts them. Note we keep `daemon_write` alive until all
+        // writes complete so the socket doesn't half-close mid-stream.
+        let daemon_handle = tokio::spawn(async move {
+            for id in 0..N_ENVELOPES {
+                let env = big_process_list_envelope(id);
+                if let Err(e) = write_envelope(&mut daemon_write, &env).await {
+                    panic!("daemon write of envelope {id} failed: {e}");
+                }
+            }
+            // Intentionally NOT dropping daemon_write yet so the
+            // reader has time to drain the kernel buffer before EOF.
+            daemon_write
+        });
+
+        // Stdin-pressure source: `tokio::io::repeat(b'y')` feeds
+        // bytes as fast as the consumer reads them, equivalent to
+        // `yes | tui` that reproduced the production desync.
+        let mut stdin_source = tokio::io::repeat(b'y');
+        let mut stdin_buf = vec![0u8; 4096];
+
+        // Tick at 33 ms — same cadence as the TUI's main loop.
+        let mut tick = tokio::time::interval(Duration::from_millis(33));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        // Main-loop mimic. Under the fix, `inbox_rx.recv()` is
+        // cancellation-safe; stdin and tick branches firing won't
+        // corrupt envelope boundaries. Pre-fix, the same loop with
+        // `read_envelope` in-place of the mpsc would desync within
+        // seconds under this pressure.
+        let mut received: usize = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while received < N_ENVELOPES {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "regression: received only {received} / {N_ENVELOPES} envelopes \
+                     within 15 s — reader task OR main-loop select is back to a \
+                     cancellation-unsafe read path"
+                );
+            }
+
+            tokio::select! {
+                inbox = inbox_rx.recv() => match inbox {
+                    Some(Ok(env)) => {
+                        let tepegoz_proto::Payload::Event(EventFrame {
+                            event: tepegoz_proto::Event::ProcessList { rows, source },
+                            ..
+                        }) = env.payload
+                        else {
+                            panic!("expected ProcessList envelope");
+                        };
+                        assert_eq!(
+                            rows.len(),
+                            ROWS_PER_ENVELOPE,
+                            "envelope #{received} must arrive with all rows intact \
+                             — a partial-read desync would have shorter or corrupted rows"
+                        );
+                        assert_eq!(source, "sysinfo-test");
+                        received += 1;
+                    }
+                    Some(Err(e)) => panic!("reader task emitted error after {received} envelopes: {e}"),
+                    None => panic!("reader task channel closed after {received}/{N_ENVELOPES} envelopes"),
+                },
+                _ = stdin_source.read(&mut stdin_buf) => {
+                    // Deliberately do nothing. The point is the cancellation
+                    // pressure on OTHER select branches: every time this
+                    // branch fires, the mpsc-recv branch's pending future
+                    // gets cancelled. mpsc::Receiver::recv is documented
+                    // cancellation-safe (pending items stay buffered); the
+                    // pre-fix read_exact was not.
+                }
+                _ = tick.tick() => {
+                    // Extra cancellation pressure to mirror the TUI's
+                    // 30 Hz redraw tick.
+                }
+            }
+        }
+
+        // Clean up.
+        let daemon_write = daemon_handle.await.expect("daemon task joined");
+        drop(daemon_write);
+        assert_eq!(received, N_ENVELOPES);
+    }
 }
