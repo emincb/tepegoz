@@ -315,6 +315,9 @@ fn render_tiles(app: &App, frame: &mut Frame<'_>) {
             TileKind::Scope(ScopeKind::Docker) => {
                 scope::docker::render(&app.docker, frame, tile.rect, focused);
             }
+            TileKind::Scope(ScopeKind::Ports) => {
+                scope::ports::render(&app.ports, frame, tile.rect, focused);
+            }
             TileKind::Placeholder { label, eta_phase } => {
                 scope::placeholder::render(label, *eta_phase, frame, tile.rect, focused);
             }

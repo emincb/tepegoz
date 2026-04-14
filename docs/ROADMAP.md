@@ -302,7 +302,7 @@ Users retain `docker exec -it <container> sh` in their local pty tile as the v1 
 
 ---
 
-## Phase 4 — Ports + processes panels (local) · 🟠 (4a + 4b landed; 4c/4d pending)
+## Phase 4 — Ports + processes panels (local) · 🟠 (4a + 4b + 4c landed; 4d pending)
 
 Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-state within the Ports tile (lowercase `p` toggles between Ports and Processes views) rather than a new Decision #7 tile — solves the "processes without a bound port" flow while respecting the god-view layout; (Q2) probe uses the cross-OS `netstat2` wrapper (procfs on Linux, libproc on macOS) plus `sysinfo` for pid → process name; (Q3) daemon-side correlation so clients stay dumb; (Q4) 2 s refresh cadence matching Docker; (Q5) 4 sub-slices.
 
@@ -333,7 +333,7 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 - `crates/tepegoz-core/tests/ports_scope.rs::ports_subscription_emits_either_port_list_or_unavailable` — always-on: subscribes, asserts the daemon emits exactly one of `PortList | PortsUnavailable` within 30 s with non-empty `source`/`reason` string.
 - `crates/tepegoz-core/tests/ports_scope.rs::ports_subscription_sees_locally_bound_listener_within_budget` — opt-in `TEPEGOZ_PROBE_TEST=1`: binds an ephemeral TCP listener in the test process, subscribes, drains events until a `PortList` includes the bound `local_port`, asserts the row attributes `pid == std::process::id()`, `protocol == "tcp"`, and non-empty `process_name` within a 6 s budget.
 
-### Slice 4b — Daemon Processes probe + wire + integration test · 🟡 (`<4b commit>`)
+### Slice 4b — Daemon Processes probe + wire + integration test · ✅ (`d626f4f`)
 
 **Delivered.**
 - Wire protocol bumped to **v6**. New subscription `Subscription::Processes { id }`. New events `Event::ProcessList { rows: Vec<ProbeProcess>, source }` and `Event::ProcessesUnavailable { reason }`. New struct `ProbeProcess { pid, parent_pid, start_time_unix_secs, command, cpu_percent: Option<f32>, mem_bytes, partial }`. The `Option<f32>` for `cpu_percent` is deliberate — `None` signals "not yet measured" (first sample after subscription, before any delta); `Some(x)` signals a measured value including `Some(0.0)` which correctly means "idle". The TUI renders `None` as an em-dash; wire-level it's a one-byte tag.
@@ -350,15 +350,32 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 - `crates/tepegoz-core/tests/processes_scope.rs::processes_subscription_emits_either_process_list_or_unavailable` (always-on): asserts `ProcessList` xor `ProcessesUnavailable` within 30 s with non-empty source / reason AND that every row in the first `ProcessList` carries `cpu_percent: None`.
 - `crates/tepegoz-core/tests/processes_scope.rs::processes_subscription_sees_spawned_child_within_budget` (opt-in `TEPEGOZ_PROBE_TEST=1`): spawns a known `sleep 30` child (`ChildGuard` force-kills on Drop), subscribes, drains until the child's pid appears with command containing `"sleep"`, non-zero `start_time_unix_secs`, non-zero `mem_bytes` (or `partial: true`). 5 s budget covers one refresh boundary.
 
-### Slice 4c — Ports tile TUI with Processes toggle · ⚪
+### Slice 4c — Ports tile TUI with Processes toggle · 🟡 (`<4c commit>`)
 
-**Scope.**
-- Render into the existing Ports placeholder's `Rect` per the scope-renderer contract. State: `PortsScope { view: PortsView::{Ports, Processes}, selected, filter }`.
-- Navigation (j/k/g/G/Home/End/arrows), filter (`/`), toggle (`p`). Three-state lifecycle (Connecting / Available / Unavailable) identical to Docker tile.
-- Tile title swaps between "Ports" / "Processes" based on view; help-bar footer advertises `[p] Processes` for discoverability (CTO's note on 4c: new-user-hint invariant).
-- Selection persistence: by `(protocol, local_port, pid)` for Ports (listening ports are stable over minutes); by `(pid, process_start_time)` for Processes (pid reuse across short-lived processes). Clamp to next visible row when the selected entity disappears mid-refresh.
-- State-machine tests + headless render tests per the `scope::docker` precedent (~15 app cases + ~8 scope cases).
-- First-sample CPU% = 0 semantic (per CTO's 4b note) surfaced in the footer/tile — "CPU% settles after first 2 s refresh" — so users don't misread "everything is idle" on first render.
+**Delivered.**
+- New `ScopeKind::Ports` variant; Ports tile in the god-view layout flipped from `Placeholder` to `Scope(ScopeKind::Ports)` (`tile.rs`) with render dispatch in `session.rs`.
+- `PortsScope` state wraps two coequal views — `PortsView` (with `PortsViewState::{Connecting, Available {rows, source}, Unavailable {reason}}`) and `ProcessesView` (analogous). Both subscriptions live concurrently; `active: PortsActiveView::{Ports, Processes}` is the render switch and is flipped by `p`.
+- `PortKey { protocol, local_port, pid }` and `ProcessKey { pid, start_time_unix_secs }` are the stable identities for selection persistence. `reanchor_selection(old_key)` on state-change tries to place the cursor on the matching key; falls back to clamping into the new visible range if the old entity is gone. Pid-reuse under a different `start_time` never silently retargets selection (state-machine test pins it).
+- Input routing: `handle_forward_bytes` now matches `routes_to_scope(self.view.focused)` as a two-arm dispatch (`Docker` → `handle_scope_key`; `Ports` → `handle_ports_key`). `handle_ports_key` absorbs `p` as the toggle at the outer scope (unless a filter is active, in which case `p` is a filter character) then delegates to `handle_ports_list_key` or `handle_processes_list_key` depending on `active`. Each per-view handler owns its own filter + navigation logic, matching the Docker precedent.
+- Renderer in `scope::ports::render` mirrors `scope::docker::render`'s shape: three-state lifecycle, filter bar on top when active, tabular body, help bar at bottom, em-dash for `cpu_percent: None` in the Processes table, `UDP coming v1.1` footer hint in the Ports status bar per the CTO's 4c UDP-resolution requirement.
+- Help bar copy adapts: Ports view → `[j/k] nav · [/] filter · [p] Processes`; Processes view → `[j/k] nav · [/] filter · [p] Ports`; filter-active → `[Enter] apply · [Esc] clear · [Backspace] delete`.
+- Selection persistence works across three scenarios (all tested): (1) rows reorder → cursor follows the selected key to its new index; (2) selected entity disappears → cursor clamps into the new visible range; (3) pid reuse with different `start_time` → cursor stays on the original `(pid, start_time)` row rather than drifting to the reused pid.
+
+**CTO-flagged notes status.**
+- **Tile-title-footer discoverability:** landed. Help bar advertises `[p] Processes` / `[p] Ports`.
+- **Selection persistence:** landed. `(protocol, port, pid)` for Ports, `(pid, start_time)` for Processes, with clamp fallback. State-machine tests cover all three scenarios.
+- **First-sample CPU% em-dash:** landed. Renderer checks `cpu_percent: Option<f32>` and emits `—` for `None`, `f32` for `Some`. Render test pins em-dash presence + absence of `0.0` for all-None rows.
+- **UDP resolution:** option (c) — deferred to v1.1 with an explicit footer hint (`UDP coming v1.1`). Implemented in `render_ports_status_bar`. Revisit if user feedback demands UDP in v1.
+
+**Deviations from the proposal.**
+- Optional 5th (cmdline-truncation visual hint): skipped. Requires either a wire flag on `ProbeProcess` (protocol bump, heavy for a cosmetic hint) or a heuristic in the renderer (false-positive prone). `docs/OPERATIONS.md` Common Issues already documents the macOS-truncation behavior so users have an answer. Revisit if signal demands.
+
+**Acceptance tests (207 on macOS / 216 on ubuntu-latest).**
+- `tepegoz-tui::app::tests` +13: event routing (PortList, PortsUnavailable, ProcessList, ProcessesUnavailable), toggle semantics (cycles views, absorbed during filter), independent selection per view, selection persistence by key under reorder + disappearance + pid-reuse-with-different-start-time, filter typing / backspace / enter / esc, Ports-focused stdin routes to handle_ports_key rather than SendInput.
+- `tepegoz-tui::scope::ports::tests` +14: three-state lifecycle per view, port + process tables with selection marker + container column, `cpu_percent: None` em-dash vs `Some(12.5)` number, unavailable verbatim reason, empty-list messages ("No listening ports" / "No running processes"), help bar shows `[p] Processes` / `[p] Ports` per view, filter bar caret, partial-row `?` cue.
+- `tile::tests::routes_to_scope_returns_scope_kind_only_for_scope_tiles` updated to assert `TileId::Ports` now routes to `Some(ScopeKind::Ports)`.
+
+**Gate.** CI green on macOS + ubuntu-latest, then CTO review before 4d.
 
 ### Slice 4d — Phase 4 e2e + manual demo script · ⚪
 

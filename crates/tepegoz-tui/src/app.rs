@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use ratatui::layout::Rect;
 use tepegoz_proto::{
     DockerActionKind, DockerActionOutcome, DockerActionRequest, DockerContainer, Envelope, Event,
-    EventFrame, LogStream, PROTOCOL_VERSION, PaneId, Payload, Subscription,
+    EventFrame, LogStream, PROTOCOL_VERSION, PaneId, Payload, ProbePort, ProbeProcess,
+    Subscription,
 };
 use vt100::Parser;
 
@@ -75,11 +76,13 @@ const VT100_SCROLLBACK_ROWS: usize = 1000;
 const FALLBACK_PTY_ROWS: u16 = 24;
 const FALLBACK_PTY_COLS: u16 = 80;
 
-/// Which scope panel a tile hosts. Slice C1.5 has only `Docker`; Phases
-/// 4 / 5 / 7 / 9 extend this.
+/// Which scope panel a tile hosts. Slice C1.5 shipped `Docker`; Slice
+/// 4c adds `Ports` (one tile hosting both a Ports view and a Processes
+/// toggle-view per Phase 4 Q1); Phases 5 / 9 extend further.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScopeKind {
     Docker,
+    Ports,
 }
 
 /// TUI view state: fixed tile layout + the id of the focused tile.
@@ -469,6 +472,255 @@ pub(crate) enum DockerScopeState {
     Unavailable { reason: String },
 }
 
+/// Phase 4 Slice 4c: Ports tile state. Hosts two coequal views in one
+/// tile (Decision #7's god-view layout reserves space only for the
+/// five headline scopes — Processes lives as a toggle-mode sub-view
+/// inside the Ports tile per Phase 4 Q1). The user toggles between
+/// them with `p`; both subscriptions stay live regardless of which is
+/// rendered, so switching views never drops data.
+#[derive(Debug)]
+pub(crate) struct PortsScope {
+    pub(crate) ports: PortsView,
+    pub(crate) processes: ProcessesView,
+    /// Which view the tile renders. Toggle with `p`.
+    pub(crate) active: PortsActiveView,
+    /// Subscription id for `Subscribe(Ports)`. Allocated once at
+    /// `App::new`; lives for the session.
+    pub(crate) ports_sub_id: u64,
+    /// Subscription id for `Subscribe(Processes)`. Also allocated at
+    /// `App::new`; both subs live concurrently.
+    pub(crate) processes_sub_id: u64,
+}
+
+/// Which view the Ports tile currently renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortsActiveView {
+    Ports,
+    Processes,
+}
+
+/// State for the Ports view (default / left side of the toggle).
+#[derive(Debug)]
+pub(crate) struct PortsView {
+    pub(crate) state: PortsViewState,
+    /// Index into the visible (filter-respecting) row set.
+    pub(crate) selection: usize,
+    pub(crate) filter: String,
+    pub(crate) filter_active: bool,
+}
+
+/// Three-state lifecycle for the Ports view. Same shape as
+/// `DockerScopeState` on purpose — the Phase 3 precedent.
+#[derive(Debug)]
+pub(crate) enum PortsViewState {
+    Connecting,
+    Available {
+        rows: Vec<ProbePort>,
+        source: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// State for the Processes view (right side of the toggle).
+#[derive(Debug)]
+pub(crate) struct ProcessesView {
+    pub(crate) state: ProcessesViewState,
+    pub(crate) selection: usize,
+    pub(crate) filter: String,
+    pub(crate) filter_active: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum ProcessesViewState {
+    Connecting,
+    Available {
+        rows: Vec<ProbeProcess>,
+        source: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// Stable identity for Ports selection persistence across refreshes.
+/// Listening ports are stable over minutes, but a refresh can still
+/// reorder or drop rows — we re-anchor the selection to the same
+/// `(protocol, local_port, pid)` tuple rather than trusting a positional
+/// index that would silently re-target a different row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PortKey {
+    pub(crate) protocol: String,
+    pub(crate) local_port: u16,
+    pub(crate) pid: u32,
+}
+
+impl PortKey {
+    pub(crate) fn of(p: &ProbePort) -> Self {
+        Self {
+            protocol: p.protocol.clone(),
+            local_port: p.local_port,
+            pid: p.pid,
+        }
+    }
+}
+
+/// Stable identity for Processes selection. `(pid, start_time)` is
+/// robust to pid reuse across short-lived processes — a new process
+/// that reuses a pid gets a different `start_time`, so selection
+/// doesn't silently retarget.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProcessKey {
+    pub(crate) pid: u32,
+    pub(crate) start_time_unix_secs: i64,
+}
+
+impl ProcessKey {
+    pub(crate) fn of(p: &ProbeProcess) -> Self {
+        Self {
+            pid: p.pid,
+            start_time_unix_secs: p.start_time_unix_secs,
+        }
+    }
+}
+
+impl PortsScope {
+    fn new(ports_sub_id: u64, processes_sub_id: u64) -> Self {
+        Self {
+            ports: PortsView {
+                state: PortsViewState::Connecting,
+                selection: 0,
+                filter: String::new(),
+                filter_active: false,
+            },
+            processes: ProcessesView {
+                state: ProcessesViewState::Connecting,
+                selection: 0,
+                filter: String::new(),
+                filter_active: false,
+            },
+            active: PortsActiveView::Ports,
+            ports_sub_id,
+            processes_sub_id,
+        }
+    }
+}
+
+impl PortsView {
+    pub(crate) fn matches_filter(&self, p: &ProbePort) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let q = self.filter.to_lowercase();
+        p.process_name.to_lowercase().contains(&q)
+            || p.local_ip.to_lowercase().contains(&q)
+            || p.local_port.to_string().contains(&q)
+            || p.container_id
+                .as_deref()
+                .is_some_and(|id| id.to_lowercase().contains(&q))
+    }
+
+    pub(crate) fn visible_count(&self) -> usize {
+        match &self.state {
+            PortsViewState::Available { rows, .. } => {
+                rows.iter().filter(|p| self.matches_filter(p)).count()
+            }
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn selected_port(&self) -> Option<&ProbePort> {
+        match &self.state {
+            PortsViewState::Available { rows, .. } => rows
+                .iter()
+                .filter(|p| self.matches_filter(p))
+                .nth(self.selection),
+            _ => None,
+        }
+    }
+
+    fn selected_key(&self) -> Option<PortKey> {
+        self.selected_port().map(PortKey::of)
+    }
+
+    /// Re-anchor `selection` after a state change. If `old_key` still
+    /// appears in the visible set, point `selection` at it. Otherwise
+    /// clamp into `[0, visible_count)` so the selection lands on a
+    /// real row (or collapses to 0 if the list emptied). Never panics
+    /// when the list shrinks under a live cursor.
+    fn reanchor_selection(&mut self, old_key: Option<PortKey>) {
+        let PortsViewState::Available { rows, .. } = &self.state else {
+            self.selection = 0;
+            return;
+        };
+        let visible: Vec<&ProbePort> = rows.iter().filter(|p| self.matches_filter(p)).collect();
+        if let Some(key) = old_key
+            && let Some(idx) = visible.iter().position(|p| PortKey::of(p) == key)
+        {
+            self.selection = idx;
+            return;
+        }
+        if visible.is_empty() {
+            self.selection = 0;
+        } else if self.selection >= visible.len() {
+            self.selection = visible.len() - 1;
+        }
+    }
+}
+
+impl ProcessesView {
+    pub(crate) fn matches_filter(&self, p: &ProbeProcess) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let q = self.filter.to_lowercase();
+        p.command.to_lowercase().contains(&q) || p.pid.to_string().contains(&q)
+    }
+
+    pub(crate) fn visible_count(&self) -> usize {
+        match &self.state {
+            ProcessesViewState::Available { rows, .. } => {
+                rows.iter().filter(|p| self.matches_filter(p)).count()
+            }
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn selected_process(&self) -> Option<&ProbeProcess> {
+        match &self.state {
+            ProcessesViewState::Available { rows, .. } => rows
+                .iter()
+                .filter(|p| self.matches_filter(p))
+                .nth(self.selection),
+            _ => None,
+        }
+    }
+
+    fn selected_key(&self) -> Option<ProcessKey> {
+        self.selected_process().map(ProcessKey::of)
+    }
+
+    fn reanchor_selection(&mut self, old_key: Option<ProcessKey>) {
+        let ProcessesViewState::Available { rows, .. } = &self.state else {
+            self.selection = 0;
+            return;
+        };
+        let visible: Vec<&ProbeProcess> = rows.iter().filter(|p| self.matches_filter(p)).collect();
+        if let Some(key) = old_key
+            && let Some(idx) = visible.iter().position(|p| ProcessKey::of(p) == key)
+        {
+            self.selection = idx;
+            return;
+        }
+        if visible.is_empty() {
+            self.selection = 0;
+        } else if self.selection >= visible.len() {
+            self.selection = visible.len() - 1;
+        }
+    }
+}
+
 /// Pending one-shot request awaiting a response from the daemon. Keyed
 /// by `request_id` in [`App::pending_actions`]; the id is mirrored back
 /// in the `DockerActionResult` so the App can look up the description
@@ -609,6 +861,11 @@ pub(crate) struct App {
     /// ratatui.
     pub(crate) pty_parser: Parser,
     pub(crate) docker: DockerScope,
+    /// Phase 4 Slice 4c: Ports tile (with Processes toggle-view). Both
+    /// the Ports and Processes subscriptions live for the session; the
+    /// tile only renders one at a time, but neither drops data when
+    /// toggled out of view.
+    pub(crate) ports: PortsScope,
     pub(crate) terminal_size: (u16, u16),
     /// Monotonic id allocator shared between subscription ids and
     /// DockerAction request ids. The daemon correlates each response by
@@ -640,6 +897,10 @@ impl App {
         next_sub_id += 1;
         let docker_sub = next_sub_id;
         next_sub_id += 1;
+        let ports_sub = next_sub_id;
+        next_sub_id += 1;
+        let processes_sub = next_sub_id;
+        next_sub_id += 1;
 
         Self {
             view,
@@ -647,6 +908,7 @@ impl App {
             pane_sub,
             pty_parser,
             docker: DockerScope::new(docker_sub),
+            ports: PortsScope::new(ports_sub, processes_sub),
             terminal_size,
             next_sub_id,
             pending_actions: HashMap::new(),
@@ -674,6 +936,12 @@ impl App {
             })),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Docker {
                 id: self.docker.sub_id,
+            }))),
+            AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Ports {
+                id: self.ports.ports_sub_id,
+            }))),
+            AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Processes {
+                id: self.ports.processes_sub_id,
             }))),
             AppAction::DrawFrame,
         ]
@@ -724,14 +992,23 @@ impl App {
             })));
             return;
         }
-        if let Some(ScopeKind::Docker) = self.view.layout.routes_to_scope(self.view.focused) {
-            for key in self.scope_key_parser.parse(&bytes) {
-                self.handle_scope_key(key, actions);
+        match self.view.layout.routes_to_scope(self.view.focused) {
+            Some(ScopeKind::Docker) => {
+                for key in self.scope_key_parser.parse(&bytes) {
+                    self.handle_scope_key(key, actions);
+                }
+            }
+            Some(ScopeKind::Ports) => {
+                for key in self.scope_key_parser.parse(&bytes) {
+                    self.handle_ports_key(key, actions);
+                }
+            }
+            None => {
+                // Placeholder or TooSmall fall through: drop the bytes.
+                // The tile renderer shows a "not yet implemented"
+                // hint; no action needed here.
             }
         }
-        // Placeholder or TooSmall fall through: drop the bytes. The
-        // tile renderer shows a "not yet implemented" hint; no action
-        // needed here.
     }
 
     fn handle_focus_direction(&mut self, dir: FocusDir, actions: &mut Vec<AppAction>) {
@@ -873,6 +1150,177 @@ impl App {
             ScopeKey::Enter => {} // Slice D uses this for DockerExec.
             ScopeKey::PgUp | ScopeKey::PgDn => {} // List view has no paging.
             ScopeKey::Backspace | ScopeKey::Char(_) => {}
+        }
+    }
+
+    /// Ports tile key map. Routes to whichever of the two co-resident
+    /// views is active (Ports | Processes). `p` toggles between them;
+    /// each view keeps its own filter + selection independently.
+    /// Selection persists across refreshes via stable keys —
+    /// `(protocol, local_port, pid)` for Ports and `(pid, start_time)`
+    /// for Processes (the latter guards against pid reuse on a
+    /// short-lived process).
+    fn handle_ports_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
+        // `p` toggles views at the outer scope — absorbed before
+        // filter / nav dispatch so toggling while a filter is typed
+        // doesn't swallow the `p` as a filter character. Uppercase
+        // `P` is reserved (destructive-verb discipline) — no-op here.
+        if matches!(key, ScopeKey::Char(b'p')) {
+            // Never toggle while a filter input is active — `p`
+            // should be a valid filter character in that state.
+            let filter_active = match self.ports.active {
+                PortsActiveView::Ports => self.ports.ports.filter_active,
+                PortsActiveView::Processes => self.ports.processes.filter_active,
+            };
+            if !filter_active {
+                self.ports.active = match self.ports.active {
+                    PortsActiveView::Ports => PortsActiveView::Processes,
+                    PortsActiveView::Processes => PortsActiveView::Ports,
+                };
+                actions.push(AppAction::DrawFrame);
+                return;
+            }
+        }
+
+        match self.ports.active {
+            PortsActiveView::Ports => self.handle_ports_list_key(key, actions),
+            PortsActiveView::Processes => self.handle_processes_list_key(key, actions),
+        }
+    }
+
+    fn handle_ports_list_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
+        if self.ports.ports.filter_active {
+            match key {
+                ScopeKey::Escape => {
+                    self.ports.ports.filter.clear();
+                    self.ports.ports.filter_active = false;
+                    let old_key = self.ports.ports.selected_key();
+                    self.ports.ports.reanchor_selection(old_key);
+                    actions.push(AppAction::DrawFrame);
+                }
+                ScopeKey::Enter => {
+                    self.ports.ports.filter_active = false;
+                    actions.push(AppAction::DrawFrame);
+                }
+                ScopeKey::Backspace => {
+                    if self.ports.ports.filter.pop().is_some() {
+                        let old_key = self.ports.ports.selected_key();
+                        self.ports.ports.reanchor_selection(old_key);
+                        actions.push(AppAction::DrawFrame);
+                    }
+                }
+                ScopeKey::Char(b) => {
+                    if (0x20..=0x7e).contains(&b) {
+                        self.ports.ports.filter.push(b as char);
+                        let old_key = self.ports.ports.selected_key();
+                        self.ports.ports.reanchor_selection(old_key);
+                        actions.push(AppAction::DrawFrame);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
+            ScopeKey::Up => {
+                self.ports.ports.selection = self.ports.ports.selection.saturating_sub(1);
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Down => {
+                let n = self.ports.ports.visible_count();
+                if n > 0 && self.ports.ports.selection + 1 < n {
+                    self.ports.ports.selection += 1;
+                }
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Top | ScopeKey::Home => {
+                self.ports.ports.selection = 0;
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Bottom | ScopeKey::End => {
+                let n = self.ports.ports.visible_count();
+                self.ports.ports.selection = n.saturating_sub(1);
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::FilterStart => {
+                self.ports.ports.filter_active = true;
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Char(b'j') => self.handle_ports_list_key(ScopeKey::Down, actions),
+            ScopeKey::Char(b'k') => self.handle_ports_list_key(ScopeKey::Up, actions),
+            ScopeKey::Char(b'g') => self.handle_ports_list_key(ScopeKey::Top, actions),
+            ScopeKey::Char(b'G') => self.handle_ports_list_key(ScopeKey::Bottom, actions),
+            ScopeKey::Char(b'/') => self.handle_ports_list_key(ScopeKey::FilterStart, actions),
+            _ => {}
+        }
+    }
+
+    fn handle_processes_list_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
+        if self.ports.processes.filter_active {
+            match key {
+                ScopeKey::Escape => {
+                    self.ports.processes.filter.clear();
+                    self.ports.processes.filter_active = false;
+                    let old_key = self.ports.processes.selected_key();
+                    self.ports.processes.reanchor_selection(old_key);
+                    actions.push(AppAction::DrawFrame);
+                }
+                ScopeKey::Enter => {
+                    self.ports.processes.filter_active = false;
+                    actions.push(AppAction::DrawFrame);
+                }
+                ScopeKey::Backspace => {
+                    if self.ports.processes.filter.pop().is_some() {
+                        let old_key = self.ports.processes.selected_key();
+                        self.ports.processes.reanchor_selection(old_key);
+                        actions.push(AppAction::DrawFrame);
+                    }
+                }
+                ScopeKey::Char(b) => {
+                    if (0x20..=0x7e).contains(&b) {
+                        self.ports.processes.filter.push(b as char);
+                        let old_key = self.ports.processes.selected_key();
+                        self.ports.processes.reanchor_selection(old_key);
+                        actions.push(AppAction::DrawFrame);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
+            ScopeKey::Up => {
+                self.ports.processes.selection = self.ports.processes.selection.saturating_sub(1);
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Down => {
+                let n = self.ports.processes.visible_count();
+                if n > 0 && self.ports.processes.selection + 1 < n {
+                    self.ports.processes.selection += 1;
+                }
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Top | ScopeKey::Home => {
+                self.ports.processes.selection = 0;
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Bottom | ScopeKey::End => {
+                let n = self.ports.processes.visible_count();
+                self.ports.processes.selection = n.saturating_sub(1);
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::FilterStart => {
+                self.ports.processes.filter_active = true;
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Char(b'j') => self.handle_processes_list_key(ScopeKey::Down, actions),
+            ScopeKey::Char(b'k') => self.handle_processes_list_key(ScopeKey::Up, actions),
+            ScopeKey::Char(b'g') => self.handle_processes_list_key(ScopeKey::Top, actions),
+            ScopeKey::Char(b'G') => self.handle_processes_list_key(ScopeKey::Bottom, actions),
+            ScopeKey::Char(b'/') => self.handle_processes_list_key(ScopeKey::FilterStart, actions),
+            _ => {}
         }
     }
 
@@ -1124,6 +1572,10 @@ impl App {
                     self.handle_docker_event(event, actions);
                 } else if self.docker.is_current_logs_sub(subscription_id) {
                     self.handle_logs_event(event, actions);
+                } else if subscription_id == self.ports.ports_sub_id {
+                    self.handle_ports_event(event, actions);
+                } else if subscription_id == self.ports.processes_sub_id {
+                    self.handle_processes_event(event, actions);
                 }
                 // Unknown sub id: stale event from a sub we've closed.
                 // Drop silently.
@@ -1210,6 +1662,44 @@ impl App {
                 // future version does, drop silently here. The
                 // per-container logs/stats streams route to
                 // handle_logs_event via is_current_logs_sub instead.
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_ports_event(&mut self, event: Event, actions: &mut Vec<AppAction>) {
+        match event {
+            Event::PortList { ports, source } => {
+                let old_key = self.ports.ports.selected_key();
+                self.ports.ports.state = PortsViewState::Available {
+                    rows: ports,
+                    source,
+                };
+                self.ports.ports.reanchor_selection(old_key);
+                actions.push(AppAction::DrawFrame);
+            }
+            Event::PortsUnavailable { reason } => {
+                self.ports.ports.state = PortsViewState::Unavailable { reason };
+                self.ports.ports.selection = 0;
+                actions.push(AppAction::DrawFrame);
+            }
+            // Other event kinds are never delivered on the Ports sub id.
+            _ => {}
+        }
+    }
+
+    fn handle_processes_event(&mut self, event: Event, actions: &mut Vec<AppAction>) {
+        match event {
+            Event::ProcessList { rows, source } => {
+                let old_key = self.ports.processes.selected_key();
+                self.ports.processes.state = ProcessesViewState::Available { rows, source };
+                self.ports.processes.reanchor_selection(old_key);
+                actions.push(AppAction::DrawFrame);
+            }
+            Event::ProcessesUnavailable { reason } => {
+                self.ports.processes.state = ProcessesViewState::Unavailable { reason };
+                self.ports.processes.selection = 0;
+                actions.push(AppAction::DrawFrame);
             }
             _ => {}
         }
@@ -1371,8 +1861,9 @@ mod tests {
         let actions = app.initial_actions();
         assert_eq!(
             actions.len(),
-            4,
-            "initial actions: AttachPane + ResizePane + Subscribe(Docker) + DrawFrame"
+            6,
+            "initial actions: AttachPane + ResizePane + Subscribe(Docker) + \
+             Subscribe(Ports) + Subscribe(Processes) + DrawFrame"
         );
 
         // AttachPane with pane_sub.
@@ -1427,7 +1918,29 @@ mod tests {
             other => panic!("expected SendEnvelope, got {other:?}"),
         }
 
-        assert!(matches!(actions[3], AppAction::DrawFrame));
+        // Subscribe(Ports) with the ports sub_id.
+        match &actions[3] {
+            AppAction::SendEnvelope(env) => match &env.payload {
+                Payload::Subscribe(Subscription::Ports { id }) => {
+                    assert_eq!(*id, app.ports.ports_sub_id);
+                }
+                other => panic!("expected Subscribe(Ports), got {other:?}"),
+            },
+            other => panic!("expected SendEnvelope, got {other:?}"),
+        }
+
+        // Subscribe(Processes) with the processes sub_id.
+        match &actions[4] {
+            AppAction::SendEnvelope(env) => match &env.payload {
+                Payload::Subscribe(Subscription::Processes { id }) => {
+                    assert_eq!(*id, app.ports.processes_sub_id);
+                }
+                other => panic!("expected Subscribe(Processes), got {other:?}"),
+            },
+            other => panic!("expected SendEnvelope, got {other:?}"),
+        }
+
+        assert!(matches!(actions[5], AppAction::DrawFrame));
 
         // Default view state: layout computed, PTY focused, docker
         // opens at Connecting (not Idle) because Subscribe is already
@@ -2936,5 +3449,376 @@ mod tests {
             matches!(app.docker.view, DockerView::Logs(_)),
             "logs view must persist across focus moves"
         );
+    }
+
+    // ---- Phase 4 Slice 4c: Ports tile (with Processes toggle) ----
+
+    fn make_port(
+        protocol: &str,
+        port: u16,
+        pid: u32,
+        name: &str,
+        container: Option<&str>,
+    ) -> ProbePort {
+        ProbePort {
+            local_ip: "0.0.0.0".into(),
+            local_port: port,
+            protocol: protocol.into(),
+            pid,
+            process_name: name.into(),
+            container_id: container.map(|s| s.to_string()),
+            partial: false,
+        }
+    }
+
+    fn make_process(pid: u32, start_time: i64, command: &str) -> ProbeProcess {
+        ProbeProcess {
+            pid,
+            parent_pid: 1,
+            start_time_unix_secs: start_time,
+            command: command.into(),
+            cpu_percent: Some(1.5),
+            mem_bytes: 4_194_304,
+            partial: false,
+        }
+    }
+
+    fn populate_ports_and_focus(app: &mut App, ports: Vec<ProbePort>) {
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.ports.ports_sub_id,
+                event: Event::PortList {
+                    ports,
+                    source: "test".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+        // Focus Ports tile: Ctrl-b j to Docker, then Ctrl-b l to Ports.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+    }
+
+    fn populate_processes(app: &mut App, procs: Vec<ProbeProcess>) {
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.ports.processes_sub_id,
+                event: Event::ProcessList {
+                    rows: procs,
+                    source: "sysinfo".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+    }
+
+    #[test]
+    fn port_list_event_transitions_ports_view_to_available_and_redraws() {
+        let mut app = test_app();
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.ports.ports_sub_id,
+                event: Event::PortList {
+                    ports: vec![make_port("tcp", 8080, 100, "nginx", None)],
+                    source: "linux-procfs".into(),
+                },
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert!(matches!(
+            app.ports.ports.state,
+            PortsViewState::Available { .. }
+        ));
+        assert_eq!(app.ports.ports.visible_count(), 1);
+        assert!(actions.iter().any(|a| matches!(a, AppAction::DrawFrame)));
+    }
+
+    #[test]
+    fn ports_unavailable_event_transitions_to_unavailable_and_clears_selection() {
+        let mut app = test_app();
+        populate_ports_and_focus(&mut app, vec![make_port("tcp", 8080, 100, "nginx", None)]);
+        app.ports.ports.selection = 0;
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.ports.ports_sub_id,
+                event: Event::PortsUnavailable {
+                    reason: "probe permission denied".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert!(matches!(
+            app.ports.ports.state,
+            PortsViewState::Unavailable { .. }
+        ));
+        assert_eq!(app.ports.ports.selection, 0);
+    }
+
+    #[test]
+    fn process_list_event_transitions_processes_view_to_available() {
+        let mut app = test_app();
+        populate_processes(
+            &mut app,
+            vec![make_process(4242, 1_700_000_000, "nginx: worker")],
+        );
+        assert!(matches!(
+            app.ports.processes.state,
+            ProcessesViewState::Available { .. }
+        ));
+        assert_eq!(app.ports.processes.visible_count(), 1);
+    }
+
+    #[test]
+    fn p_toggles_ports_and_processes_views_when_ports_tile_focused() {
+        let mut app = test_app();
+        populate_ports_and_focus(&mut app, vec![make_port("tcp", 8080, 100, "nginx", None)]);
+        assert!(matches!(app.ports.active, PortsActiveView::Ports));
+        app.handle_event(AppEvent::StdinChunk(b"p".to_vec()));
+        assert!(matches!(app.ports.active, PortsActiveView::Processes));
+        app.handle_event(AppEvent::StdinChunk(b"p".to_vec()));
+        assert!(matches!(app.ports.active, PortsActiveView::Ports));
+    }
+
+    #[test]
+    fn p_does_not_toggle_while_filter_is_active_on_ports_view() {
+        let mut app = test_app();
+        populate_ports_and_focus(&mut app, vec![make_port("tcp", 8080, 100, "nginx", None)]);
+        app.handle_event(AppEvent::StdinChunk(b"/".to_vec())); // activate filter
+        assert!(app.ports.ports.filter_active);
+        app.handle_event(AppEvent::StdinChunk(b"p".to_vec()));
+        assert!(
+            matches!(app.ports.active, PortsActiveView::Ports),
+            "`p` while filter-typing must be a filter character, not toggle"
+        );
+        assert_eq!(app.ports.ports.filter, "p");
+    }
+
+    #[test]
+    fn j_k_navigate_ports_view_independently_of_processes_selection() {
+        let mut app = test_app();
+        populate_ports_and_focus(
+            &mut app,
+            vec![
+                make_port("tcp", 3000, 200, "web", None),
+                make_port("tcp", 5432, 300, "postgres", None),
+                make_port("tcp", 6379, 400, "redis", None),
+            ],
+        );
+        populate_processes(
+            &mut app,
+            vec![
+                make_process(200, 1_700_000_001, "web"),
+                make_process(300, 1_700_000_002, "postgres"),
+            ],
+        );
+
+        assert_eq!(app.ports.ports.selection, 0);
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
+        assert_eq!(app.ports.ports.selection, 1);
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
+        assert_eq!(app.ports.ports.selection, 2);
+
+        // Toggle to Processes; its selection should still be at 0 (not
+        // carried over from Ports' 2).
+        app.handle_event(AppEvent::StdinChunk(b"p".to_vec()));
+        assert_eq!(app.ports.processes.selection, 0);
+
+        // Move selection in Processes.
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
+        assert_eq!(app.ports.processes.selection, 1);
+
+        // Toggle back: Ports selection must still be 2 (not overwritten
+        // by Processes' 1).
+        app.handle_event(AppEvent::StdinChunk(b"p".to_vec()));
+        assert_eq!(app.ports.ports.selection, 2);
+    }
+
+    #[test]
+    fn ports_selection_persists_across_refresh_by_protocol_port_pid_key() {
+        let mut app = test_app();
+        populate_ports_and_focus(
+            &mut app,
+            vec![
+                make_port("tcp", 3000, 200, "web", None),
+                make_port("tcp", 5432, 300, "postgres", None),
+                make_port("tcp", 6379, 400, "redis", None),
+            ],
+        );
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec())); // select postgres
+        assert_eq!(app.ports.ports.selection, 1);
+
+        // Refresh arrives with postgres REORDERED to index 0.
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.ports.ports_sub_id,
+                event: Event::PortList {
+                    ports: vec![
+                        make_port("tcp", 5432, 300, "postgres", None),
+                        make_port("tcp", 3000, 200, "web", None),
+                        make_port("tcp", 6379, 400, "redis", None),
+                    ],
+                    source: "test".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+
+        // Selection must follow postgres to its new index.
+        assert_eq!(
+            app.ports.ports.selection, 0,
+            "selection must re-anchor to (protocol, port, pid) of postgres after reorder"
+        );
+    }
+
+    #[test]
+    fn ports_selection_moves_to_next_row_when_selected_row_disappears() {
+        let mut app = test_app();
+        populate_ports_and_focus(
+            &mut app,
+            vec![
+                make_port("tcp", 3000, 200, "web", None),
+                make_port("tcp", 5432, 300, "postgres", None),
+                make_port("tcp", 6379, 400, "redis", None),
+            ],
+        );
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec())); // select postgres
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec())); // select redis
+        assert_eq!(app.ports.ports.selection, 2);
+
+        // postgres + redis vanish — only `web` left. Selection was
+        // pointing at redis; since redis is gone, fall back to clamping
+        // to the last valid index (0 = web).
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.ports.ports_sub_id,
+                event: Event::PortList {
+                    ports: vec![make_port("tcp", 3000, 200, "web", None)],
+                    source: "test".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert_eq!(
+            app.ports.ports.selection, 0,
+            "disappeared-entity selection must clamp into the new visible range"
+        );
+    }
+
+    #[test]
+    fn processes_selection_persists_across_refresh_by_pid_start_time_key() {
+        let mut app = test_app();
+        populate_processes(
+            &mut app,
+            vec![
+                make_process(200, 1_700_000_001, "web"),
+                make_process(300, 1_700_000_002, "postgres"),
+            ],
+        );
+        app.ports.active = PortsActiveView::Processes;
+        app.view.focused = TileId::Ports;
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec())); // select postgres
+        assert_eq!(app.ports.processes.selection, 1);
+
+        // Pid 200 gets reused by a *new* process (different
+        // start_time). The selected postgres row (pid 300) is still
+        // present but reordered. Selection must re-anchor to
+        // (300, 1_700_000_002), not drift to the reused pid 200.
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.ports.processes_sub_id,
+                event: Event::ProcessList {
+                    rows: vec![
+                        make_process(300, 1_700_000_002, "postgres"),
+                        make_process(200, 1_700_000_500, "DIFFERENT_BINARY"),
+                    ],
+                    source: "sysinfo".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert_eq!(
+            app.ports.processes.selection, 0,
+            "selection must follow (pid, start_time) to postgres's new index"
+        );
+    }
+
+    #[test]
+    fn filter_active_typing_accumulates_to_ports_view_filter() {
+        let mut app = test_app();
+        populate_ports_and_focus(&mut app, vec![make_port("tcp", 8080, 100, "nginx", None)]);
+        app.handle_event(AppEvent::StdinChunk(b"/".to_vec()));
+        assert!(app.ports.ports.filter_active);
+        app.handle_event(AppEvent::StdinChunk(b"ngi".to_vec()));
+        assert_eq!(app.ports.ports.filter, "ngi");
+        app.handle_event(AppEvent::StdinChunk(b"\x7f".to_vec())); // backspace
+        assert_eq!(app.ports.ports.filter, "ng");
+        // Enter commits; filter remains.
+        app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
+        assert!(!app.ports.ports.filter_active);
+        assert_eq!(app.ports.ports.filter, "ng");
+    }
+
+    #[test]
+    fn esc_clears_ports_filter_and_deactivates() {
+        let mut app = test_app();
+        populate_ports_and_focus(&mut app, vec![make_port("tcp", 8080, 100, "nginx", None)]);
+        app.handle_event(AppEvent::StdinChunk(b"/".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"xyz".to_vec()));
+        assert_eq!(app.ports.ports.filter, "xyz");
+        app.handle_event(AppEvent::StdinChunk(b"\x1b".to_vec())); // Esc
+        assert!(!app.ports.ports.filter_active);
+        assert_eq!(app.ports.ports.filter, "");
+    }
+
+    #[test]
+    fn ports_filter_narrows_visible_rows_and_reanchors_selection() {
+        let mut app = test_app();
+        populate_ports_and_focus(
+            &mut app,
+            vec![
+                make_port("tcp", 3000, 200, "web", None),
+                make_port("tcp", 5432, 300, "postgres", None),
+                make_port("tcp", 6379, 400, "redis", None),
+            ],
+        );
+        assert_eq!(app.ports.ports.visible_count(), 3);
+        app.handle_event(AppEvent::StdinChunk(b"/".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"post".to_vec()));
+        assert_eq!(app.ports.ports.visible_count(), 1);
+    }
+
+    #[test]
+    fn ports_focused_stdin_routes_to_ports_key_handler_not_send_input() {
+        // Ports tile is now a real scope (ScopeKind::Ports), not a
+        // placeholder. Focused stdin must route to handle_ports_key
+        // and produce DrawFrame (from nav), not SendInput to the pty.
+        let mut app = test_app();
+        populate_ports_and_focus(
+            &mut app,
+            vec![
+                make_port("tcp", 3000, 200, "web", None),
+                make_port("tcp", 5432, 300, "postgres", None),
+            ],
+        );
+        let actions = app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
+        let send_input_count = actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    AppAction::SendEnvelope(env)
+                        if matches!(&env.payload, Payload::SendInput { .. })
+                )
+            })
+            .count();
+        assert_eq!(send_input_count, 0, "j in Ports must not become SendInput");
+        assert_eq!(app.ports.ports.selection, 1);
     }
 }

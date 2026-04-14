@@ -136,10 +136,7 @@ impl TileLayout {
             },
             TileDef {
                 id: TileId::Ports,
-                kind: TileKind::Placeholder {
-                    label: "Ports — Phase 4".to_string(),
-                    eta_phase: 4,
-                },
+                kind: TileKind::Scope(ScopeKind::Ports),
                 rect: ports_rect,
             },
             TileDef {
@@ -415,7 +412,12 @@ mod tests {
             layout.routes_to_scope(TileId::Docker),
             Some(ScopeKind::Docker)
         );
+        assert_eq!(
+            layout.routes_to_scope(TileId::Ports),
+            Some(ScopeKind::Ports),
+            "Phase 4 Slice 4c replaced the Ports placeholder with a real scope"
+        );
         assert_eq!(layout.routes_to_scope(TileId::Pty), None);
-        assert_eq!(layout.routes_to_scope(TileId::Ports), None);
+        assert_eq!(layout.routes_to_scope(TileId::Fleet), None);
     }
 }
