@@ -83,13 +83,36 @@ impl KnownHostsStore {
 
     /// Append a new entry. Creates the parent directory if missing.
     /// Called on TOFU auto-accept for first-contact hosts.
+    ///
+    /// After russh writes the entry, we set the file mode to `0600` on
+    /// Unix to match OpenSSH's convention for `~/.ssh/known_hosts`.
+    /// The file contains server public keys (not sensitive by
+    /// themselves) but matching OpenSSH's posture removes one "why is
+    /// this world-readable?" surprise. Russh's `learn_known_hosts_path`
+    /// does not set a mode explicitly — verified 2026-04-14 against
+    /// russh 0.60.
     pub fn trust(&self, hostname: &str, port: u16, key: &PublicKey) -> Result<(), SshError> {
         known_hosts::learn_known_hosts_path(hostname, port, key, &self.path).map_err(|e| {
             SshError::KnownHosts {
                 path: self.path.clone(),
                 reason: e.to_string(),
             }
-        })
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            if let Err(e) = std::fs::set_permissions(&self.path, perms) {
+                // Don't fail the operation — the entry is persisted;
+                // mode is a defense-in-depth nicety. Trace-level log.
+                tracing::debug!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "failed to chmod 0600 on known_hosts (entry was written successfully)"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -166,6 +189,21 @@ mod tests {
         assert_eq!(
             store.check("alt.box", 22, &key).unwrap(),
             HostKeyVerdict::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_sets_known_hosts_mode_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("known_hosts");
+        let store = KnownHostsStore::open_at(&path);
+        store.trust("chmod.box", 22, &parse(KEY_A)).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "known_hosts should be 0600 after trust (OpenSSH convention)"
         );
     }
 

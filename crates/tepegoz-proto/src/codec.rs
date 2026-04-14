@@ -49,6 +49,8 @@ fn payload_variant(p: &Payload) -> &'static str {
             Event::PortsUnavailable { .. } => "Event::PortsUnavailable",
             Event::ProcessList { .. } => "Event::ProcessList",
             Event::ProcessesUnavailable { .. } => "Event::ProcessesUnavailable",
+            Event::HostList { .. } => "Event::HostList",
+            Event::HostStateChanged { .. } => "Event::HostStateChanged",
         },
         Payload::PaneOpened(_) => "PaneOpened",
         Payload::PaneList { .. } => "PaneList",
@@ -691,6 +693,117 @@ mod tests {
                 assert!(reason.contains("sysinfo"));
             }
             other => panic!("expected Event(ProcessesUnavailable), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_fleet_roundtrip() {
+        use crate::Subscription;
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(Subscription::Fleet { id: 97 }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::Subscribe(Subscription::Fleet { id }) => assert_eq!(id, 97),
+            other => panic!("expected Subscribe(Fleet), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_list_event_roundtrip_preserves_all_fields() {
+        use crate::HostEntry;
+        let (mut a, mut b) = tokio::io::duplex(8192);
+
+        let hosts = vec![
+            HostEntry {
+                alias: "staging".into(),
+                hostname: "staging.internal".into(),
+                user: "alice".into(),
+                port: 22,
+                identity_files: vec!["/home/alice/.ssh/id_ed25519_staging".into()],
+                proxy_jump: None,
+            },
+            HostEntry {
+                alias: "bench-01".into(),
+                hostname: "10.0.2.5".into(),
+                user: "bob".into(),
+                port: 2222,
+                identity_files: vec![],
+                proxy_jump: Some("bastion".into()),
+            },
+        ];
+
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: 97,
+                event: Event::HostList {
+                    hosts: hosts.clone(),
+                    source: "ssh_config (/home/alice/.ssh/config)".into(),
+                },
+            }),
+        };
+
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+
+        match decoded.payload {
+            Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::HostList { hosts: h, source },
+            }) => {
+                assert_eq!(subscription_id, 97);
+                assert_eq!(h, hosts, "host list survived rkyv roundtrip");
+                assert!(source.contains("ssh_config"));
+            }
+            other => panic!("expected Event(HostList), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_state_changed_event_roundtrip_covers_all_variants() {
+        use crate::HostState;
+        for state in [
+            HostState::Disconnected,
+            HostState::Connecting,
+            HostState::Connected,
+            HostState::Degraded,
+            HostState::AuthFailed,
+            HostState::HostKeyMismatch,
+            HostState::AgentNotDeployed,
+            HostState::AgentVersionMismatch,
+        ] {
+            let (mut a, mut b) = tokio::io::duplex(1024);
+            let original = Envelope {
+                version: PROTOCOL_VERSION,
+                payload: Payload::Event(EventFrame {
+                    subscription_id: 97,
+                    event: Event::HostStateChanged {
+                        alias: "staging".into(),
+                        state,
+                    },
+                }),
+            };
+            write_envelope(&mut a, &original).await.unwrap();
+            let decoded = read_envelope(&mut b).await.unwrap();
+            match decoded.payload {
+                Payload::Event(EventFrame {
+                    subscription_id,
+                    event:
+                        Event::HostStateChanged {
+                            alias,
+                            state: decoded_state,
+                        },
+                }) => {
+                    assert_eq!(subscription_id, 97);
+                    assert_eq!(alias, "staging");
+                    assert_eq!(decoded_state, state);
+                }
+                other => panic!("expected Event(HostStateChanged), got {other:?}"),
+            }
         }
     }
 }

@@ -22,3 +22,4 @@ anyhow = { workspace = true }
 tepegoz-core = { workspace = true }
 tepegoz-tui = { workspace = true }
 tepegoz-agent = { workspace = true }
+tepegoz-ssh = { workspace = true }

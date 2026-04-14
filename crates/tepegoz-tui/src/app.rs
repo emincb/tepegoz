@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use ratatui::layout::Rect;
 use tepegoz_proto::{
     DockerActionKind, DockerActionOutcome, DockerActionRequest, DockerContainer, Envelope, Event,
-    EventFrame, LogStream, PROTOCOL_VERSION, PaneId, Payload, ProbePort, ProbeProcess,
-    Subscription,
+    EventFrame, HostEntry, HostState, LogStream, PROTOCOL_VERSION, PaneId, Payload, ProbePort,
+    ProbeProcess, Subscription,
 };
 use vt100::Parser;
 
@@ -83,6 +83,7 @@ const FALLBACK_PTY_COLS: u16 = 80;
 pub(crate) enum ScopeKind {
     Docker,
     Ports,
+    Fleet,
 }
 
 /// TUI view state: fixed tile layout + the id of the focused tile.
@@ -721,6 +722,112 @@ impl ProcessesView {
     }
 }
 
+/// Phase 5 Slice 5b: SSH Fleet tile state. Hosts the list of configured
+/// SSH hosts from `tepegoz-ssh::HostList::discover()` plus their per-
+/// host connection state (all `Disconnected` in 5b — 5c's supervisor
+/// drives real transitions). Single view (no toggle like Ports).
+#[derive(Debug)]
+pub(crate) struct FleetScope {
+    pub(crate) state: FleetScopeState,
+    pub(crate) selection: usize,
+    pub(crate) filter: String,
+    pub(crate) filter_active: bool,
+    /// Subscription id for `Subscribe(Fleet)`. Allocated once at
+    /// `App::new`; lives for the session.
+    pub(crate) sub_id: u64,
+}
+
+/// Three-state lifecycle for the Fleet tile — mirrors Docker/Ports.
+/// `Available` carries the full host list + per-alias state map +
+/// source label. No `Unavailable` variant: a discovery failure still
+/// produces an empty `HostList` with an error `source`, rendered as
+/// Available-with-zero-hosts + the source string as the footer hint.
+#[derive(Debug)]
+pub(crate) enum FleetScopeState {
+    Connecting,
+    Available {
+        hosts: Vec<HostEntry>,
+        states: HashMap<String, HostState>,
+        source: String,
+    },
+}
+
+/// Stable identity for Fleet selection — the alias is unique per host
+/// list so a single String suffices. Re-anchors across refreshes the
+/// same way Ports/Processes do.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FleetKey(pub(crate) String);
+
+impl FleetKey {
+    pub(crate) fn of(h: &HostEntry) -> Self {
+        Self(h.alias.clone())
+    }
+}
+
+impl FleetScope {
+    fn new(sub_id: u64) -> Self {
+        Self {
+            state: FleetScopeState::Connecting,
+            selection: 0,
+            filter: String::new(),
+            filter_active: false,
+            sub_id,
+        }
+    }
+
+    pub(crate) fn matches_filter(&self, h: &HostEntry) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let q = self.filter.to_lowercase();
+        h.alias.to_lowercase().contains(&q)
+            || h.hostname.to_lowercase().contains(&q)
+            || h.user.to_lowercase().contains(&q)
+    }
+
+    pub(crate) fn visible_count(&self) -> usize {
+        match &self.state {
+            FleetScopeState::Available { hosts, .. } => {
+                hosts.iter().filter(|h| self.matches_filter(h)).count()
+            }
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn selected_host(&self) -> Option<&HostEntry> {
+        match &self.state {
+            FleetScopeState::Available { hosts, .. } => hosts
+                .iter()
+                .filter(|h| self.matches_filter(h))
+                .nth(self.selection),
+            _ => None,
+        }
+    }
+
+    fn selected_key(&self) -> Option<FleetKey> {
+        self.selected_host().map(FleetKey::of)
+    }
+
+    fn reanchor_selection(&mut self, old_key: Option<FleetKey>) {
+        let FleetScopeState::Available { hosts, .. } = &self.state else {
+            self.selection = 0;
+            return;
+        };
+        let visible: Vec<&HostEntry> = hosts.iter().filter(|h| self.matches_filter(h)).collect();
+        if let Some(key) = old_key
+            && let Some(idx) = visible.iter().position(|h| FleetKey::of(h) == key)
+        {
+            self.selection = idx;
+            return;
+        }
+        if visible.is_empty() {
+            self.selection = 0;
+        } else if self.selection >= visible.len() {
+            self.selection = visible.len() - 1;
+        }
+    }
+}
+
 /// Pending one-shot request awaiting a response from the daemon. Keyed
 /// by `request_id` in [`App::pending_actions`]; the id is mirrored back
 /// in the `DockerActionResult` so the App can look up the description
@@ -866,6 +973,11 @@ pub(crate) struct App {
     /// tile only renders one at a time, but neither drops data when
     /// toggled out of view.
     pub(crate) ports: PortsScope,
+    /// Phase 5 Slice 5b: SSH Fleet tile. Subscribes to `Fleet` at
+    /// startup; 5b carries only the initial `HostList` snapshot + one
+    /// `HostStateChanged { Disconnected }` per host. 5c's supervisor
+    /// drives real connection-state transitions.
+    pub(crate) fleet: FleetScope,
     pub(crate) terminal_size: (u16, u16),
     /// Monotonic id allocator shared between subscription ids and
     /// DockerAction request ids. The daemon correlates each response by
@@ -901,6 +1013,8 @@ impl App {
         next_sub_id += 1;
         let processes_sub = next_sub_id;
         next_sub_id += 1;
+        let fleet_sub = next_sub_id;
+        next_sub_id += 1;
 
         Self {
             view,
@@ -909,6 +1023,7 @@ impl App {
             pty_parser,
             docker: DockerScope::new(docker_sub),
             ports: PortsScope::new(ports_sub, processes_sub),
+            fleet: FleetScope::new(fleet_sub),
             terminal_size,
             next_sub_id,
             pending_actions: HashMap::new(),
@@ -942,6 +1057,9 @@ impl App {
             }))),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Processes {
                 id: self.ports.processes_sub_id,
+            }))),
+            AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Fleet {
+                id: self.fleet.sub_id,
             }))),
             AppAction::DrawFrame,
         ]
@@ -1001,6 +1119,11 @@ impl App {
             Some(ScopeKind::Ports) => {
                 for key in self.scope_key_parser.parse(&bytes) {
                     self.handle_ports_key(key, actions);
+                }
+            }
+            Some(ScopeKind::Fleet) => {
+                for key in self.scope_key_parser.parse(&bytes) {
+                    self.handle_fleet_key(key, actions);
                 }
             }
             None => {
@@ -1185,6 +1308,74 @@ impl App {
         match self.ports.active {
             PortsActiveView::Ports => self.handle_ports_list_key(key, actions),
             PortsActiveView::Processes => self.handle_processes_list_key(key, actions),
+        }
+    }
+
+    fn handle_fleet_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
+        if self.fleet.filter_active {
+            match key {
+                ScopeKey::Escape => {
+                    self.fleet.filter.clear();
+                    self.fleet.filter_active = false;
+                    let old_key = self.fleet.selected_key();
+                    self.fleet.reanchor_selection(old_key);
+                    actions.push(AppAction::DrawFrame);
+                }
+                ScopeKey::Enter => {
+                    self.fleet.filter_active = false;
+                    actions.push(AppAction::DrawFrame);
+                }
+                ScopeKey::Backspace => {
+                    if self.fleet.filter.pop().is_some() {
+                        let old_key = self.fleet.selected_key();
+                        self.fleet.reanchor_selection(old_key);
+                        actions.push(AppAction::DrawFrame);
+                    }
+                }
+                ScopeKey::Char(b) => {
+                    if (0x20..=0x7e).contains(&b) {
+                        self.fleet.filter.push(b as char);
+                        let old_key = self.fleet.selected_key();
+                        self.fleet.reanchor_selection(old_key);
+                        actions.push(AppAction::DrawFrame);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
+            ScopeKey::Up => {
+                self.fleet.selection = self.fleet.selection.saturating_sub(1);
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Down => {
+                let n = self.fleet.visible_count();
+                if n > 0 && self.fleet.selection + 1 < n {
+                    self.fleet.selection += 1;
+                }
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Top | ScopeKey::Home => {
+                self.fleet.selection = 0;
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Bottom | ScopeKey::End => {
+                let n = self.fleet.visible_count();
+                self.fleet.selection = n.saturating_sub(1);
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::FilterStart => {
+                self.fleet.filter_active = true;
+                actions.push(AppAction::DrawFrame);
+            }
+            ScopeKey::Char(b'j') => self.handle_fleet_key(ScopeKey::Down, actions),
+            ScopeKey::Char(b'k') => self.handle_fleet_key(ScopeKey::Up, actions),
+            ScopeKey::Char(b'g') => self.handle_fleet_key(ScopeKey::Top, actions),
+            ScopeKey::Char(b'G') => self.handle_fleet_key(ScopeKey::Bottom, actions),
+            ScopeKey::Char(b'/') => self.handle_fleet_key(ScopeKey::FilterStart, actions),
+            _ => {}
         }
     }
 
@@ -1576,6 +1767,8 @@ impl App {
                     self.handle_ports_event(event, actions);
                 } else if subscription_id == self.ports.processes_sub_id {
                     self.handle_processes_event(event, actions);
+                } else if subscription_id == self.fleet.sub_id {
+                    self.handle_fleet_event(event, actions);
                 }
                 // Unknown sub id: stale event from a sub we've closed.
                 // Drop silently.
@@ -1700,6 +1893,53 @@ impl App {
                 self.ports.processes.state = ProcessesViewState::Unavailable { reason };
                 self.ports.processes.selection = 0;
                 actions.push(AppAction::DrawFrame);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_fleet_event(&mut self, event: Event, actions: &mut Vec<AppAction>) {
+        match event {
+            Event::HostList { hosts, source } => {
+                let old_key = self.fleet.selected_key();
+                // Seed per-alias state map from whatever was in the
+                // prior Available state (if any) so a refreshed host
+                // list doesn't blink connection markers back to
+                // Disconnected. Missing aliases default to Disconnected
+                // — they'll be corrected by a follow-up HostStateChanged.
+                let mut states = HashMap::new();
+                if let FleetScopeState::Available {
+                    states: prev_states,
+                    ..
+                } = &self.fleet.state
+                {
+                    for h in &hosts {
+                        if let Some(s) = prev_states.get(&h.alias) {
+                            states.insert(h.alias.clone(), *s);
+                        } else {
+                            states.insert(h.alias.clone(), HostState::Disconnected);
+                        }
+                    }
+                } else {
+                    for h in &hosts {
+                        states.insert(h.alias.clone(), HostState::Disconnected);
+                    }
+                }
+                self.fleet.state = FleetScopeState::Available {
+                    hosts,
+                    states,
+                    source,
+                };
+                self.fleet.reanchor_selection(old_key);
+                actions.push(AppAction::DrawFrame);
+            }
+            Event::HostStateChanged { alias, state } => {
+                if let FleetScopeState::Available { states, .. } = &mut self.fleet.state {
+                    states.insert(alias, state);
+                    actions.push(AppAction::DrawFrame);
+                }
+                // Arriving before HostList — ignore; the supervisor
+                // will re-emit once the tile transitions to Available.
             }
             _ => {}
         }
@@ -1861,9 +2101,9 @@ mod tests {
         let actions = app.initial_actions();
         assert_eq!(
             actions.len(),
-            6,
+            7,
             "initial actions: AttachPane + ResizePane + Subscribe(Docker) + \
-             Subscribe(Ports) + Subscribe(Processes) + DrawFrame"
+             Subscribe(Ports) + Subscribe(Processes) + Subscribe(Fleet) + DrawFrame"
         );
 
         // AttachPane with pane_sub.
@@ -1940,7 +2180,18 @@ mod tests {
             other => panic!("expected SendEnvelope, got {other:?}"),
         }
 
-        assert!(matches!(actions[5], AppAction::DrawFrame));
+        // Subscribe(Fleet) with the fleet sub_id (Phase 5 Slice 5b).
+        match &actions[5] {
+            AppAction::SendEnvelope(env) => match &env.payload {
+                Payload::Subscribe(Subscription::Fleet { id }) => {
+                    assert_eq!(*id, app.fleet.sub_id);
+                }
+                other => panic!("expected Subscribe(Fleet), got {other:?}"),
+            },
+            other => panic!("expected SendEnvelope, got {other:?}"),
+        }
+
+        assert!(matches!(actions[6], AppAction::DrawFrame));
 
         // Default view state: layout computed, PTY focused, docker
         // opens at Connecting (not Idle) because Subscribe is already

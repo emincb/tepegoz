@@ -17,6 +17,7 @@ tepegoz-proto = { workspace = true }
 tepegoz-pty = { workspace = true }
 tepegoz-docker = { workspace = true }
 tepegoz-probe = { workspace = true }
+tepegoz-ssh = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

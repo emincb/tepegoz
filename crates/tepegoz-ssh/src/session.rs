@@ -187,7 +187,7 @@ pub async fn open_session(session: &SshSession) -> Result<SshChannel, SshError> 
 async fn authenticate(
     handle: &mut Handle<TofuHandler>,
     user: &str,
-    identity_files: &[PathBuf],
+    identity_files: &[String],
     alias: &str,
     hostname: &str,
     port: u16,
@@ -201,13 +201,27 @@ async fn authenticate(
                 attempts.push("ssh-agent connected but holds no identities".into());
             }
             Ok(ids) => {
-                attempts.push(format!("ssh-agent: {} identity(ies)", ids.len()));
+                let total = ids.len();
+                let cert_count = ids
+                    .iter()
+                    .filter(|id| matches!(id, AgentIdentity::Certificate { .. }))
+                    .count();
+                let pk_count = total - cert_count;
+                attempts.push(format!(
+                    "ssh-agent: {pk_count} public-key identity(ies) attempted"
+                ));
+                if cert_count > 0 {
+                    // Phase 5 skips certificate auth — improve visibility
+                    // so a user relying on SSH certs sees a legible reason
+                    // rather than a silent skip. v1.1 reopen if asked.
+                    attempts.push(format!(
+                        "{cert_count} certificate identity(ies) in agent \
+                         skipped (SSH certificates not supported in Phase 5)"
+                    ));
+                }
                 for id in &ids {
                     let pk = match id {
                         AgentIdentity::PublicKey { key, .. } => key.clone(),
-                        // SSH certificates: skip for Phase 5 — uncommon
-                        // in typical dev/ops setups. v1.1 reopen if
-                        // users ask.
                         AgentIdentity::Certificate { .. } => continue,
                     };
                     match handle
@@ -234,28 +248,28 @@ async fn authenticate(
     }
 
     // Phase 2 — IdentityFile(s) from ssh_config, in declaration order.
-    for path in identity_files {
-        match load_secret_key(path, None) {
+    for path_str in identity_files {
+        let path = PathBuf::from(path_str);
+        match load_secret_key(&path, None) {
             Ok(key) => {
                 let kw = PrivateKeyWithHashAlg::new(Arc::new(key), None);
                 match handle.authenticate_publickey(user, kw).await {
                     Ok(AuthResult::Success) => return Ok(()),
                     Ok(AuthResult::Failure { .. }) => {
-                        attempts.push(format!("IdentityFile {} rejected", path.display()));
+                        attempts.push(format!("IdentityFile {path_str} rejected"));
                     }
-                    Err(e) => attempts.push(format!("IdentityFile {} error: {e}", path.display())),
+                    Err(e) => attempts.push(format!("IdentityFile {path_str} error: {e}")),
                 }
             }
             Err(russh::keys::Error::KeyIsEncrypted) => {
                 // Per Q4 CTO addition: passphrase-protected key with no
                 // agent unlocking it must surface verbatim — never hang.
                 attempts.push(format!(
-                    "IdentityFile {} is passphrase-protected and no \
-                     SSH agent unlocked it",
-                    path.display()
+                    "IdentityFile {path_str} is passphrase-protected and \
+                     no SSH agent unlocked it"
                 ));
             }
-            Err(e) => attempts.push(format!("IdentityFile {} load error: {e}", path.display())),
+            Err(e) => attempts.push(format!("IdentityFile {path_str} load error: {e}")),
         }
     }
 

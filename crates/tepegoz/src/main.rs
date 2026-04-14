@@ -56,6 +56,14 @@ enum Command {
         /// Dump the detected Claude Code layout signature.
         #[arg(long)]
         claude_layout: bool,
+        /// Dump the resolved SSH host list + source label (Phase 5
+        /// Slice 5b). Shows the precedence layer that won
+        /// (tepegoz config.toml / TEPEGOZ_SSH_HOSTS env / ssh_config /
+        /// none) alongside each alias's hostname, user, port, and
+        /// IdentityFile list. Use this when `tepegoz connect <alias>`
+        /// can't find a host, or to verify an override is active.
+        #[arg(long)]
+        ssh_hosts: bool,
     },
 }
 
@@ -89,12 +97,50 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(stdio, "agent mode — not yet implemented (Phase 6)");
             Ok(())
         }
-        Command::Doctor { claude_layout } => {
+        Command::Doctor {
+            claude_layout,
+            ssh_hosts,
+        } => {
             init_stdout_tracing(&cli.log_level);
-            tracing::info!(claude_layout, "doctor mode — not yet implemented");
-            Ok(())
+            if ssh_hosts {
+                dump_ssh_hosts()
+            } else {
+                tracing::info!(claude_layout, "doctor mode — not yet implemented");
+                Ok(())
+            }
         }
     }
+}
+
+fn dump_ssh_hosts() -> anyhow::Result<()> {
+    use tepegoz_ssh::HostList;
+    let list =
+        HostList::discover().map_err(|e| anyhow::anyhow!("ssh host discovery failed: {e}"))?;
+    println!("source: {}", list.source.label());
+    println!("hosts ({}):", list.hosts.len());
+    if list.hosts.is_empty() {
+        println!(
+            "  (none) — add entries to ~/.ssh/config or set \
+             TEPEGOZ_SSH_HOSTS=<alias>,<alias>,..."
+        );
+        return Ok(());
+    }
+    for host in &list.hosts {
+        println!(
+            "  {alias}  {user}@{hostname}:{port}",
+            alias = host.alias,
+            user = host.user,
+            hostname = host.hostname,
+            port = host.port,
+        );
+        if !host.identity_files.is_empty() {
+            println!("    IdentityFile: {}", host.identity_files.join(", "));
+        }
+        if let Some(jump) = &host.proxy_jump {
+            println!("    ProxyJump: {jump} (not supported in v1 — Slice 5c surfaces this)");
+        }
+    }
+    Ok(())
 }
 
 fn init_stdout_tracing(default_level: &str) {

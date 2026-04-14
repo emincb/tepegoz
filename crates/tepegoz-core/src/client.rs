@@ -134,6 +134,7 @@ async fn session(
     let mut docker_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut ports_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut processes_subs: HashMap<u64, AbortHandle> = HashMap::new();
+    let mut fleet_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut status_sub: Option<u64> = None;
     let mut ticker = tokio::time::interval(Duration::from_millis(1000));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -161,6 +162,7 @@ async fn session(
                     &mut docker_subs,
                     &mut ports_subs,
                     &mut processes_subs,
+                    &mut fleet_subs,
                 )
                 .await
                 {
@@ -181,6 +183,9 @@ async fn session(
         handle.abort();
     }
     for (_, handle) in processes_subs.drain() {
+        handle.abort();
+    }
+    for (_, handle) in fleet_subs.drain() {
         handle.abort();
     }
     drop(event_tx);
@@ -213,6 +218,7 @@ async fn handle_command(
     docker_subs: &mut HashMap<u64, AbortHandle>,
     ports_subs: &mut HashMap<u64, AbortHandle>,
     processes_subs: &mut HashMap<u64, AbortHandle>,
+    fleet_subs: &mut HashMap<u64, AbortHandle>,
 ) -> anyhow::Result<()> {
     match payload {
         Payload::Ping => {
@@ -292,6 +298,18 @@ async fn handle_command(
             processes_subs.insert(id, handle.abort_handle());
         }
 
+        Payload::Subscribe(Subscription::Fleet { id }) => {
+            if let Some(prev) = fleet_subs.remove(&id) {
+                debug!(id, "replacing existing fleet subscription");
+                prev.abort();
+            }
+            let tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                forward_fleet(id, tx).await;
+            });
+            fleet_subs.insert(id, handle.abort_handle());
+        }
+
         Payload::DockerAction(req) => {
             let tx = event_tx.clone();
             // Spawn so a slow docker daemon doesn't stall the session loop.
@@ -320,6 +338,9 @@ async fn handle_command(
                 handle.abort();
             }
             if let Some(handle) = processes_subs.remove(&id) {
+                handle.abort();
+            }
+            if let Some(handle) = fleet_subs.remove(&id) {
                 handle.abort();
             }
         }
@@ -1022,4 +1043,91 @@ fn processes_unavailable_envelope(subscription_id: u64, reason: String) -> Envel
             event: Event::ProcessesUnavailable { reason },
         }),
     }
+}
+
+/// Forwarder for `Subscription::Fleet`.
+///
+/// Phase 5 Slice 5b: discover SSH hosts (ssh_config / tepegoz config.toml
+/// / env) and deliver one `HostList` snapshot, then one
+/// `HostStateChanged { state: Disconnected }` per host. After that the
+/// task parks — actual per-host connection supervision lands in Slice 5c.
+///
+/// Until 5c ships, Fleet renders "all Disconnected" — same degrade-
+/// gracefully shape as Phase 3's `DockerUnavailable`.
+///
+/// Discovery runs on tokio's blocking pool because ssh_config parsing
+/// does filesystem reads; it's bounded and fast, but keeps the async
+/// runtime clean.
+async fn forward_fleet(subscription_id: u64, event_tx: mpsc::UnboundedSender<Envelope>) {
+    let list = match tokio::task::spawn_blocking(tepegoz_ssh::HostList::discover).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(e)) => {
+            // Rare — ssh_config malformed, or config.toml garbage.
+            // Surface via the same "empty list with source label" shape
+            // a real empty host list would use, then park. UI renders
+            // the tile's empty-list hint. Log the reason so the daemon
+            // operator can diagnose.
+            warn!(subscription_id, error = %e, "fleet discovery failed");
+            let _ = event_tx.send(Envelope {
+                version: PROTOCOL_VERSION,
+                payload: Payload::Event(EventFrame {
+                    subscription_id,
+                    event: Event::HostList {
+                        hosts: Vec::new(),
+                        source: format!("discovery error: {e}"),
+                    },
+                }),
+            });
+            std::future::pending::<()>().await;
+            return;
+        }
+        Err(e) => {
+            warn!(subscription_id, error = %e, "fleet discovery task panicked");
+            return;
+        }
+    };
+
+    let hosts = list.hosts;
+    let source = list.source.label();
+
+    if event_tx
+        .send(Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id,
+                event: Event::HostList {
+                    hosts: hosts.clone(),
+                    source,
+                },
+            }),
+        })
+        .is_err()
+    {
+        return;
+    }
+
+    // Emit an initial Disconnected transition per host so the tile
+    // knows the state marker starts at ○. 5c's supervisor drives real
+    // transitions after this.
+    for host in &hosts {
+        if event_tx
+            .send(Envelope {
+                version: PROTOCOL_VERSION,
+                payload: Payload::Event(EventFrame {
+                    subscription_id,
+                    event: Event::HostStateChanged {
+                        alias: host.alias.clone(),
+                        state: tepegoz_proto::HostState::Disconnected,
+                    },
+                }),
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    // Park until the subscription is cancelled. 5c replaces this with
+    // the per-host supervisor loop that drives real state transitions.
+    std::future::pending::<()>().await;
 }

@@ -547,6 +547,117 @@ pkill -f "python3 -c import socket" 2>/dev/null
 pkill -f "tepegoz daemon" 2>/dev/null
 ```
 
+## SSH Fleet discovery (Phase 5 Slice 5b)
+
+Tepegöz resolves the SSH Fleet host list from three sources, in strict
+precedence (**first non-empty source wins — no merging**):
+
+1. **Tepegöz `config.toml`** — the `[ssh.hosts]` table at:
+   - Linux: `$XDG_CONFIG_HOME/tepegoz/config.toml` (falls back to
+     `~/.config/tepegoz/config.toml`)
+   - macOS: `~/Library/Application Support/tepegoz/config.toml`
+
+   Example:
+
+   ```toml
+   [[ssh.hosts]]
+   alias = "prod-api"
+   hostname = "10.0.0.5"
+   user = "deploy"
+   port = 22
+   identity_file = "~/.ssh/id_ed25519_prod"   # ~ expansion supported
+
+   [[ssh.hosts]]
+   alias = "bench-01"
+   hostname = "10.0.2.5"
+   user = "bench"
+   ```
+
+2. **`TEPEGOZ_SSH_HOSTS` env** — comma-separated list of aliases.
+   Aliases are looked up in `~/.ssh/config`, so this is the right knob
+   when you want tepegöz to show a subset of your ssh_config hosts
+   without editing config files. Single-user machines won't typically
+   need this; CI / scripted contexts do.
+
+   ```sh
+   TEPEGOZ_SSH_HOSTS=staging,dev-eu tepegoz daemon
+   ```
+
+3. **`~/.ssh/config`** — every concrete (non-wildcard) `Host` entry
+   becomes a Fleet row. `User`, `Hostname`, `Port`, `IdentityFile`, and
+   `ProxyJump` are resolved via `russh-config` per ssh_config(5) merge
+   rules + percent-token expansion.
+
+**First non-empty wins, no merging.** If your `config.toml` has any
+`[[ssh.hosts]]` entries, `~/.ssh/config` is **not consulted** — this
+avoids surprise-merging behavior where adding one override silently
+changes the rest of the list. The Fleet tile's footer renders the
+resolved source when it's an override (tepegoz config.toml / env),
+hidden when the source is the user's ssh_config.
+
+### Diagnostic: `tepegoz doctor --ssh-hosts`
+
+Dumps the resolved host list + source label:
+
+```sh
+$ tepegoz doctor --ssh-hosts
+source: ssh_config (/home/alice/.ssh/config)
+hosts (3):
+  staging  alice@staging.internal:2222
+    IdentityFile: /home/alice/.ssh/id_ed25519_staging
+  dev-eu  alice@dev-eu.eu.dev:22
+  bench-01  bench@10.0.2.5:22
+    ProxyJump: bastion (not supported in v1 — Slice 5c surfaces this)
+```
+
+Use it when `tepegoz connect <alias>` can't find a host, or to verify
+that an override layer is active.
+
+### Phase 5 limitations (documented, not bugs)
+
+- **`Include` directives in `~/.ssh/config` are not followed.** Hosts
+  defined only in an Include'd file are invisible to tepegoz. Workaround:
+  flatten your ssh_config, or list the hosts explicitly in
+  `tepegoz/config.toml`. Pinned by
+  `tepegoz-ssh::config::tests::include_directive_is_not_followed_phase_5_limitation`
+  — if that test starts failing, russh-config grew Include support and
+  this limitation is gone.
+- **`ProxyJump` hosts are captured but not dialed.** Slice 5c surfaces
+  a clear `SshError::ConnectFailed { reason: "host requires ProxyJump
+  which is not supported in Phase 5 (v1.1)" }` so the user sees why,
+  rather than an opaque network timeout.
+- **SSH certificate identities in `$SSH_AUTH_SOCK` are skipped** with
+  an explicit "N certificate identity(ies) skipped (not supported in
+  Phase 5)" entry in the `SshError::AuthFailed.reason` chain, rather
+  than a silent skip.
+- **Remote pty session persistence across SSH disconnects lands in
+  Phase 6.** In Phase 5 a dropped SSH connection kills the remote pane
+  (Q3 proposal accepted limit; the agent-backed remote pty in Phase 6
+  replaces this transparently without any wire-protocol change).
+- **Between 5b merge and 5c merge**, every host in the Fleet tile
+  renders as `○ Disconnected` — the connection supervisor that drives
+  real transitions ships in 5c. Same degrade-gracefully shape as Phase
+  3's `DockerUnavailable`.
+
+### Host-key TOFU
+
+On first connect to a given `(hostname, port)`, tepegöz auto-accepts
+the server's host key and persists it to:
+
+- Linux: `$XDG_DATA_HOME/tepegoz/known_hosts`
+- macOS: `~/Library/Application Support/tepegoz/known_hosts`
+
+**Tepegöz never touches `~/.ssh/known_hosts`** — our SSH layer is
+additive to your OpenSSH state, not destructive to it. File format is
+OpenSSH-compatible so you can inspect or hand-edit with standard
+tools; file mode is `0600` on Unix.
+
+On key mismatch (presented key differs from stored), tepegöz rejects
+the connection with a structured error pointing at the stored record's
+file + line. Recovery path (once 5b's diagnostic lands): `tepegoz
+doctor --ssh-forget <alias>` — intentionally a two-step operation so a
+legitimate key-rotation gets verified before the new key is trusted.
+
 ## Common issues
 
 ### POSIX `printf` portability in integration tests

@@ -148,7 +148,7 @@ async fn ssh_connect_exec_roundtrip() {
             hostname: "127.0.0.1".to_string(),
             user: "tepegoz".to_string(),
             port,
-            identity_files: vec![key_path],
+            identity_files: vec![key_path.display().to_string()],
             proxy_jump: None,
         }],
         source: HostSource::None,

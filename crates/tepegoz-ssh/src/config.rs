@@ -23,26 +23,13 @@ use serde::Deserialize;
 use crate::error::SshError;
 use crate::paths;
 
-/// A single remote host the user may connect to — `tepegoz connect <alias>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostEntry {
-    /// Lookup name used by `tepegoz connect <alias>` and the Fleet tile.
-    pub alias: String,
-    /// DNS name or IP literally dialed.
-    pub hostname: String,
-    /// Remote user — resolved from `User` or falls back to the current
-    /// username via `whoami`.
-    pub user: String,
-    /// TCP port. Defaults to 22.
-    pub port: u16,
-    /// `IdentityFile` entries in ssh_config order. Empty when the host
-    /// relies on an SSH agent alone.
-    pub identity_files: Vec<PathBuf>,
-    /// `ProxyJump` alias. Carried forward unused in Phase 5 — v1.1
-    /// reopens ProxyJump once the "chained SSH through another host"
-    /// UX is actually needed.
-    pub proxy_jump: Option<String>,
-}
+// Re-export the wire-level `HostEntry` from `tepegoz-proto` so tepegoz-ssh
+// consumers and the daemon wire speak the same vocabulary. `identity_files`
+// carries `Vec<String>` (not `Vec<PathBuf>`) so the type round-trips
+// cleanly through rkyv and shows up legibly in `tepegoz doctor
+// --ssh-hosts`. The SSH client converts each entry through `PathBuf`
+// just before calling `load_secret_key`.
+pub use tepegoz_proto::HostEntry;
 
 /// Where the host list came from — rendered in the Fleet-tile footer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +150,7 @@ struct TepegozHostEntry {
     #[serde(default)]
     port: Option<u16>,
     #[serde(default)]
-    identity_file: Option<PathBuf>,
+    identity_file: Option<String>,
     #[serde(default)]
     proxy_jump: Option<String>,
 }
@@ -185,10 +172,36 @@ fn parse_tepegoz_config(path: &Path) -> Result<Vec<HostEntry>, SshError> {
             hostname: h.hostname,
             user: h.user.unwrap_or_else(|| default_user.clone()),
             port: h.port.unwrap_or(22),
-            identity_files: h.identity_file.map(|p| vec![p]).unwrap_or_default(),
+            // Tilde expansion (follow-up #2 on 5a): user-authored
+            // `identity_file = "~/.ssh/id_ed25519"` must resolve to an
+            // absolute path; russh's `load_secret_key` does not
+            // tilde-expand. `russh-config` already expands on the
+            // ssh_config path — this matches that behavior for
+            // tepegoz-owned config.toml input.
+            identity_files: h
+                .identity_file
+                .map(|p| vec![expand_tilde(&p)])
+                .unwrap_or_default(),
             proxy_jump: h.proxy_jump,
         })
         .collect())
+}
+
+/// Expand a leading `~/` or literal `~` into the user's home directory.
+/// Returns the input verbatim on non-home paths or when the home
+/// directory can't be resolved.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return dirs::home_dir()
+            .map(|h| h.display().to_string())
+            .unwrap_or_else(|| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).display().to_string();
+        }
+    }
+    path.to_string()
 }
 
 // --- ssh_config via russh-config ----------------------------------------
@@ -250,15 +263,34 @@ fn parse_all_ssh_config(path: &Path) -> Result<Vec<HostEntry>, SshError> {
 }
 
 fn parse_one_alias(ssh_config_path: &Path, alias: &str) -> Result<HostEntry, SshError> {
-    let cfg =
-        russh_config::parse_path(ssh_config_path, alias).map_err(|e| SshError::ConfigParse {
-            path: ssh_config_path.to_path_buf(),
-            reason: e.to_string(),
-        })?;
+    // `russh_config::parse_path` chokes on `Include` directives (raises
+    // `HostNotFound` on any params before the first concrete `Host` —
+    // `Include` counts as a param). Pre-strip `Include` lines from the
+    // raw file content and feed russh-config the sanitized text so
+    // top-level hosts still resolve. The Include'd hosts themselves
+    // are missed — documented as a Phase 5 limitation in
+    // OPERATIONS.md.
+    let raw = std::fs::read_to_string(ssh_config_path).map_err(|e| SshError::ConfigParse {
+        path: ssh_config_path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    let sanitized = strip_include_directives(&raw);
+    let cfg = russh_config::parse(&sanitized, alias).map_err(|e| SshError::ConfigParse {
+        path: ssh_config_path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
     let hostname = cfg.host().to_string();
     let user = cfg.user();
     let port = cfg.port();
-    let identity_files = cfg.host_config.identity_file.unwrap_or_default();
+    // russh-config gives us `Vec<PathBuf>` with tilde already expanded
+    // — convert to display strings for the wire shape.
+    let identity_files = cfg
+        .host_config
+        .identity_file
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect();
     let proxy_jump = cfg.host_config.proxy_jump;
     Ok(HostEntry {
         alias: alias.to_string(),
@@ -268,6 +300,24 @@ fn parse_one_alias(ssh_config_path: &Path, alias: &str) -> Result<HostEntry, Ssh
         identity_files,
         proxy_jump,
     })
+}
+
+/// Remove `Include` directives from ssh_config text. Preserves
+/// everything else verbatim, including leading whitespace and comments.
+/// ssh_config's `Include` keyword is case-insensitive per the man page.
+fn strip_include_directives(raw: &str) -> String {
+    raw.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                return true;
+            }
+            // First token case-insensitive `include`?
+            let first = trimmed.split_whitespace().next().unwrap_or("");
+            !first.eq_ignore_ascii_case("include")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn current_user() -> String {
@@ -409,6 +459,34 @@ port = 5432
     }
 
     #[test]
+    fn tepegoz_config_expands_tilde_in_identity_file() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            &dir,
+            "tepegoz.toml",
+            r#"
+[[ssh.hosts]]
+alias = "with-tilde"
+hostname = "10.0.0.7"
+identity_file = "~/.ssh/id_ed25519_test"
+"#,
+        );
+        let hosts = parse_tepegoz_config(&path).unwrap();
+        assert_eq!(hosts.len(), 1);
+        let idf = &hosts[0].identity_files[0];
+        assert!(
+            !idf.starts_with("~"),
+            "tilde should have been expanded, got {idf:?}"
+        );
+        if let Some(home) = dirs::home_dir() {
+            assert!(
+                idf.starts_with(home.display().to_string().as_str()),
+                "expanded path should start with home dir: {idf:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tepegoz_config_empty_ssh_section_is_not_an_error() {
         let dir = TempDir::new().unwrap();
         let path = write_file(&dir, "tepegoz.toml", "# no ssh section\n");
@@ -427,6 +505,47 @@ port = 5432
             }
             other => panic!("expected TepegozConfig error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn include_directive_is_not_followed_phase_5_limitation() {
+        // `russh-config` (and consequently our manual Host-line walk)
+        // does NOT follow `Include` directives. Pin the limitation so
+        // OPERATIONS.md's Phase-5-limitation note stays accurate: any
+        // alias defined only in an Include'd file is invisible.
+        //
+        // If a future russh-config or replacement parser gains Include
+        // support, this test starts failing and OPERATIONS gets updated
+        // in the same change.
+        let dir = TempDir::new().unwrap();
+        let included_path = write_file(
+            &dir,
+            "included.conf",
+            "Host only-in-included\n\tHostname included.box\n",
+        );
+        let main_path = write_file(
+            &dir,
+            "config",
+            &format!(
+                "Include {}\n\
+                 \n\
+                 Host only-in-main\n\
+                 \tHostname main.box\n",
+                included_path.display()
+            ),
+        );
+        let hosts = parse_all_ssh_config(&main_path).unwrap();
+        let aliases: Vec<_> = hosts.iter().map(|h| h.alias.as_str()).collect();
+        assert!(
+            aliases.contains(&"only-in-main"),
+            "host defined in the main file should be resolved"
+        );
+        assert!(
+            !aliases.contains(&"only-in-included"),
+            "Include'd host should NOT be resolved — Phase 5 limitation. \
+             If this starts failing, russh-config grew Include support; \
+             update OPERATIONS.md in the same commit."
+        );
     }
 
     #[test]

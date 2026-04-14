@@ -141,10 +141,7 @@ impl TileLayout {
             },
             TileDef {
                 id: TileId::Fleet,
-                kind: TileKind::Placeholder {
-                    label: "SSH Fleet — Phase 5".to_string(),
-                    eta_phase: 5,
-                },
+                kind: TileKind::Scope(ScopeKind::Fleet),
                 rect: fleet_rect,
             },
             TileDef {
@@ -417,7 +414,11 @@ mod tests {
             Some(ScopeKind::Ports),
             "Phase 4 Slice 4c replaced the Ports placeholder with a real scope"
         );
+        assert_eq!(
+            layout.routes_to_scope(TileId::Fleet),
+            Some(ScopeKind::Fleet),
+            "Phase 5 Slice 5b replaced the Fleet placeholder with a real scope"
+        );
         assert_eq!(layout.routes_to_scope(TileId::Pty), None);
-        assert_eq!(layout.routes_to_scope(TileId::Fleet), None);
     }
 }

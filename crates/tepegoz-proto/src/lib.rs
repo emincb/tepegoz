@@ -37,7 +37,7 @@ pub mod socket;
 ///   "not-yet-measured" from "idle". `start_time_unix_secs` pairs with
 ///   `pid` to form a stable identity for selection persistence under pid
 ///   reuse.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Identifier for a pty pane owned by the daemon.
 pub type PaneId = u64;
@@ -161,6 +161,15 @@ pub enum Subscription {
     Processes {
         id: u64,
     },
+    /// Subscribe to SSH fleet events: per-host state transitions plus an
+    /// initial `HostList`. Phase 5 Slice 5b ships the discovery + tile
+    /// wiring; Slice 5c ships the per-host connection supervisor that
+    /// actually drives the state machine. Between the two, every host
+    /// remains `HostState::Disconnected` — same degrade-gracefully shape
+    /// as Phase 3's `DockerUnavailable`.
+    Fleet {
+        id: u64,
+    },
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
@@ -253,6 +262,25 @@ pub enum Event {
     /// once the probe succeeds again.
     ProcessesUnavailable {
         reason: String,
+    },
+    /// Full list of configured SSH hosts. Delivered once at subscribe
+    /// time; further changes (e.g. user edits ssh_config live) are out
+    /// of scope for v1. The `source` string labels which precedence
+    /// layer produced this list — rendered in the Fleet-tile footer
+    /// when it's an override (tepegoz config.toml or env), hidden when
+    /// the source is the user's ssh_config.
+    HostList {
+        hosts: Vec<HostEntry>,
+        source: String,
+    },
+    /// A single host's connection state changed. Delivered under a
+    /// `Fleet` subscription. 5b emits one `HostStateChanged { state:
+    /// Disconnected }` per host right after the initial `HostList` —
+    /// 5c replaces that with real connection-supervisor transitions
+    /// through Connecting → Connected → Degraded → Disconnected.
+    HostStateChanged {
+        alias: String,
+        state: HostState,
     },
 }
 
@@ -485,4 +513,66 @@ pub struct ProbeProcess {
     /// was unreadable). TUI renders partial rows with a visual cue so the
     /// user knows to elevate for the full view.
     pub partial: bool,
+}
+
+/// A single configured SSH host. Produced by `tepegoz-ssh`'s host
+/// discovery (ssh_config / tepegoz config.toml / env) and delivered to
+/// clients via `Event::HostList`.
+///
+/// `identity_files` carries display strings rather than `PathBuf` so the
+/// wire shape stays stable across OSes (rkyv doesn't archive `PathBuf`
+/// natively) and so the user can eyeball the list in `tepegoz doctor
+/// --ssh-hosts`. The consuming side maps each entry through `PathBuf`
+/// just before calling `load_secret_key`.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    /// Lookup alias — `tepegoz connect <alias>` and the Fleet tile use this.
+    pub alias: String,
+    /// DNS name or IP literally dialed.
+    pub hostname: String,
+    /// Remote user — resolved from `User` in ssh_config or the current
+    /// username when unset.
+    pub user: String,
+    /// TCP port. Defaults to 22.
+    pub port: u16,
+    /// `IdentityFile` entries in ssh_config declaration order. Empty
+    /// when the host relies solely on an SSH agent.
+    pub identity_files: Vec<String>,
+    /// `ProxyJump` alias (if set). Carried forward unused in Phase 5 —
+    /// the daemon surfaces a clear "ProxyJump not supported in v1" error
+    /// when a host with this field set is actually dialed (Slice 5c).
+    pub proxy_jump: Option<String>,
+}
+
+/// Per-host connection state. Rendered in the Fleet tile as a marker
+/// glyph (● / ◐ / ○ / ⚠). Phase 5 Slice 5b emits only `Disconnected`
+/// (no connections are made yet); 5c drives the full state machine.
+/// Phase 6 adds `AgentNotDeployed` and `AgentVersionMismatch`.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostState {
+    /// Not connected. Initial state; also the idle state after clean
+    /// disconnect. Rendered as ○ gray.
+    Disconnected,
+    /// Dialing / key-exchanging / authenticating. Rendered as ◐ yellow.
+    Connecting,
+    /// Connected, heartbeat fresh. Rendered as ● green.
+    Connected,
+    /// Connected but heartbeat is late. Transient — one more missed
+    /// tick transitions to `Disconnected` and schedules a reconnect.
+    /// Rendered as ◐ yellow.
+    Degraded,
+    /// Authentication failed. Terminal state: no auto-reconnect; the
+    /// user must fix the auth issue and trigger `Ctrl-b r` on the
+    /// Fleet row. Rendered as ⚠ red.
+    AuthFailed,
+    /// Host-key TOFU rejected the presented key. Terminal state: user
+    /// must `tepegoz doctor --ssh-forget <alias>` after verifying the
+    /// key change is legitimate. Rendered as ⚠ red.
+    HostKeyMismatch,
+    /// (Phase 6) Agent binary not yet deployed to the remote host.
+    /// Rendered as ⚠ red.
+    AgentNotDeployed,
+    /// (Phase 6) Agent protocol version doesn't match controller's.
+    /// Rendered as ⚠ red.
+    AgentVersionMismatch,
 }

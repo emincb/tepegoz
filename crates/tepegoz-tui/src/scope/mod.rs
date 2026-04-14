@@ -8,5 +8,6 @@
 //! render tests AND drawn into a tile sub-`Rect` at runtime.
 
 pub(crate) mod docker;
+pub(crate) mod fleet;
 pub(crate) mod placeholder;
 pub(crate) mod ports;

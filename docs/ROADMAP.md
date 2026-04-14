@@ -399,21 +399,50 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 
 ---
 
-## Phase 5 — SSH transport + remote pty · ⚪
+## Phase 5 — SSH transport + remote pty · 🟠 (5a + 5b landed)
 
 **Goal.** `tepegoz connect user@host` opens a remote pty pane — same UX as local.
 
-**Scope.**
-- `tepegoz-ssh`: `russh` client with channel multiplexing. Host key TOFU (trust on first use) with warn on change.
-- Wire protocol extension: pty commands/events gain a `host` qualifier (or the daemon tracks per-connection host association).
-- Daemon: per-host connection pool; persistent channel carries protocol frames.
-- TUI: host:pane identification in the UI.
+Proposal pass signed off 2026-04-14: Q1 ssh concrete + trait-in-Phase-10; Q2 ssh_config + overrides (config.toml + env) with first-non-empty-wins + `tepegoz doctor --ssh-hosts` diagnostic; Q3 russh-direct in Phase 5, agent-backed in Phase 6; Q4 SSH_AUTH_SOCK + IdentityFile (NOT layered under Decision #2); **Q5 tab-strip inside PTY tile** (option b per README mockup — "all activity visible" is the product promise, one line of chrome is the point); Q6 four-state markers (`●`/`◐`/`○`/`⚠`) + state machine + Ctrl-b r recovery; Q7 five sub-slices.
 
-**Acceptance.** Integration test with a test SSH server (via testcontainers or similar): open remote pane, send input, read output, disconnect, reattach, verify scrollback.
+### Slice 5a — `tepegoz-ssh` crate: connect + auth + TOFU + ssh_config · ✅ (`2b54d2e`)
 
-**Not in scope.** QUIC (Phase 10). Multi-host agent coordination (Phase 6).
+**Delivered.**
+- `tepegoz-ssh` crate with concrete API (no trait abstraction — that's Phase 10): `HostList::discover()`, `connect_host(alias, &HostList, &KnownHostsStore)`, `open_session(&SshSession)`. Auth chain via `$SSH_AUTH_SOCK` → `IdentityFile` from ssh_config; russh errors surfaced verbatim including `KeyIsEncrypted` for passphrase-protected keys with no agent.
+- Host-key TOFU against `data_dir/tepegoz/known_hosts` (Linux `$XDG_DATA_HOME`, macOS `~/Library/Application Support`). OpenSSH-compatible format; never touches `~/.ssh/known_hosts`. First contact auto-trusts; mismatch rejects with `SshError::HostKeyMismatch { path, line }`.
+- ssh_config parser via `russh-config` (hybrid: manual `Host`-line walk collects concrete aliases, then per-alias resolution through russh-config's standard ssh_config(5) merge rules).
+- Tests: 14 cross-OS lib tests (config + known_hosts) + 1 opt-in integration against testcontainer openssh-server on `TEPEGOZ_SSH_TEST=1`.
+- `docs/ARCHITECTURE.md §8` gains "SSH auth" + "SSH host-key TOFU" bullets distinguishing from Decision #2 (at-rest root key) and Phase 6 (agent binary TOFU).
 
-**Risks.** Pure-SSH latency may feel sluggish for live telemetry; QUIC in Phase 10 is the relief valve. Acceptable for Phase 5 since the killer app here is remote pty.
+### Slice 5b — Host discovery + Fleet tile + `doctor --ssh-hosts` · ✅ (`<5b commit>`)
+
+**Delivered.**
+- Wire protocol bumped to **v7**. New subscription `Subscription::Fleet { id }`. New events `Event::HostList { hosts: Vec<HostEntry>, source }` and `Event::HostStateChanged { alias, state }`. `HostEntry` moved from `tepegoz-ssh` to `tepegoz-proto` as the shared wire type (re-exported from `tepegoz-ssh`); `identity_files: Vec<String>` (not `Vec<PathBuf>`) so rkyv round-trips cleanly. `HostState` enum carries Q6's four user-visible states (`Disconnected`/`Connecting`/`Connected`/`Degraded` + the `⚠` terminal states `AuthFailed`/`HostKeyMismatch`) plus Phase 6's `AgentNotDeployed`/`AgentVersionMismatch` additive states.
+- `tepegoz-core::client` gains `fleet_subs: HashMap<u64, AbortHandle>` alongside the existing pane / docker / ports / processes subscription maps — uniformity preserved per the Phase 3 contract. `forward_fleet` task runs `HostList::discover()` on `spawn_blocking`, emits one `HostList` snapshot, emits one `HostStateChanged { Disconnected }` per host, then parks until cancelled. 5c's connection supervisor replaces the park with the real state machine.
+- TUI `ScopeKind::Fleet` replaces the 5-phase placeholder. `FleetScope` hosts `FleetScopeState::{Connecting, Available { hosts, states, source }}` (no `Unavailable` variant — discovery failure emits empty `HostList` + error-labeled source). Per-host state map stays stable across refreshes. Selection persistence via `FleetKey(alias)`. Filter matches alias / hostname / user. Help bar advertises `[j/k] nav · [/] filter · Ctrl-b h/j/k/l focus`.
+- Fleet tile renderer (`scope::fleet::render`) draws four-glyph state markers per Q6 (`●` Connected / `◐` Connecting+Degraded / `○` Disconnected / `⚠` AuthFailed+HostKeyMismatch+agent errors). "procs" column renders as em-dash placeholder — Phase 6 fills it with real values, no one-shot SSH probe workaround (per user sign-off "em-dash is honest; don't stand up scope creep dressed as polish"). Footer shows resolved source label when it's an override; hidden when ssh_config.
+- `tepegoz doctor --ssh-hosts` CLI dumps the resolved host list + source label, mirrors `--claude-layout`'s shape.
+- Slice 5a follow-ups folded: (#2) `~` expansion in tepegoz config.toml `identity_file` strings; (#3) `known_hosts` file mode set to `0600` after trust writes, matching OpenSSH convention; (#4) agent certificate identities skipped with explicit "N certificate identity(ies) skipped (not supported in Phase 5)" entry in `AuthFailed.reason`; (#5) Include-directive behavior pinned by test — `russh-config` raises `HostNotFound` on `Include` lines, mitigated by pre-stripping Includes before parsing (top-level hosts still resolve; Include'd hosts are documented as a Phase 5 limitation in OPERATIONS).
+- `docs/OPERATIONS.md` gains an "SSH Fleet discovery (Phase 5 Slice 5b)" section: precedence + config.toml schema + `tepegoz doctor --ssh-hosts` usage + documented Phase 5 limitations + host-key TOFU explanation.
+- Tests: 3 new proto codec roundtrips (`subscribe_fleet`, `host_list_event_roundtrip_preserves_all_fields`, `host_state_changed_event_roundtrip_covers_all_variants`); 3 new `tepegoz-ssh` lib tests (tilde expansion, Include-directive limitation pin, known_hosts 0600 mode); 8 new TUI render tests in `scope::fleet` (three-state lifecycle, selection marker, four-glyph state rendering, empty-list hints, filter/help-bar swaps, em-dash procs column); 1 new default integration test `fleet_scope.rs` (subscribe → HostList + Disconnected-per-host within a 15 s budget). 241 total on macOS (was 226 post-5a).
+
+**5b-to-5c gap** (explicit — not a bug): Fleet renders `all Disconnected` between this slice and 5c's merge because the connection supervisor isn't up yet. Same degrade-gracefully shape as Phase 3's `DockerUnavailable`. 5c replaces the parked `forward_fleet` task body with real state transitions.
+
+### Slice 5c — Per-host connection supervisor + heartbeat + reconnect · ⚪
+
+Upcoming. Daemon-side per-host `tokio::task` with state machine; `keepalive@openssh.com` heartbeat (30 s; three misses → Degraded → Disconnected); exponential backoff (1/2/5/15/60 s cap); `Payload::FleetAction { alias, kind: Reconnect|Disconnect }`; `FleetActionResult`; ProxyJump detection surfaces `SshError::ConnectFailed { reason: "ProxyJump not supported in v1" }` (follow-up #1 from 5a review).
+
+### Slice 5d — Remote pty open + pane-stack + `tepegoz connect <alias>` · ⚪
+
+Upcoming. `OpenPane` grows `target: PaneTarget::{Local, Remote { alias }}` (wire v8); daemon `RemotePane` wraps an SSH channel with `request_pty` + `request_shell`; TUI pane-stack lands (Q5's tab strip inside the PTY tile — `[N label*]` format + desaturation for inactive; `Ctrl-b 0..9`/`n`/`p`/`&`/`w`); `tepegoz connect <alias>` CLI subcommand.
+
+### Slice 5e — Error surfaces + disconnect recovery + e2e manual demo · ⚪
+
+Upcoming. Inline "`— ssh connection lost: <reason> —`" marker in the pane scrollback; `⚠` red state rendering with russh-verbatim toast; host-key-change rejection path. Phase 5 close: 8-scenario manual demo.
+
+**Not in scope.** QUIC (Phase 10). Multi-host agent coordination (Phase 6). ProxyJump (v1.1). SSH certificate auth (v1.1). PKCS#11 hardware tokens (v1.1, indirect via ssh-agent).
+
+**Risks.** Pure-SSH latency may feel sluggish for live telemetry; QUIC in Phase 10 is the relief valve. Acceptable for Phase 5 since the killer app here is remote pty. Phase-5-era remote-pane session-persistence gap (dropped SSH kills pane) is documented limitation — Phase 6's agent-backed remote pty fixes it without changing wire protocol.
 
 ---
 

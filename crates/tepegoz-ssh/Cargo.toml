@@ -13,6 +13,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+tepegoz-proto = { workspace = true }
 
 # SSH client + ssh_config parsing. `russh-config` is authored alongside
 # russh so versioning tracks cleanly; `ssh2-config` is the alternative
