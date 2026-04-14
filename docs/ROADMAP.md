@@ -302,7 +302,7 @@ Users retain `docker exec -it <container> sh` in their local pty tile as the v1 
 
 ---
 
-## Phase 4 — Ports + processes panels (local) · 🟠 (all 4 sub-slices landed; 8-scenario user demo pending)
+## Phase 4 — Ports + processes panels (local) · ✅ (2026-04-14)
 
 Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-state within the Ports tile (lowercase `p` toggles between Ports and Processes views) rather than a new Decision #7 tile — solves the "processes without a bound port" flow while respecting the god-view layout; (Q2) probe uses the cross-OS `netstat2` wrapper (procfs on Linux, libproc on macOS) plus `sysinfo` for pid → process name; (Q3) daemon-side correlation so clients stay dumb; (Q4) 2 s refresh cadence matching Docker; (Q5) 4 sub-slices.
 
@@ -377,7 +377,7 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 
 **Gate.** CI green on macOS + ubuntu-latest, then CTO review before 4d.
 
-### Slice 4d — Phase 4 e2e + manual demo script · 🟡 (`<4d commit>`)
+### Slice 4d — Phase 4 e2e + manual demo script · ✅ (`d202edf`, `bee6aba`, `77aa9ca`, _close commit_)
 
 **Delivered.**
 - **Combined E2E integration test** at `crates/tepegoz-core/tests/ports_processes_e2e.rs`:

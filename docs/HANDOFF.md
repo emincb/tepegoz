@@ -16,82 +16,87 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## CTO section
 
-**Last updated:** 2026-04-14, post-Phase-3-close + Slice-D-deferred. Phase 4 proposal pass in flight.
+**Last updated:** 2026-04-14, post-Phase-4-close. Phase 5 proposal pass is the next gate. **This HANDOFF was updated immediately before a CTO context clear — fresh CTO is reading cold.**
 
 ### What I just signed off on
-- **Phase 3 closed** (`8984456`). Docker scope panel ships end-to-end — daemon-side container list + lifecycle actions + logs/stats streaming; client-side tiled god view + action keybinds + confirm modal + toast overlay + logs sub-state. 165 tests green. User's 9-scenario manual demo all passed; scenario 9 (tile-sized logs sanity, advisory) not flagged.
-- **Slice D (`DockerExec`) deferred to v1.1** per user sign-off. Decisive reason: Docker's exec API ends the exec session when the hijacked connection closes — there's no server-side session persistence — so `DockerExec` can't preserve Phase 2's detach/reattach invariant without a custom in-container agent, out of scope for v1. Secondary reason: the "scope view triggers new pane" pattern generalizes to Phase 5 (SSH Fleet → remote pty) and Phase 6 (remote Docker → exec). Designing the mechanism for DockerExec in isolation would lock in a shape that may not fit. Escape hatch: users retain `docker exec -it <container> sh` in the local pty tile.
+- **Phase 4 closed.** User signed off on the 8-scenario manual demo (with navigation-discoverability clarification noted — `h/j/k/l` horizontal+vertical, not just vertical). Ports + Processes scopes ship end-to-end: cross-OS probe abstraction (netstat2 + sysinfo + procfs/libproc), daemon-side port→process→container correlation, Ports tile with Processes toggle. 220 tests on ubuntu / 211 on macOS.
+- **Wire-desync root cause + fix** (`77aa9ca`). `tokio::AsyncReadExt::read_exact` is NOT cancellation-safe. The TUI's main-loop `select!` was calling `read_envelope` directly alongside stdin/winch/tick branches; when another branch fired mid-`read_exact`, kernel socket position advanced but userspace bytes were lost → next read desynced. Fix: dedicated `spawn_reader_task` mirroring the daemon-side writer pattern; main loop reads from `mpsc::UnboundedReceiver<Result<Envelope, anyhow::Error>>` (cancellation-safe). Regression test in default suite (`stdin_pressure_does_not_desync_large_envelopes`). Engineer verified both CI-green AND the original production trigger (`yes | tui`).
+- **Phase 3 closed** (`8984456`). Docker scope panel end-to-end.
+- **Slice D (`DockerExec`) deferred to v1.1** per user sign-off. Decisive reason: Docker's exec API ends the exec session when the hijacked connection closes — can't preserve Phase 2's detach/reattach invariant without a custom in-container agent. Secondary: the "scope → new pane" pattern generalizes to Phases 5/6 and should be designed there, not for DockerExec alone.
 
 ### What's in flight with the engineer
-- **Phase 4 proposal pass.** Ports + Processes panels. I directed 5 specific questions in proposal-pass format (same discipline as Slice C1.5). Engineer is preparing the proposal; no code yet.
-- The five questions, in priority order: (1) where does "Processes" live in the tiled layout — drilldown inside Ports tile, toggle-mode within Ports tile, or daemon-only (no v1 UI)? Decision #7 doesn't reserve a Processes tile; a new tile would require amending Decision #7; (2) data source + platform matrix — `/proc/net/*` vs `procfs` vs `socket2` on Linux; `lsof` vs `libproc` on macOS; (3) port → process → container correlation daemon-side or client-side; (4) refresh cadence; (5) sub-slicing.
+
+Three things queued, in strict order:
+
+1. **Phase 4 close commit.** `docs/STATUS.md` row 4 → ✅, ROADMAP Phase 4 → ✅ (2026-04-14), HANDOFF updates, + the "Help overlay for focus navigation keybinds" polish candidate in STATUS.md (user hit horizontal-vs-vertical discoverability during demo scenario 3). Close-commit text in the relay message before this clear. Engineer lands next.
+2. **Diagnostic tracing cleanup commit.** Strip high-cardinality envelope-write debug logs from `bee6aba`. Keep: `payload_variant` helper; read-side hex-dump on length-prefix-bail; the `debug_assert_eq!(bytes.len(), ...)` assertion that falsified the AlignedVec hypothesis. Separate commit, after Phase 4 close.
+3. **Phase 5 proposal pass.** Seven questions issued in the relay before this clear. No code until proposal is signed off. Phase 5 is the most architecturally novel phase to date.
 
 ### What I'm expecting next
-- **Engineer's Phase 4 proposal ping** (no code, answers to the five questions). I review, sign off or push back, escalate to user if anything requires Decision #7 amendment.
-- **Then Phase 4 sub-slices** per the engineer's proposed slicing (rough sketch in my direction: 4a daemon-side Ports probe + `Subscribe(Ports)`, 4b Ports tile renderer + subscribe-on-startup, 4c port→container correlation, 4d Processes per Q1's answer, 4e end-to-end test + manual demo).
-- **User manual demo** gates Phase 4 close, same shape as C1.5c and C3.
+
+- Engineer's ping on Phase 4 close commit (trivial, doc-only).
+- Engineer's ping on diagnostic tracing cleanup (trivial, scoped strip).
+- **Engineer's Phase 5 proposal ping — the substantive one.** Seven questions: (Q1) crate structure `tepegoz-ssh` vs. `tepegoz-transport` trait-now-or-later; (Q2) host discovery / `~/.ssh/config` / first-run UX; (Q3) remote pty lifecycle daemon-side-tunneled vs. remote-side-via-agent; (Q4) auth model SSH agent vs. explicit keys vs. layered like Decision #2; (Q5) **the big call — "scope → new pane" mechanism** (candidate a: replace-primary + stashed-original; b: tab-strip within pty tile; c: amend Decision #7 for new tile kind); (Q6) connection lifecycle + error UX; (Q7) sub-slicing proposal.
+- On Q5: if engineer proposes (c) amending Decision #7, escalate to user sign-off BEFORE accepting. That's a locked-decision amendment.
+- Phase 5 sub-slices per engineer's proposed slicing. User manual demo gates close, same shape as Phases 3 and 4.
 
 ### Open questions I'm holding (not yet in DECISIONS.md)
 
-- **Processes tile placement.** Decision #7 locks five tiles (PTY, Docker, Ports, Fleet, Claude Code) — no Processes tile. Phase 4's name includes Processes. Engineer's proposal must pick a placement approach; if it's "add a 6th tile," that's a Decision #7 amendment requiring user sign-off.
-- **Phase 5 (SSH transport + remote pty)** is the next phase after Phase 4. It's also the forcing function for the "scope → new pane" mechanism that Slice D deferred on. Design pass for that mechanism likely lands at Phase 5's proposal pass rather than before.
-- **Phase 3 polish candidates** (tracked in `docs/STATUS.md`): (1) bounded `tail_lines` default (`1000` instead of `0` with a "load more" affordance); (2) logs-tile zoom / temporary full-scope-row expansion if cramped; (3) color palette revisit if stderr-yellow or stdout-gray has readability issues on some themes. None blocking; pick up when signal says so.
-- **OSC 0 title refresh on focus change** was left stubbed in C1.5b (`AppAction::FocusTile(TileId)` only debug-logs). Candidate future use: update `tepegoz · [PTY]` / `[Docker]` / etc. when focus moves. Don't force it; land if it genuinely helps the user distinguish focus externally.
+- **Phase 5 "scope → new pane" is the load-bearing call.** It locks the pattern for Phase 6 (remote Docker → exec into remote container) AND for v1.1 Slice D (DockerExec) when it reopens. Get it right once. My prior: option (a) replace-primary-with-stashed-original is cleanest — matches tmux's mental model, doesn't add chrome, doesn't amend Decision #7. But I'm not committing that view; engineer's proposal should earn the call.
+- **Phase 4 polish candidates** tracked in `docs/STATUS.md`:
+  1. Help overlay for focus nav (`Ctrl-b ?` already reserved, rendered no-op since C1.5b). User hit discoverability issue; worth landing as an early v1.1 polish item or in any Phase 5-adjacent TUI work.
+  2. Phase 3 carryovers: bounded `tail_lines` default (1000 with "load more"); logs-tile zoom if cramped; color palette feedback revisit.
+- **OSC 0 title refresh on focus change** still stubbed (`AppAction::FocusTile(TileId)` → debug log). More useful now that 5 tiles exist and focus ambiguity is more common.
+- **Phase 3's `tail_lines: 0 = all history` wire semantic** remains Slice B's contract; changing it is a compatible additive (daemon honors any value; client can send `1000` instead of `0`).
 
 ### Observations about engineer patterns (load-bearing for future direction)
 
-- Highly disciplined at diagnose-before-fixing. At C2 gate they caught a real daemon bug (pane_subs leak) while trying to build the vim-preservation test — refused to ship a test that didn't exercise the real mechanism, which surfaced an invisible zombie-task leak that would have shown up as "daemon feels slow" weeks later.
-- Strong commit hygiene: messages capture *why* and blast-radius, not just *what*. Commit messages for `43b28eb`, `c7b336d`, and `4dd1208` are good reference models.
-- Good at salvage logic during pivots: during the C1.5 tiling correction, explicitly called out what survives from C1/C2 and what goes, updated docs in the same commit as the pivot. Minimal rework churn.
-- Executes cross-OS CI discipline (two-OS green on every push) without me asking. Caught the `printf \x1b` vs `\033` POSIX gotcha via CI, not local-only testing.
-- Volunteers judgment calls at the right level: flags 3–5 tactical decisions per slice for review, doesn't flag every naming choice. Matches the `feedback_implementation_autonomy` model.
-- Adopted defensive testing patterns without prompting: `push_toast_at(now, ...)` for time-travel-in-tests, 2-second sleep for status-counter-advance in restart round-trip, SIGSTOP-dockerd for timeout demo. Recognizes when a test would otherwise be flaky or misleading and fixes the test design, not just the assertion.
+- **Diagnostic discipline operates at its best when a bug is hard to narrow down.** Reference execution: Phase 4 wire-desync at `77aa9ca`. Shipped tracing in isolated commit (`bee6aba`), reproduced with targeted trigger (`yes | tui`), *falsified* a plausible hypothesis with an assertion (`debug_assert_eq` ruled out `AlignedVec` padding), identified actual root cause from byte-level log evidence, proposed minimal well-reasoned fix with symmetry argument, wrote regression test in default suite. This is the reference model.
+- **Verifies fixes against the original production trigger, not just CI green.** Phase 4 fix: ran `yes | tui` for 20s alarm window on the fixed binary before declaring done. "Tests pass" and "bug fixed" are different claims; engineer checks both.
+- **Catches real daemon bugs while trying to build tests.** C2 gate (`43b28eb`): discovered `pane_subs` leak because they refused to ship a vim-preservation test that didn't exercise the real `Unsubscribe` path.
+- **Strong commit hygiene.** Messages capture *why* and blast-radius. Reference models: `43b28eb`, `c7b336d`, `4dd1208`, `77aa9ca`.
+- **Good at salvage logic during pivots.** C1.5 tiling correction: explicitly enumerated what survives from C1/C2 and what gets deleted; updated docs in the same commit as the pivot.
+- **Cross-OS CI discipline without prompting.** Caught the `printf \x1b` vs. `\033` POSIX gotcha via CI, not local-only testing. Platform divergence catches ship on every push.
+- **Volunteers judgment calls at the right level.** Flags 3-5 tactical decisions per slice for review, doesn't flag naming noise. Matches `feedback_implementation_autonomy` model.
+- **Adopts defensive testing patterns unprompted.** Examples: `push_toast_at(now, ...)` for time-travel tests; 2s sleep for status-counter-advance in restart round-trip; SIGSTOP-dockerd for timeout demo; python3 child + stdout-handshake for Phase 4 e2e (eliminates port-collision + bind-race flakes); `kill_on_drop(true)` instead of hand-rolled `ChildGuard`.
+- **One watch-item:** occasionally needs the generalization-to-future-phases prompt. Examples where engineer's reasoning covered it (Slice D defer, desync fix class-of-bug), examples where I added it (the netstat2 deviation's Phase 7 implications). When signing off on deviations, explicitly ask "what does this lock for Phase N+1?"
 
 ### Standing context (if you're the fresh CTO reading cold)
 
-- You are the CTO / planner / architect on this project. User promoted you 2026-04-13. You don't write code; the engineer does. Your job is proposal review, architectural sign-off, ordering of work, and flagging product-level drift.
-- The user relays between two Claude Code sessions (you + engineer). The engineer doesn't see your reasoning, only the directives the user relays. Write the engineer-facing messages as self-contained, unambiguous, and ordered — they should pick up cold from the relay.
-- The project's spec hierarchy is `README.md` + mockup first, `docs/DECISIONS.md` second, other `docs/` third. Check README before signing off on UX proposals (see memory: `feedback_cross_check_vision_before_signoff.md`).
-- Six locked architectural decisions in `docs/DECISIONS.md`; changing any of those requires user sign-off. #7 (tiled god view) was added 2026-04-14.
-- Working memory: `~/.claude/projects/-Users-emin-Documents-projects-personal/memory/` — `MEMORY.md` is the index.
+- **Your role:** CTO / planner / architect, promoted by user "Emin" on 2026-04-13. You don't write code; the engineer does. Your job: proposal review, architectural sign-off, ordering of work, flagging product-level drift. You can edit `docs/`, `README.md`, and memory files — that's not "code." You cannot touch `crates/` or anything Rust.
+- **Relay pattern:** user mediates between your session and the engineer's session. Engineer doesn't see your internal reasoning, only directives the user relays. Write engineer-facing messages as self-contained, unambiguous, ordered — they pick up cold from the relay. When user says "give me the full message and only the message," lead with the relay text marked for verbatim paste.
+- **Spec hierarchy:** `README.md` + mockup first, `docs/DECISIONS.md` second, `docs/STATUS.md` / `docs/ROADMAP.md` / `docs/ARCHITECTURE.md` / `docs/OPERATIONS.md` / `docs/ISSUES.md` third. Check README before signing off on UX proposals (memory: `feedback_cross_check_vision_before_signoff.md`). The mode-switch-drift in Slice C happened because a previous-me skipped this check.
+- **Seven locked architectural decisions** in `docs/DECISIONS.md`. Changing any requires user sign-off. #7 (tiled god view, opinionated default, vt100 via `vt100` crate) was added 2026-04-14 after the Slice C mode-switch drift.
+- **Session-start ritual** in `CLAUDE.md`: read it + STATUS + ISSUES + HANDOFF, verify git log matches claims, fix stale entries before acting. Don't act on a memory or handoff entry if reality diverges — trust reality, update the docs.
+- **Working memory:** `~/.claude/projects/-Users-emin-Documents-projects-personal/memory/`. `MEMORY.md` is the index. Current entries: user profile, sharpen-before-AI, diagnose-before-fixing, demonstrable-acceptance, implementation-autonomy, durable-project-state, session-boundary-handoff, cross-check-vision-before-signoff, project_tepegoz.
+- **Phases shipped:** 0 (scaffold), 1 (proto + daemon + TUI), 2 (pty multiplex), 3 (Docker scope), 4 (Ports + Processes). Current: Phase 5 proposal pass pending.
+- **Phases deferred:** Slice D (DockerExec) deferred to v1.1 — reopens when Phase 5 crystallizes the "scope → new pane" mechanism.
+- **If the current state of the tree doesn't match this HANDOFF:** trust the tree, update HANDOFF. `git log --oneline -10` + `cat docs/STATUS.md` is the authoritative answer to "where are we?"
 
 ---
 
 ## Engineer section
 
-**Last updated:** 2026-04-14, post-4d-desync-fix. Phase 4 close still pending user's 8-scenario manual demo rerun on the fixed binary.
+**Last updated:** 2026-04-14, post-Phase-4-close. Phase 5 proposal pass is the next gate.
 
 ### Where I left off
 
-Phase 4 Slice 4d shipped but hit a wire desync in the user's first manual demo attempt (~4–6 s in). Diagnosed + fixed in two commits:
+**Phase 4 is closed.** User signed off on all 8 manual-demo scenarios in `docs/OPERATIONS.md` "Slice 4d manual demo prep" against the desync-fix binary. The close commit flipped STATUS row 4 → ✅ (2026-04-14) with the full commit list (4a + 4b + 4c + 4d feat + `bee6aba` diag + `77aa9ca` fix + this close commit), flipped ROADMAP Phase 4 overall marker + Slice 4d header to ✅, refreshed both HANDOFF sections for post-close state, and added a STATUS "Phase 4 polish candidates" section capturing the one item the user flagged during the demo: the reserved `Ctrl-b ?` help overlay needs wiring up to expose the full focus-nav + per-tile keybind set — explicitly noting that `h/j/k/l` moves both horizontally AND vertically, since "just vertically" was the discoverability miss during demo scenario 3.
 
-- `bee6aba` — diagnostic tracing in `tepegoz-proto::codec` + `tepegoz-core::client::spawn_writer_task`. No fix, just instrumentation. Falsified the AlignedVec-padding hypothesis (daemon writes exactly `bytes.len()` bytes per envelope; the `debug_assert_eq!(slice.len(), bytes.len())` never fired across 50+ envelope writes).
-- `<fix commit>` — real fix. Root cause: `tokio::AsyncReadExt::read_exact` is not cancellation-safe, and the TUI's main-loop `tokio::select!` was calling it directly. When any other branch (stdin / winch / tick) fired while `read_envelope` was mid-read, the pending future got cancelled; the kernel socket position had advanced but userspace bytes were lost; the next `read_envelope` iteration read from mid-payload and treated process-table data as a length prefix. Fix: `spawn_reader_task` function mirroring `spawn_writer_task` — a dedicated reader task loops `read_envelope` and forwards envelopes through an `mpsc::UnboundedSender<Result<Envelope, anyhow::Error>>`. Main-loop `select!` now polls `mpsc::Receiver::recv()` which IS cancellation-safe (pending items stay buffered if the branch is cancelled). Reader spawned at the AppRuntime::new transition from sequential startup (handshake + ensure_pane, which don't need the fix) to concurrent event loop. Both the reader + writer tasks abort on AppRuntime::drop.
-
-Reproduction: real-TUI under `yes | tui` stdin pressure reliably triggered the desync in <1 s pre-fix; post-fix, same harness ran for 20 s with zero desync messages and clean "early eof" shutdown.
-
-Regression test: `crates/tepegoz-tui/src/session.rs::tests::stdin_pressure_does_not_desync_large_envelopes` (default cargo test, not opt-in). Uses `tokio::net::UnixStream::pair` + 25 large ProcessList envelopes (500 rows each, ~100 KB per, multi-poll-sized) concurrent with `tokio::io::repeat(b'y')` driving stdin-pressure + 33 ms tick. Asserts all 25 envelopes arrive intact with full row counts. Passes on fixed code; would fail on reverted pre-fix code.
-
-Phase 4 sub-slices 4a + 4b + 4c + 4d remain valid; details in `docs/ROADMAP.md` per-slice sections. The 4d desync was a TUI-side cancellation-safety bug in pre-existing code (Phase 2-era read_envelope-in-select!), not a Phase 4 regression per se — Phase 4's large ProcessList payloads just pushed reads into the multi-poll regime where the bug manifested.
-
-4d covers:
-- Combined E2E integration test `crates/tepegoz-core/tests/ports_processes_e2e.rs` with two opt-in cases. Main: spawn python3 child binding a TCP port, wait for the child's readiness handshake (port printed to stdout + flushed), subscribe to BOTH Ports + Processes, assert child appears in both within 6 s, kill child, assert disappears from both within 6 s. Bonus: gated on `TEPEGOZ_PROBE_TEST=1 + TEPEGOZ_DOCKER_TEST=1`, starts a `docker run -d -p <port>:80 alpine sleep 120`, subscribes to Ports, asserts the row carries `container: Some(<id>)` within 6 s. Pins the README mockup's distinguishing `:3000 web (docker)` feature — most likely to silently regress since it spans three subsystems. Confirmed locally against Docker Desktop.
-- 8-scenario manual demo in `docs/OPERATIONS.md` "Slice 4d manual demo prep". Scenarios 1–6 are the 6 staked out in the CTO's 4c sign-off; 7 (`UDP coming v1.1` footer hint legibility at 120×40) and 8 (second-sample CPU% transition from em-dash to number) are 4c-deliverable eyeball confirmations that the integration tests can't fully exercise. Unlike C3's 1–8-gate + 9-advisory split, all 8 here are the gate — they pin the 4c invariants plus the Phase 4 overall "scopes degrade gracefully under Docker outage" story.
-- `tokio::process::Command::kill_on_drop(true)` handles the child-leak problem without a hand-rolled ChildGuard struct. Sync `DockerContainerGuard` Drop impl handles the container.
+**Wire desync class-of-bug** (`77aa9ca`). `tokio::AsyncReadExt::read_exact` is NOT cancellation-safe. Main-loop `select!` was calling `read_envelope` directly alongside stdin / winch / tick — any competing branch firing mid-`read_exact` silently corrupted the reader. Fix: `spawn_reader_task` mirroring the daemon's writer pattern, funneling envelopes through a cancellation-safe mpsc. Regression pinned in the default suite (`session::tests::stdin_pressure_does_not_desync_large_envelopes`). Production trigger (`yes | tui`) verified clean over a 20 s alarm window on the fixed binary — "tests pass" and "bug fixed" confirmed separately.
 
 ### What I'm mid-flight on
 
-_Nothing._ Awaiting CTO review of the desync fix + user's 8-scenario manual demo rerun on the fixed binary. Don't start any Phase 5 work until Phase 4 closes via the post-demo close commit.
+_Nothing committed-side._ One commit queued:
 
-Pending cleanup commit (separate, AFTER user demo passes): strip the diagnostic tracing from `bee6aba` that's no longer load-bearing. Per CTO: "Keep any tracing that's still genuinely useful for future debugging; strip what was purely for this investigation." My plan: keep `payload_variant` string helper (useful for any future wire issue); keep the read-side hex-dump of the next 32 bytes on MAX_FRAME_SIZE bail (useful if any future desync surfaces — makes diagnosis 10× faster); strip the `first_four_hex` / per-envelope-write debug log + the running byte counter in spawn_writer_task (high-cardinality noise that was purely for this investigation).
+- **Diagnostic tracing cleanup.** Strip the high-cardinality envelope-write debug logs that `bee6aba` added for the desync investigation. Keep: `payload_variant` string helper in `tepegoz-proto::codec` (useful for any future wire debugging); read-side next-32-bytes hex dump on the length-prefix-bail path (makes any future desync diagnosis 10× faster); `debug_assert_eq!(slice.len(), bytes.len())` assertion that falsified the AlignedVec hypothesis (cheap dev-build invariant check). Strip: `first_four_hex` in `write_envelope` + per-envelope-write debug log + running `bytes_written_total` + per-envelope-seq counter in `tepegoz-core::client::spawn_writer_task`. Separate commit, no bundling.
 
 ### What I'm expecting from the CTO next
 
-- **Review + sign-off on 4d**, or redirect. No deviations from the CTO's 4d directive (matched the scenario list 1–8 exactly; integration test file name + opt-in env var scheme match the instructions).
-- **User runs the 8-scenario manual demo** per `docs/OPERATIONS.md` "Slice 4d manual demo prep" against the standing Docker victim. All 8 are the gate.
-- **On user sign-off:** I land a separate close commit flipping STATUS row 4 to ✅ + ROADMAP Phase 4 marker to ✅ with date + HANDOFF CTO + engineer sections for post-Phase-4-close state (Phase 5 proposal pass pending). Per CTO: close is user-action-triggered, NOT bundled with the 4d feature commit — same shape as Phase 3 close `8984456`.
-- **If any scenario fails:** inline fix commit before the close, same pattern as C1.5c's potential fallback.
-- CI green on both OSes is my own gate; I'll check `gh run` after pushing and ping only once both OSes are confirmed.
+- **Phase 5 proposal-pass direction.** The CTO's 7 questions, in order: (Q1) crate structure — `tepegoz-ssh` as the first concrete impl vs. `tepegoz-transport` trait-now-or-later; (Q2) host discovery + first-run UX — `~/.ssh/config` parsing, explicit host list, or both; (Q3) remote pty lifecycle — daemon-side-tunneled through SSH or remote-side-via-agent (forecasts Phase 6's agent design); (Q4) auth model — SSH agent socket inheritance vs. explicit key paths vs. keychain vs. layered like Decision #2's root-key precedence; (Q5) **the big call — "scope → new pane" mechanism** under Decision #7's fixed layout (three candidates carried forward from Slice D: a) replace primary PTY tile + stash original; b) tab-strip within pty tile; c) amend Decision #7 for new tile kind); (Q6) connection lifecycle + error UX; (Q7) sub-slicing proposal. No code until the proposal is signed off.
+- **Phase 5 inherits to Phase 6 + v1.1 Slice D.** Q5 locks the "scope → new pane" pattern for all three futures (remote pty, remote-Docker exec, DockerExec reopen); Q3's pty-lifecycle answer forecasts Phase 6's agent design. Proposal will call out both forward-compat arguments explicitly.
+- **If Q5's answer requires amending Decision #7** (option c — new tile kind): CTO escalates to user before any code starts. I'll flag this prominently in the proposal if that's where the reasoning lands.
+- **Diagnostic tracing cleanup commit** immediately follows the Phase 4 close commit on this branch; Phase 5 proposal pass starts after the cleanup. CI green on both OSes is my own gate; I check `gh run` after pushing.
 
 ### Anything that would surprise a fresh-me
 
