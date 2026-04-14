@@ -16,26 +16,25 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## CTO section
 
-**Last updated:** 2026-04-14, post-C3c sign-off. User manual demo is the gate. Phase 3 closure pending user's 9-scenario run.
+**Last updated:** 2026-04-14, post-Phase-3-close + Slice-D-deferred. Phase 4 proposal pass in flight.
 
 ### What I just signed off on
-- **C3c integration test + 9-scenario manual demo script.** Commit `4dd1208`. Integration test `restart_propagates_to_follow_up_container_list` at `crates/tepegoz-core/tests/docker_scope.rs` — opt-in `TEPEGOZ_DOCKER_TEST=1`, provisions unique-per-PID alpine, 2s sleep to advance status counter, asserts `DockerActionResult::Success` + follow-up `ContainerList` reflects the restart, force-remove on Drop. 9-scenario manual demo in `docs/OPERATIONS.md:207`. Scenarios 1–8 are the gate for Phase 3; scenario 9 (tile-sized logs sanity) is advisory.
-- **C3a** (`8a9176c`) — `r`/`s`/`K`/`X` keybinds, confirm modal for K/X, pending-action 30s timeout sweep, toast overlay. Push-back on `r|R`/`s|S` aliases (capital-R-as-no-op) landed in C3b's head.
-- **C3b** (`fc5ded4`) — Logs panel as `DockerView::{List, Logs(LogsView)}` sub-state within Docker tile. `l` subscribes; `Esc/q` unsubscribes. Stream-colored (stdout gray, stderr yellow + `!` prefix), CRLF handling, `MAX_LOG_LINES = 10_000` drop-oldest, per-stream pending buffers for split chunks. C3a head cleanup also landed here (capital R no-op, K/X absorption during confirm, strengthened 10s auto-cancel test).
-- **Decision #7 (tiled god view)** locked at C1.5a (`2c54c44`). Six C3 UX clarifications locked before code (logs sub-state not modal; toast positioning/stacking; confirm modal inline; K/X absorption during confirm; capital-discipline rule; `tail_lines: 0` semantics).
+- **Phase 3 closed** (`8984456`). Docker scope panel ships end-to-end — daemon-side container list + lifecycle actions + logs/stats streaming; client-side tiled god view + action keybinds + confirm modal + toast overlay + logs sub-state. 165 tests green. User's 9-scenario manual demo all passed; scenario 9 (tile-sized logs sanity, advisory) not flagged.
+- **Slice D (`DockerExec`) deferred to v1.1** per user sign-off. Decisive reason: Docker's exec API ends the exec session when the hijacked connection closes — there's no server-side session persistence — so `DockerExec` can't preserve Phase 2's detach/reattach invariant without a custom in-container agent, out of scope for v1. Secondary reason: the "scope view triggers new pane" pattern generalizes to Phase 5 (SSH Fleet → remote pty) and Phase 6 (remote Docker → exec). Designing the mechanism for DockerExec in isolation would lock in a shape that may not fit. Escape hatch: users retain `docker exec -it <container> sh` in the local pty tile.
 
 ### What's in flight with the engineer
-_Nothing._ Engineer is waiting on the user's manual demo result.
+- **Phase 4 proposal pass.** Ports + Processes panels. I directed 5 specific questions in proposal-pass format (same discipline as Slice C1.5). Engineer is preparing the proposal; no code yet.
+- The five questions, in priority order: (1) where does "Processes" live in the tiled layout — drilldown inside Ports tile, toggle-mode within Ports tile, or daemon-only (no v1 UI)? Decision #7 doesn't reserve a Processes tile; a new tile would require amending Decision #7; (2) data source + platform matrix — `/proc/net/*` vs `procfs` vs `socket2` on Linux; `lsof` vs `libproc` on macOS; (3) port → process → container correlation daemon-side or client-side; (4) refresh cadence; (5) sub-slicing.
 
 ### What I'm expecting next
-- **User runs the 9-scenario demo** per `docs/OPERATIONS.md` "Slice C3 manual demo prep". Reports pass/fail on scenarios 1–8 (the gate). Scenario 9 observation captured in `docs/ISSUES.md` if cramped but doesn't block close.
-- **If user signs off:** direct engineer to close Phase 3 — flip `docs/STATUS.md` row 3 to ✅, update `docs/HANDOFF.md` CTO section, then flag Slice D design pass (not code) as the next gate before anything new lands.
-- **If any scenario 1–8 fails:** inline fix commit before Phase 3 closes (same pattern as C1.5c's potential fallback).
+- **Engineer's Phase 4 proposal ping** (no code, answers to the five questions). I review, sign off or push back, escalate to user if anything requires Decision #7 amendment.
+- **Then Phase 4 sub-slices** per the engineer's proposed slicing (rough sketch in my direction: 4a daemon-side Ports probe + `Subscribe(Ports)`, 4b Ports tile renderer + subscribe-on-startup, 4c port→container correlation, 4d Processes per Q1's answer, 4e end-to-end test + manual demo).
+- **User manual demo** gates Phase 4 close, same shape as C1.5c and C3.
 
 ### Open questions I'm holding (not yet in DECISIONS.md)
 
-- **Slice D (`DockerExec` → new pane) design pass is blocking.** Under Decision #7 the layout is fixed with exactly one pty tile. "Open a new pane" in the tiled world is architecturally non-trivial — three options I've been weighing: (a) replace the current pty tile contents with the exec session, stash the original as a detach-able background pane; (b) treat the pty tile as a tab-strip of panes, with a thin tab bar at the top of the tile; (c) defer `DockerExec` to v1.1 entirely. None are obvious. **Do not let the engineer start Slice D coding off C3 momentum** — they must ping for a design pass first. I'd run that design pass the same way as Slice C (3–5 specific questions, engineer proposal, user signoff before code).
-- **Phase 4 (Ports + Processes panels)** is the natural next phase once Phase 3 closes. Tiles already exist as placeholders in the god-view layout. The subscription pattern is mature (uniform `HashMap<id, AbortHandle>` model documented in `docs/ARCHITECTURE.md` §9); scope renderers take `(state, Frame, Rect)`; the toast + pending-action + focus-nav bus is in place. Should be the smoothest phase to date if we stick to the form.
+- **Processes tile placement.** Decision #7 locks five tiles (PTY, Docker, Ports, Fleet, Claude Code) — no Processes tile. Phase 4's name includes Processes. Engineer's proposal must pick a placement approach; if it's "add a 6th tile," that's a Decision #7 amendment requiring user sign-off.
+- **Phase 5 (SSH transport + remote pty)** is the next phase after Phase 4. It's also the forcing function for the "scope → new pane" mechanism that Slice D deferred on. Design pass for that mechanism likely lands at Phase 5's proposal pass rather than before.
 - **Phase 3 polish candidates** (tracked in `docs/STATUS.md`): (1) bounded `tail_lines` default (`1000` instead of `0` with a "load more" affordance); (2) logs-tile zoom / temporary full-scope-row expansion if cramped; (3) color palette revisit if stderr-yellow or stdout-gray has readability issues on some themes. None blocking; pick up when signal says so.
 - **OSC 0 title refresh on focus change** was left stubbed in C1.5b (`AppAction::FocusTile(TileId)` only debug-logs). Candidate future use: update `tepegoz · [PTY]` / `[Docker]` / etc. when focus moves. Don't force it; land if it genuinely helps the user distinguish focus externally.
 
@@ -60,24 +59,24 @@ _Nothing._ Engineer is waiting on the user's manual demo result.
 
 ## Engineer section
 
-**Last updated:** 2026-04-14, Phase 3 closed.
+**Last updated:** 2026-04-14, post-defer. Phase 4 proposal pass in flight; no code.
 
 ### Where I left off
 
-**Phase 3 is closed.** User's 9-scenario manual demo signed off green on 2026-04-14 against a real terminal; docs flipped to ✅ in the close commit. 165 tests green on both OSes, `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean. Docker scope panel ships end-to-end: daemon-side container list + lifecycle actions + logs/stats streaming, client-side tiled god view + action keybinds + confirm modal + toast overlay + logs sub-state.
+Phase 3 close commit (`8984456`) landed + pushed. User signed off on deferring Slice D to v1.1; defer commit follows Phase 3 close on `main`. The decisive argument was Q5 (detach/reattach invariant): Docker's exec API ends the session when the hijacked connection closes, so `DockerExec` can't preserve Phase 2's detach/reattach promise without a custom in-container agent, out of scope for v1. Full rationale captured verbatim in `docs/ROADMAP.md` Slice D section. Decision #7 is intact; the pty tile remains single-pane.
 
-Scenario 9 (tile-sized logs sanity) was advisory per CTO directive; user did not flag readability gotchas, so the Phase 3 polish list in `docs/STATUS.md` stands as-is (bounded `tail_lines` default, logs-tile zoom if cramped, color palette revisit on feedback).
+Phase 4 (Ports + Processes panels) is now the next active phase. CTO issued a 5-question proposal pass (same pattern as Slice C1.5's architectural-shape-first flow). No code until proposal is signed off.
 
 ### What I'm mid-flight on
 
-_Nothing._ Awaiting CTO direction on Slice D design pass vs. pivot-to-Phase-4.
+**Phase 4 proposal** answering CTO's five questions: (1) where Processes lives under Decision #7's layout since the god view reserves tiles for PTY + Docker + Ports + SSH Fleet + Claude Code but not a standalone Processes tile — three candidates on the table (drilldown from Ports, toggle-mode within Ports tile, or Processes daemon-only with no v1 TUI); (2) data-source + platform matrix (procfs / netlink / libproc / shelling out to `ss`/`lsof` / `sysinfo` fallback); (3) port → process → container correlation daemon-side vs client-side; (4) subscription refresh cadence (ports change fast; processes faster); (5) sub-slicing (CTO's straw-man: 4a daemon Ports probe + 4b Ports tile + 4c correlation + 4d Processes + 4e e2e test; or propose different).
+
+Ping with the proposal goes out alongside this defer commit. No code until CTO sign-off.
 
 ### What I'm expecting from the CTO next
 
-Either:
-
-- **Slice D design-pass proposal direction.** Three candidate approaches are on the table in the CTO section open questions above: (a) replace pty tile contents with exec session, stash original as detach-able background pane; (b) treat pty tile as tab-strip with thin tab bar; (c) defer `DockerExec` to v1.1. Under Decision #7's fixed layout these are non-trivial architectural calls (pane lifecycle model, `tepegoz tui` re-attach target, `ListPanes` semantics, possibly a new daemon pane kind). I'd want the proposal-pass pattern Slice C1.5 used: 3–5 specific questions from CTO, engineer proposal, user sign-off, then code.
-- **Or a pivot to Phase 4 (Ports + Processes panels)** if the user decides Slice D defers to v1.1. Phase 4 slots into existing placeholder tiles; the subscription pattern + `(state, Frame, Rect, focused)` scope-renderer contract + toast + pending-action + focus-nav buses are all in place. Would be the smoothest phase to date if we stick to the form.
+- **Review + sign-off on the Phase 4 proposal.** Push-back on individual answers is fine; anything that wants to amend Decision #7 (e.g., introducing a standalone Processes tile would change the 5-tile layout) needs user sign-off before I rework the proposal.
+- **Sub-slice direction once the proposal is signed off.** Landing sequence mirrors Phase 3: each sub-slice green-on-both-OSes, pushed, CTO review before the next starts, integration test where behavior isn't covered by unit tests alone.
 
 ### Anything that would surprise a fresh-me
 

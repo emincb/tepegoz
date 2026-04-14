@@ -2,7 +2,7 @@
 
 Target: **0.1.0 release** at end of Phase 10. Rough budget: 15–20 weeks full-time.
 
-Status key: ✅ complete · 🟡 code+tests green, user acceptance pending · 🟠 in progress · ⚪ not started.
+Status key: ✅ complete · 🟡 code+tests green, user acceptance pending · 🟠 in progress · ⚪ not started · 🔵 deferred to a future release.
 
 Per-phase: goal, delivered (or scope), acceptance test, explicit non-goals, risks.
 
@@ -282,20 +282,19 @@ Lands as three sub-commits per CTO sign-off: **C3a** (actions + confirm modal + 
 
 **Gate.** CI green on macOS + ubuntu-latest, then CTO reviews the integration-test shape + demo script. User runs the manual demo in a real terminal with the pass/fail matrix. If scenarios 1–8 sign off, Phase 3 row in `docs/STATUS.md` goes ✅.
 
-### Slice D — `DockerExec` → new pty pane · ⚪
+### Slice D — `DockerExec` → new pty pane · 🔵 Deferred to v1.1
 
-**Scope.**
+**Deferred to v1.1.** Docker's exec API (bollard inherits from the engine API) ends the exec session when the hijacked connection closes — there is no server-side "detach and keep running." This means a `DockerExec` pane cannot preserve Phase 2's detach/reattach invariant without a custom in-container agent, which is out of scope for v1.
+
+The "scope view triggers new pane" pattern also generalizes to Phase 5 (SSH Fleet → open remote pty) and Phase 6 (remote Docker → exec into remote container). Designing the mechanism for DockerExec in isolation would lock in a shape that may not fit those phases. Revisit after Phase 5's concrete requirements force the generalized design.
+
+Users retain `docker exec -it <container> sh` in their local pty tile as the v1 escape hatch.
+
+**Original scope (retained for v1.1 reference).**
 - Command: `DockerExec { container_id, cmd, env, rows, cols }`. Daemon spawns a docker exec session, wraps it as a `Pane` in `PtyManager`, returns `PaneOpened(PaneInfo)`. From the client's perspective it looks identical to opening a local shell pane.
-- TUI's `RequestOpenPane(PaneRequestKind::DockerExec { ... })` (the C1 placeholder variant) gets wired: `Enter` in scope view sends the command, awaits `PaneOpened`, then transitions `View → Pane(new_pane_id)`.
+- TUI's `RequestOpenPane(PaneRequestKind::DockerExec { ... })` (the C1 placeholder variant) gets wired: `Enter` in scope view sends the command, awaits `PaneOpened`, then opens the new pane inside whatever multi-pane model v1.1 picks (background-stash vs. tab-strip — the design pass that was deferred with this slice).
 
-**Acceptance.** Provision a known container; exec into it; send `pwd\n`; verify expected output in pane scrollback.
-
-### Slice D — `DockerExec` → new pty pane · ⚪
-
-**Scope.**
-- Command: `DockerExec { container_id, cmd, env, rows, cols }`. Daemon spawns a docker exec session, wraps it as a `Pane` in `PtyManager`, returns `PaneOpened(PaneInfo)`. From the client's perspective it looks identical to opening a local shell pane.
-
-**Acceptance.** Provision a known container; exec into it; send `pwd\n`; verify expected output in pane scrollback.
+**Original acceptance (v1.1).** Provision a known container; exec into it; send `pwd\n`; verify expected output in pane scrollback.
 
 **Not in scope (Phase 3 overall).** Docker Compose, swarm, multi-host. Cross-container networking visualization (Phase 4+).
 
@@ -305,7 +304,7 @@ Lands as three sub-commits per CTO sign-off: **C3a** (actions + confirm modal + 
 
 ## Phase 4 — Ports + processes panels (local) · ⚪
 
-_Unblocked once Slice D (`DockerExec`) is resolved or explicitly deferred to v1.1; see `docs/HANDOFF.md` CTO-section open questions._
+_Proposal pass in flight; no code until CTO sign-off. Slice D (`DockerExec`) is deferred to v1.1 so Phase 4 is the next active phase. Note that Decision #7's god-view layout reserves tiles for PTY + Docker + Ports + SSH Fleet + Claude Code, but not a standalone Processes tile — the proposal pass addresses where Processes lives._
 
 **Goal.** Two more scope panels backed by native per-OS probes.
 
