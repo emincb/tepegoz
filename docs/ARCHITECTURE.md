@@ -200,7 +200,9 @@ Broadcast channel capacity is 1024 `PaneUpdate`s. Slow subscribers get `RecvErro
 - **Pane env.** `TEPEGOZ_PANE_ID=<id>` stamped into every pty's environment so clients (notably `tepegoz tui`) can detect and refuse recursive attach.
 - **No cloud, no phone-home.** No auto-update. No outbound network outside user-authorized SSH.
 - **Keychain root key (Phase 8).** `keyring` crate + env/file override; precedence `env > file > keychain`. Daemon does not write back to keychain when an override is set — see `docs/DECISIONS.md#2`.
-- **Agent auth (Phase 6).** ed25519 host key TOFU, warn on key change. Hash-verified agent binary on deploy.
+- **SSH auth (Phase 5).** Agent socket inheritance (`$SSH_AUTH_SOCK`) first, then `IdentityFile` entries from `~/.ssh/config` in order. Passphrase-protected keys with no agent surface russh's error verbatim in a red Fleet-tile toast — never a silent hang. **Not** layered under Decision #2's at-rest root-key precedence; SSH keys belong to the user's OpenSSH toolchain and have their own provenance story.
+- **SSH host-key TOFU (Phase 5).** Tepegöz maintains its own known_hosts file at `data_dir/tepegoz/known_hosts` (Linux: `$XDG_DATA_HOME`; macOS: `~/Library/Application Support`). We never mutate `~/.ssh/known_hosts` — the user's OpenSSH state is additive, not ours to touch. First-contact hosts auto-trust + persist; subsequent mismatches reject with a structured `SshError::HostKeyMismatch` and surface as the `⚠` terminal state in the Fleet tile. Recovery is `tepegoz doctor --ssh-forget <alias>` (ships in 5b alongside `--ssh-hosts`), not an auto-accept on mismatch. File format is OpenSSH-compatible so the user can inspect or hand-edit with standard tools.
+- **Agent auth (Phase 6).** ed25519 host key TOFU for the agent's identity (a separate thing from Phase 5's SSH host-key TOFU — the agent TOFU identifies the agent binary running on a remote host). Warn on key change. Hash-verified agent binary on deploy.
 - **Audit log (Phase 6+).** Every agent RPC + every TUI command appended to a separate file; not part of the main tracing stream.
 
 ## 9. Concurrency model

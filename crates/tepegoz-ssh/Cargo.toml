@@ -6,9 +6,31 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "SSH transport (russh client) with channel multiplexing for Tepegöz frames."
+description = "SSH transport (russh client) with host discovery, auth chain, and host-key TOFU for Tepegöz."
 
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# SSH client + ssh_config parsing. `russh-config` is authored alongside
+# russh so versioning tracks cleanly; `ssh2-config` is the alternative
+# and can be swapped in with minimal surface change if russh-config ever
+# misses a field we need.
+russh = "0.60"
+russh-config = "0.58"
+
+# OS-split config / data dirs. `dirs::config_dir()` maps to
+# `$XDG_CONFIG_HOME` on Linux and `~/Library/Application Support` on
+# macOS per ARCHITECTURE §5; same shape for `data_dir()`.
+dirs = "6"
+
+# Tepegöz-local `config.toml` override for the SSH host list. Only the
+# `[ssh]` table is deserialized here; other tepegoz config is owned by
+# other crates.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

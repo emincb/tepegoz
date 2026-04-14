@@ -16,38 +16,36 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## CTO section
 
-**Last updated:** 2026-04-14, post-Phase-4-close. Phase 5 proposal pass is the next gate. **This HANDOFF was updated immediately before a CTO context clear — fresh CTO is reading cold.**
+**Last updated:** 2026-04-14, post-Phase-5-proposal-review. Phase 4 closed + cleanup landed (`357a016`, `1069e95`). Phase 5 proposal signed off, Slice 5a kicked off. **Fresh CTO is reading cold — relay to engineer has already been sent; engineer is executing 5a.**
 
 ### What I just signed off on
-- **Phase 4 closed.** User signed off on the 8-scenario manual demo (with navigation-discoverability clarification noted — `h/j/k/l` horizontal+vertical, not just vertical). Ports + Processes scopes ship end-to-end: cross-OS probe abstraction (netstat2 + sysinfo + procfs/libproc), daemon-side port→process→container correlation, Ports tile with Processes toggle. 220 tests on ubuntu / 211 on macOS.
-- **Wire-desync root cause + fix** (`77aa9ca`). `tokio::AsyncReadExt::read_exact` is NOT cancellation-safe. The TUI's main-loop `select!` was calling `read_envelope` directly alongside stdin/winch/tick branches; when another branch fired mid-`read_exact`, kernel socket position advanced but userspace bytes were lost → next read desynced. Fix: dedicated `spawn_reader_task` mirroring the daemon-side writer pattern; main loop reads from `mpsc::UnboundedReceiver<Result<Envelope, anyhow::Error>>` (cancellation-safe). Regression test in default suite (`stdin_pressure_does_not_desync_large_envelopes`). Engineer verified both CI-green AND the original production trigger (`yes | tui`).
-- **Phase 3 closed** (`8984456`). Docker scope panel end-to-end.
-- **Slice D (`DockerExec`) deferred to v1.1** per user sign-off. Decisive reason: Docker's exec API ends the exec session when the hijacked connection closes — can't preserve Phase 2's detach/reattach invariant without a custom in-container agent. Secondary: the "scope → new pane" pattern generalizes to Phases 5/6 and should be designed there, not for DockerExec alone.
+- **Phase 4 closed** (`357a016`) + **diagnostic tracing cleanup** (`1069e95`) both landed. User ran the 8-scenario manual demo on the desync-fix binary and signed off. STATUS row 4 is ✅, ROADMAP Phase 4 marker is ✅ (2026-04-14), 211 tests on macOS / 220 on ubuntu.
+- **Phase 5 proposal (7 questions) reviewed and signed off.** Engineer's answers were strong on Q1/Q3/Q4/Q7. Adjustments: Q2 adds macOS config path + `tepegoz doctor --ssh-hosts` diagnostic + OPERATIONS precedence doc; Q4 adds explicit red-toast failure mode for passphrase-no-agent; Q7 adds `tepegoz connect <alias>` CLI to 5d + 5b-to-5c gap doc note.
+- **Q5 REDIRECTED from option (a) to option (b) tab-strip.** Spec-hierarchy drift — engineer cited CLAUDE.md + DECISIONS but not README mockup. The mockup shows the PTY tile with a visible multi-pane list; option (a)'s replace-primary hid non-active panes behind a `Ctrl-b w` overlay, regressing the "all activity visible at a glance" tagline. User explicitly endorsed the redirect: *"One line of chrome is not a cost — it's the point."* Neither (a) nor (b) is a Decision #7 amendment (layout ≠ content); tab strip sits above the vt100 render area inside the same Rect. Caught pre-implementation this time, unlike the Slice C mode-switch drift — process working.
+- **Three user UX sign-offs baked into the relay:** (1) Fleet `procs` column is em-dash placeholder until Phase 6 fills it — no one-shot SSH probe workaround; (2) Fleet state markers are four-state (`●`/`◐`/`○`/`⚠`) not mockup's two; (3) PTY tab-strip uses `*` suffix + desaturation, NOT bright cyan (reserved for tile-focus per existing renderer contract).
 
 ### What's in flight with the engineer
 
-Three things queued, in strict order:
-
-1. **Phase 4 close commit.** `docs/STATUS.md` row 4 → ✅, ROADMAP Phase 4 → ✅ (2026-04-14), HANDOFF updates, + the "Help overlay for focus navigation keybinds" polish candidate in STATUS.md (user hit horizontal-vs-vertical discoverability during demo scenario 3). Close-commit text in the relay message before this clear. Engineer lands next.
-2. **Diagnostic tracing cleanup commit.** Strip high-cardinality envelope-write debug logs from `bee6aba`. Keep: `payload_variant` helper; read-side hex-dump on length-prefix-bail; the `debug_assert_eq!(bytes.len(), ...)` assertion that falsified the AlignedVec hypothesis. Separate commit, after Phase 4 close.
-3. **Phase 5 proposal pass.** Seven questions issued in the relay before this clear. No code until proposal is signed off. Phase 5 is the most architecturally novel phase to date.
+**Slice 5a** — `tepegoz-ssh` crate with concrete API + auth chain + host-key TOFU + ssh_config parser. No daemon integration, no wire-protocol change. Full scope in the relay text (already sent); 5a commit will also update `ARCHITECTURE.md §8` with the host-key TOFU location + precedence (not covered today; §8 only names Phase 6's agent TOFU, which is a different thing).
 
 ### What I'm expecting next
 
-- Engineer's ping on Phase 4 close commit (trivial, doc-only).
-- Engineer's ping on diagnostic tracing cleanup (trivial, scoped strip).
-- **Engineer's Phase 5 proposal ping — the substantive one.** Seven questions: (Q1) crate structure `tepegoz-ssh` vs. `tepegoz-transport` trait-now-or-later; (Q2) host discovery / `~/.ssh/config` / first-run UX; (Q3) remote pty lifecycle daemon-side-tunneled vs. remote-side-via-agent; (Q4) auth model SSH agent vs. explicit keys vs. layered like Decision #2; (Q5) **the big call — "scope → new pane" mechanism** (candidate a: replace-primary + stashed-original; b: tab-strip within pty tile; c: amend Decision #7 for new tile kind); (Q6) connection lifecycle + error UX; (Q7) sub-slicing proposal.
-- On Q5: if engineer proposes (c) amending Decision #7, escalate to user sign-off BEFORE accepting. That's a locked-decision amendment.
-- Phase 5 sub-slices per engineer's proposed slicing. User manual demo gates close, same shape as Phases 3 and 4.
+- **Engineer's 5a ping** — ping content: API shape review, TOFU location sanity check, ssh_config parser choice (`ssh2-config` crate vs. hand-rolled — my prior is the crate but engineer owns the tactical call). CI green on both OSes is the engineer's own gate.
+- **5b opens after my 5a sign-off.** 5b bumps wire protocol to v7 (Fleet subscription) and ships the live Fleet tile replacing the placeholder. Fleet renders "all Disconnected" between 5b and 5c merges — same degrade-gracefully pattern as Phase 3's `DockerUnavailable` — called out explicitly in the 5b commit message per Q7 addition.
+- **5c is where the interesting daemon work lives** — per-host connection supervisor, state machine, `keepalive@openssh.com` heartbeat, exponential backoff, `FleetAction::Reconnect|Disconnect`.
+- **5d delivers the UX payoff** — remote pty open, pane-stack, tab-strip chrome, `tepegoz connect <alias>` CLI. This is where option (b) tab-strip actually ships; watch the PR closely for visual-hierarchy choices (desaturation level, column width under many-panes pressure, overflow handling for >9 panes into `Ctrl-b w` overlay).
+- **5e closes Phase 5** — error-surface polish + 8-scenario manual demo, same shape as Phase 4's close. User manual demo gates sign-off.
 
 ### Open questions I'm holding (not yet in DECISIONS.md)
 
-- **Phase 5 "scope → new pane" is the load-bearing call.** It locks the pattern for Phase 6 (remote Docker → exec into remote container) AND for v1.1 Slice D (DockerExec) when it reopens. Get it right once. My prior: option (a) replace-primary-with-stashed-original is cleanest — matches tmux's mental model, doesn't add chrome, doesn't amend Decision #7. But I'm not committing that view; engineer's proposal should earn the call.
-- **Phase 4 polish candidates** tracked in `docs/STATUS.md`:
-  1. Help overlay for focus nav (`Ctrl-b ?` already reserved, rendered no-op since C1.5b). User hit discoverability issue; worth landing as an early v1.1 polish item or in any Phase 5-adjacent TUI work.
+- **Phase 5 load-bearing Q5 resolution is option (b) tab-strip.** Decision NOT amended. If 5d's tab-strip visuals turn out too noisy in practice (>4 panes at 120-col widths), the fallback polish is compacting labels to `[N]` without the name, OR reserving an overflow indicator `[+N more]`. Don't pre-optimize; let the 5d eyeball pass surface it if real.
+- **ARCHITECTURE §8 needs the host-key TOFU addition** in the 5a commit. Currently §8 only mentions Phase 6 agent TOFU. Separate thing; engineer will patch §8 as part of 5a.
+- **Phase 5 remote-pane session-persistence gap** (SSH flap kills pane) is a documented limitation, not a bug. Lives in `docs/ISSUES.md` under a NEW section "Known limitations, Phase 6 upgrade path" per Q3 addition — engineer creates the section in 5a or 5e. Not an active bug.
+- **Phase 4 polish candidates** (unchanged, tracked in STATUS):
+  1. Help overlay for focus nav (`Ctrl-b ?` already reserved). User hit discoverability during Phase 4 demo scenario 3. Worth bundling into any Phase 5-adjacent TUI work OR landing as early v1.1 polish.
   2. Phase 3 carryovers: bounded `tail_lines` default (1000 with "load more"); logs-tile zoom if cramped; color palette feedback revisit.
-- **OSC 0 title refresh on focus change** still stubbed (`AppAction::FocusTile(TileId)` → debug log). More useful now that 5 tiles exist and focus ambiguity is more common.
-- **Phase 3's `tail_lines: 0 = all history` wire semantic** remains Slice B's contract; changing it is a compatible additive (daemon honors any value; client can send `1000` instead of `0`).
+- **OSC 0 title refresh on focus change** still stubbed. Even more useful now that tab-strip chrome in 5d will also need to update on active-pane change — may be natural to land both together.
+- **Fleet `procs` column** shipping as em-dash in Phase 5, real values in Phase 6. If a user specifically flags the em-dash as confusing during 5e demo, revisit — but default is defer.
 
 ### Observations about engineer patterns (load-bearing for future direction)
 
@@ -60,6 +58,8 @@ Three things queued, in strict order:
 - **Volunteers judgment calls at the right level.** Flags 3-5 tactical decisions per slice for review, doesn't flag naming noise. Matches `feedback_implementation_autonomy` model.
 - **Adopts defensive testing patterns unprompted.** Examples: `push_toast_at(now, ...)` for time-travel tests; 2s sleep for status-counter-advance in restart round-trip; SIGSTOP-dockerd for timeout demo; python3 child + stdout-handshake for Phase 4 e2e (eliminates port-collision + bind-race flakes); `kill_on_drop(true)` instead of hand-rolled `ChildGuard`.
 - **One watch-item:** occasionally needs the generalization-to-future-phases prompt. Examples where engineer's reasoning covered it (Slice D defer, desync fix class-of-bug), examples where I added it (the netstat2 deviation's Phase 7 implications). When signing off on deviations, explicitly ask "what does this lock for Phase N+1?"
+- **Second watch-item: spec-hierarchy cross-check defaults to DECISIONS + CLAUDE.md, skips README mockup.** Phase 5 Q5 proposal argued (a) vs. (b) vs. (c) entirely against Decision #7's layout/content distinction — mechanically correct, but missed that the README mockup literally depicts a multi-pane PTY tile. Same failure class as the Slice C mode-switch drift. CTO caught it pre-implementation this time via the cross-check discipline, redirected to (b). When reviewing UX-adjacent proposals, the question "does the engineer cite the mockup?" is now a checklist item — if not, the CTO adds it explicitly. Memory file `feedback_cross_check_vision_before_signoff.md` covers this; the Q5 episode is a reinforcement, not a new lesson.
+- **Strong flagging of escalation-worthy decisions.** Phase 5 proposal's "Flagged escalations" section correctly surfaced two items: Q5's Decision #7 claim (asking CTO to verify) and Q3's session-persistence gap (asking whether to pull Phase 6 forward). Both were the right calls to raise and the right calls to leave as-is. This is the "implementation autonomy within architectural guardrails" pattern working as intended — engineer makes the tactical call + explicitly flags the decisions that exceed tactical scope. Reference model for future proposals.
 
 ### Standing context (if you're the fresh CTO reading cold)
 
