@@ -770,6 +770,10 @@ async fn forward_ports(subscription_id: u64, event_tx: mpsc::UnboundedSender<Env
         // blocking pool so we don't stall the runtime.
         let probe_result = tokio::task::spawn_blocking(tepegoz_probe::list_ports).await;
 
+        // `mut` is only consumed by the `target_os = "macos"` correlation
+        // block below (mutates rows in place). On Linux the block is
+        // cfg-gated out, leaving `mut` unused — silence clippy there.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut ports = match probe_result {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
