@@ -74,7 +74,7 @@ Per-phase: goal, delivered (or scope), acceptance test, explicit non-goals, risk
 
 ---
 
-## Phase 3 — Docker scope panel · 🟠 (A + B + C1 + C2 + C1.5a + C1.5b landed per Decision #7; C1.5c manual demo pending user; C3 action keybinds + toasts + logs panel outstanding)
+## Phase 3 — Docker scope panel · ✅ (2026-04-14)
 
 **Goal.** First scope panel. Lists containers; tails logs; execs into container (opens a new pane); lifecycle actions. Sets the UX template for Ports/Processes/Logs in Phase 4.
 
@@ -248,7 +248,7 @@ Full script in `docs/OPERATIONS.md` "Slice C manual demo prep".
 - Add to `crates/tepegoz-core/tests/docker_scope.rs` a TUI-driver test that spawns the daemon, runs a scripted `App` (no terminal) through "subscribe → receive ContainerList → press r → receive DockerActionResult". Bypasses crossterm but exercises the entire wire path.
 - **Manual demo (per CTO §7 sign-off, including new Step 10):** start daemon + TUI; switch to scope (`Ctrl-b s`); see container table; navigate (j/k); filter (`/`); switch back to pane (`Ctrl-b a`); verify vim-preservation; detach + reattach (`Ctrl-b d`, `tepegoz tui`); **kill the docker daemon, verify scope view transitions to Unavailable within ~5 s without crashing the TUI; restart docker, verify scope view recovers**. Standing victim-container snippet in `docs/OPERATIONS.md`.
 
-#### Slice C3 — Action keybinds + toasts + logs panel · 🟡 (C3a + C3b + C3c landed; user manual demo pending)
+#### Slice C3 — Action keybinds + toasts + logs panel · ✅ (`8a9176c`, `fc5ded4`, `4dd1208`, _close commit_)
 
 Lands as three sub-commits per CTO sign-off: **C3a** (actions + confirm modal + toasts + timeout sweep), **C3b** (logs panel sub-state inside the Docker tile + C3a style-cleanup: R/S aliases removed + K/X absorption behavior), **C3c** (end-to-end Restart round-trip test + 9-scenario manual demo script).
 
@@ -304,6 +304,8 @@ Lands as three sub-commits per CTO sign-off: **C3a** (actions + confirm modal + 
 ---
 
 ## Phase 4 — Ports + processes panels (local) · ⚪
+
+_Unblocked once Slice D (`DockerExec`) is resolved or explicitly deferred to v1.1; see `docs/HANDOFF.md` CTO-section open questions._
 
 **Goal.** Two more scope panels backed by native per-OS probes.
 
