@@ -35,7 +35,7 @@ pub(crate) fn container_id_from_cgroup_path(path: &str) -> Option<String> {
     // Find the last `docker` occurrence, skip any `-` / `/` separator, then
     // scan the ascii-hex run that follows.
     let tail = path.rsplit_once("docker")?.1;
-    let tail = tail.trim_start_matches(|c: char| c == '-' || c == '/');
+    let tail = tail.trim_start_matches(['-', '/']);
     let id: String = tail.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
     if id.len() >= 12 { Some(id) } else { None }
 }
