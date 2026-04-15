@@ -73,3 +73,33 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo zigbuild --workspace --target ${{ matrix.target }}
+
+  # Cheap sanity gate against controller `build.rs` drift vs. the actual
+  # agent build: runs `cargo xtask build-agents` to populate
+  # `target/agents/<triple>/{tepegoz-agent, manifest.json}` for all four
+  # Decision #3 triples, then `cargo check -p tepegoz` to force the
+  # controller's `build.rs` to consume each manifest + assert
+  # `protocol_version` matches `tepegoz-proto/PROTOCOL_VERSION` at
+  # compile time. Mismatch = panic = CI red. No artifacts shipped —
+  # this job catches drift, release packaging lives in Phase 10.
+  agents:
+    name: Agents — cross-compile + drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: agents
+      - name: Cross-compile all agent targets + write manifests
+        run: cargo xtask build-agents
+      - name: Verify embedded-agent drift check (controller build.rs)
+        run: cargo check -p tepegoz

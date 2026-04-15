@@ -51,10 +51,11 @@ The TUI keyboard surface (Slice 6.0 + 6c-iii) is six bindings plus mouse:
   or Esc to cancel. Greyed-out rows are hosts that aren't currently reachable —
   selectable but not committable.
 - `Ctrl-b ?` — toggle the in-TUI help overlay (authoritative reference)
-- mouse — click to focus tile + select row; click the Docker tile title bar to
-  open the host picker; click a tab to switch panes; click the `[×]` affordance
-  next to the tab strip to close the active pane; double-click a Fleet row to
-  open a remote pane
+- mouse — click to focus tile + select row; click the Docker or Ports tile
+  title bar to open the host picker (Ports tile dispatches per the active
+  view — Ports vs. Processes toggle via `p`); click a tab to switch panes;
+  click the `[×]` affordance next to the tab strip to close the active pane;
+  double-click a Fleet row to open a remote pane
 
 Useful flags:
 - `--socket /path/to/sock` — override daemon's socket path; TUI must match
@@ -771,13 +772,15 @@ Plain `cargo build` (no `build-agents` invocation) still succeeds: the `build.rs
 
 ```sh
 cargo xtask demo-phase-6 up
-# Expect output like:
+# Expect output like (protocol_version reflects live PROTOCOL_VERSION file):
 #   agent handshake ✓
 #     request_id:   1
-#     version:      10
+#     version:      12
 #     os:           macos
 #     arch:         aarch64
-#     capabilities: (none — 6a ships an empty list; 6c/d populate)
+#     capabilities: docker, ports, processes
+# `docker` appears iff bollard reached a local docker socket at probe
+# time; `ports` + `processes` are always present on macOS + Linux.
 
 cargo xtask demo-phase-6 down
 # Idempotent tempdir cleanup; nothing persistent to remove in 6a.
@@ -793,17 +796,20 @@ Slice 6b turns the 6a-embedded agent binaries into something you can actually ru
    # Requires: docker, ssh-keygen, cargo-zigbuild (cross-platform) OR
    # a Linux host with the musl target + linker installed.
    cargo xtask demo-phase-6 up --remote
-   # Expect:
+   # Expect (protocol_version reflects live PROTOCOL_VERSION file):
    #   [demo-phase-6] sshd listening at 127.0.0.1:<port>
    #   [demo-phase-6] cross-building tepegoz-agent for x86_64-unknown-linux-musl…
    #   [demo-phase-6] connecting via SSH (TOFU → isolated known_hosts)…
    #   [demo-phase-6] deploying agent (idempotent — cache hit if already matching)…
-   #   [demo-phase-6]   path: /config/.cache/tepegoz/agent-v10 (uploaded now)
+   #   [demo-phase-6]   path: /config/.cache/tepegoz/agent-v12 (uploaded now)
    #   remote agent handshake ✓
-   #     version:      10
+   #     version:      12
    #     os:           linux
    #     arch:         x86_64
-   #     capabilities: (none — 6a/6b ship empty; 6c/d populate)
+   #     capabilities: ports, processes
+   # No `docker` capability in the stock fixture — sshd container doesn't
+   # bind-mount /var/run/docker.sock. `ports` + `processes` are always
+   # populated on supported platforms.
    cargo xtask demo-phase-6 down --remote
    # → docker rm -f + tempdir cleanup (idempotent)
    ```
@@ -812,15 +818,15 @@ Slice 6b turns the 6a-embedded agent binaries into something you can actually ru
 
    ```sh
    tepegoz doctor --agents
-   # Example output:
+   # Example output (agent-v<N> path follows the live PROTOCOL_VERSION):
    # source: ssh_config (/Users/emin/.ssh/config)
    # agents (3 host(s)):
    #   staging              x86_64-unknown-linux-musl       ✓ matches embedded
-   #     /home/ubuntu/.cache/tepegoz/agent-v10 (214008 bytes, mtime 1744000000)
+   #     /home/ubuntu/.cache/tepegoz/agent-v12 (214008 bytes, mtime 1744000000)
    #     remote   sha256: 3a7b5f2e8c1d4f9b
    #   dev                  aarch64-apple-darwin            ✗ absent — would deploy on next connect
    #   old-box              x86_64-unknown-linux-musl       ⚠ drift — redeploy needed
-   #     /home/ubuntu/.cache/tepegoz/agent-v10 (203456 bytes, mtime 1743800000)
+   #     /home/ubuntu/.cache/tepegoz/agent-v12 (203456 bytes, mtime 1743800000)
    #     remote   sha256: 9f8e7d6c5b4a3928
    #     embedded sha256: 3a7b5f2e8c1d4f9b
    ```
@@ -830,7 +836,7 @@ Slice 6b turns the 6a-embedded agent binaries into something you can actually ru
 3. **Agent TOFU model**. Slice 6b does NOT maintain a first-seen stored-hash database for agent binaries (unlike SSH host keys). The embedded binary is the source of truth — every deploy verifies by content-hash against `sha2::Sha256::digest(&embedded_bytes)`. If the remote's file matches, no upload happens (cache-hit branch). If it diverges, we upload + verify + one-retry on mismatch + terminal error on second mismatch. Rationale: the agent's identity is its binary hash + `PROTOCOL_VERSION`, both controller-owned at build time — SSH-style "first-seen-wins" semantics don't add safety here, just complexity.
 
 **Known limitations** (`docs/ISSUES.md`):
-- Protocol version bumps leave orphaned `agent-v<N-1>` binaries on remote hosts (~1 MB each). Not a correctness issue; Phase 6 close or v1.1 will add a cleanup helper.
+- Protocol version bumps leave orphaned `agent-v<N-1>` binaries on remote hosts (~1 MB each). Not a correctness issue; Phase 6 close accepted the cleanup helper as v1.1 polish rather than folding into 6e.
 - Universal macOS `lipo` deferred to the Phase 10 release pipeline (requires Xcode tooling not guaranteed on dev/CI boxes). Controllers embed two separate darwin binaries for now.
 
 ## Remote Docker scope (Phase 6 Slice 6c)
@@ -897,6 +903,228 @@ cargo xtask demo-phase-6 down --remote
 ```
 
 **Out of scope for 6d**: per-host procs aggregation in the Fleet tile (CTO carve-out — v1.1 polish; the user can already see per-host process counts by retargeting the Processes tile to a specific host).
+
+## Phase 6 close manual demo prep (Phase 6 Slice 6e)
+
+Closes Phase 6. Same shape as 4d + 5e: 8 scenarios, pass/fail matrix, all rows are the gate. The 8 scenarios exercise the full remote-scopes surface end-to-end: retarget UX (keyboard + mouse), multi-tile concurrency, capability greying, agent disconnect + reconnect state handling.
+
+Unlike demo-phase-5's `up` — which brings up the full fixture + daemon + blocks for TUI in one command — `cargo xtask demo-phase-6 up --remote` today only drives automated verification (handshake + subs through a direct SSH channel) and then exits after printing results. A one-command daemon-spawn wrapper around demo-phase-6 is a v1.1 polish candidate; for the 8-scenario walk the user brings up the fixture via the xtask, then starts the daemon + TUI by hand against the same fixture paths. Three terminals; the prep block below walks through each one.
+
+### Prep
+
+**Terminal 1 — fixture up + agent pre-built + pre-flight verification.**
+
+```sh
+# Stays blocked until the verification prints its summary + exits cleanly;
+# the sshd container + demo-root state stay up for the walk.
+cargo xtask demo-phase-6 up --remote
+```
+
+Expected final lines:
+
+```
+  remote agent handshake ✓
+    host:         demo6b (127.0.0.1:<port>)
+    version:      12
+    os:           linux
+    arch:         x86_64
+    capabilities: ports, processes
+...
+[demo-phase-6] remote deploy + handshake + Docker/Ports/Processes subs complete.
+[demo-phase-6] fixture left running; tear down with `cargo xtask demo-phase-6 down --remote`.
+```
+
+`capabilities: ports, processes` (no `docker`) is expected — the stock fixture does NOT bind-mount `/var/run/docker.sock` into the sshd container. Scenario 1 validates the Docker-tile retarget path against this exact "reachable host, no docker" state; scenario 2 requires extending the fixture (steps inline below).
+
+Note the demo root the xtask prints (typically `/tmp/tepegoz-demo-phase-6/` on Linux, `/var/folders/.../T/tepegoz-demo-phase-6/` on macOS). Export it for the daemon + TUI terminals:
+
+```sh
+export DEMO_ROOT=/tmp/tepegoz-demo-phase-6   # or the path xtask printed
+```
+
+**Terminal 2 — cross-build agent into the embeddable layout + build controller + start daemon.**
+
+`cargo xtask demo-phase-6 up --remote` cross-builds the agent for deploy via its own SSH session, but that path writes to `target/<triple>/release/` rather than the `target/agents/<triple>/` layout the controller's `build.rs` consumes for agent-embedding. Populate the embedding layout + build the controller so the daemon's Fleet supervisor can deploy the agent via its `agent_conns` pool:
+
+```sh
+# Full 4-arch build is slowest; the demo only needs the sshd container's target.
+# If you've already run `cargo xtask build-agents` recently, skip this.
+cargo xtask build-agents
+cargo build -p tepegoz           # rebuilds controller with agent embedded
+```
+
+Write a config.toml pointing at the fixture with `autoconnect = true` so the Fleet supervisor dials on first Fleet subscribe:
+
+```sh
+# Look up the fixture's published port (random ephemeral port, printed
+# by `docker port tepegoz-demo-phase-6-sshd 2222/tcp`).
+FIXTURE_PORT=$(docker port tepegoz-demo-phase-6-sshd 2222/tcp | awk -F: '{print $2}' | head -1)
+
+mkdir -p "$DEMO_ROOT/tepegoz-config" "$DEMO_ROOT/tepegoz-data"
+cat >"$DEMO_ROOT/tepegoz-config/config.toml" <<EOF
+[[ssh.hosts]]
+alias = "demo6b"
+hostname = "127.0.0.1"
+port = $FIXTURE_PORT
+user = "tepegoz"
+identity_file = "$DEMO_ROOT/id_ed25519"
+autoconnect = true
+EOF
+```
+
+Start the daemon against the isolated dirs (stays blocked until `Ctrl-C`):
+
+```sh
+TEPEGOZ_CONFIG_DIR="$DEMO_ROOT/tepegoz-config" \
+TEPEGOZ_DATA_DIR="$DEMO_ROOT/tepegoz-data" \
+  ./target/debug/tepegoz daemon
+```
+
+**Terminal 3 — TUI against the daemon.**
+
+```sh
+TEPEGOZ_CONFIG_DIR="$DEMO_ROOT/tepegoz-config" \
+TEPEGOZ_DATA_DIR="$DEMO_ROOT/tepegoz-data" \
+  ./target/debug/tepegoz tui
+```
+
+The Fleet tile's `demo6b` row should appear with glyph `○` (Disconnected) initially, transitioning through `◐` (Connecting) to `●` (Connected) within the connect + deploy + handshake window (~5–15 s first time, faster on cache-hit re-runs).
+
+### Demo sequence
+
+**Scenario 1 — Docker retarget from Local → demo6b: title suffix updates + DockerUnavailable on capability miss.**
+
+Focus the Docker tile (`Tab` twice from the PTY tile, or click the tile). The title reads `docker · local`; the container table shows your local Docker Desktop's containers (or "Unavailable" if local Docker isn't running). Press `Ctrl-b t` — the host picker modal opens, preselected on `Local`. `↓` / `j` to highlight `demo6b`. Note `demo6b` renders **greyed** with the annotation `(no docker)` — the capability-greying path is already working. Press `Enter` anyway: the picker stays open (greyed-row commit is a no-op). Press `Esc` to dismiss.
+
+→ **Pass**: picker opens on `Ctrl-b t`; `demo6b` row is greyed with `(no docker)` annotation; `Enter` on the greyed row is a no-op (picker stays open). Scenario 8 below exercises the same greying path from the complementary direction.
+
+**Scenario 2 — Docker retarget against a remote WITH docker: ContainerList populates + lifecycle action round-trips.**
+
+Scenario 2 requires a remote target that actually has Docker. Two options:
+
+Option A — extend the stock fixture with a docker.sock bind-mount. Re-launch the container with:
+
+```sh
+cargo xtask demo-phase-6 down --remote
+docker run -d --name tepegoz-demo-phase-6-sshd \
+  --rm=false \
+  -e PUID=1000 -e "PGID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || stat -f '%g' /var/run/docker.sock)" \
+  -e USER_NAME=tepegoz \
+  -e "PUBLIC_KEY=$(cat "$DEMO_ROOT/id_ed25519.pub")" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -p 0:2222 \
+  lscr.io/linuxserver/openssh-server:latest
+# then: rewire $FIXTURE_PORT, restart daemon, wait for Fleet glyph ●
+```
+
+Option B — use your own remote SSH host with Docker installed (edit `$DEMO_ROOT/tepegoz-config/config.toml` to add a second `[[ssh.hosts]]` block for the real host; restart the daemon).
+
+With a Docker-capable remote connected, focus the Docker tile, press `Ctrl-b t`, select the Docker-capable host, Enter. Title becomes `docker · <alias>`; ContainerList populates with the remote's containers. Select any row (arrows / `j` / `k`), press `r` (Restart). A blue Info toast flashes "restart <name> — dispatched"; within a few seconds a green Success toast confirms "restart <name> — succeeded" and the row's `Up <N> seconds` counter resets.
+
+→ **Pass**: title suffix updates; remote ContainerList populates; `r` on a selected row produces a Success toast + visible state change (the counter reset is the cheapest proof the restart landed).
+
+Restore the stock fixture for subsequent scenarios if you took Option A:
+
+```sh
+cargo xtask demo-phase-6 down --remote
+cargo xtask demo-phase-6 up --remote
+# then: rewire $FIXTURE_PORT, restart daemon
+```
+
+**Scenario 3 — Ports retarget to demo6b: remote PortList populates (not local).**
+
+Focus the Ports tile (`Tab` from Docker, or click). Title reads `ports · local`; the table shows your host's listening sockets. Press `Ctrl-b t` — picker opens; `demo6b` renders NORMAL (not greyed) because the Ports capability is always advertised on supported platforms. `↓` / `j` to highlight, Enter.
+
+Title changes to `ports · demo6b`. The table populates with the sshd container's listening sockets — typically just `:22 sshd` (the container's internal sshd). The port list is short but confirms the bytes came from the remote agent's probe (your host's port list is ~10+ entries; the container's is 1–3).
+
+→ **Pass**: title suffix reads `ports · demo6b`; PortList shows ONLY the container's listening sockets (sshd on :22, possibly one or two others); no rows from the host's list bleed through.
+
+**Scenario 4 — Processes retarget to demo6b: remote ProcessList populates (not local).**
+
+Within the Ports tile, press `p` to toggle to the Processes view. Title reads `processes · local`; the table shows your host's running processes (hundreds of rows). Press `Ctrl-b t`, select `demo6b`, Enter. Title becomes `processes · demo6b`; the table shrinks to ~5–15 rows showing the container's processes (`s6-svscan`, `s6-supervise`, `sshd`, `socklog`, etc.).
+
+Note: the Ports tile's dual views have **independent targets**. Press `p` again to toggle back to Ports view — the title should STILL read `ports · demo6b` from scenario 3 (target persisted across the toggle). Press `p` again to return to Processes view — title stays `processes · demo6b`.
+
+→ **Pass**: processes view shows container processes (5–15 rows) not host processes; Ports/Processes targets are independently retained across `p` toggles.
+
+**Scenario 5 — Concurrent multi-tile retarget: Docker + Ports + Processes all targeting demo6b simultaneously.**
+
+After scenarios 3 + 4, Ports + Processes are already on `demo6b`. Retarget Docker back to `demo6b` (or keep it from scenario 1 on the local DockerUnavailable-on-remote-path for variety). Verify all three tile title suffixes read `demo6b` (or respective) concurrently. Rendering + event routing should be stable — each tile independently receives its own event stream with the right subscription id translation.
+
+Scroll around in each tile: arrows in Processes to move selection; `p` to toggle Ports view; `Ctrl-b t` on any of them to open pickers independently; `Esc` to dismiss. Each tile's state is isolated; no interference between them.
+
+→ **Pass**: three remote subscriptions coexist; each tile's UI state (selection, scroll, filter) is independent; opening one tile's picker doesn't affect another's.
+
+**Scenario 6 — Agent disconnect mid-session: three Unavailable events + Fleet glyph flip.**
+
+With Docker / Ports / Processes all on `demo6b` (or at least two of them), kill the sshd container from a fourth terminal:
+
+```sh
+docker kill tepegoz-demo-phase-6-sshd
+```
+
+Within ~30 s (heartbeat timeout + reconnect attempt), the Fleet tile's `demo6b` row glyph transitions from `●` (Connected) through `◐` (Degraded) to `○` (Disconnected). Each active remote scope subscription receives its Unavailable event:
+- Docker tile: state transitions to Unavailable with a reason mentioning `demo6b` or "agent" or "connection".
+- Ports tile: PortList replaced by "Unavailable: …".
+- Processes tile: ProcessList replaced by "Unavailable: …".
+
+Each tile shows its own Unavailable surface; no crashes, no stuck loading spinners.
+
+→ **Pass**: Fleet glyph transitions to `○` within heartbeat window; all three targeted tiles show their respective Unavailable state with a legible reason; no TUI hang or crash.
+
+**Scenario 7 — Reconnect: state resumes, subscriptions restored, no stale data.**
+
+Restart the container:
+
+```sh
+docker start tepegoz-demo-phase-6-sshd
+```
+
+Within ~10–30 s (first backoff tick + reconnect + deploy cache-hit + handshake), Fleet glyph returns to `●` (Connected). **Each active remote scope subscription automatically resubscribes** (the retarget records the target, and re-connection re-opens the agent session + re-routes any pending subscriptions). Within a few more seconds the tiles repopulate:
+- Docker tile: back to whatever state (DockerUnavailable on stock fixture; ContainerList on docker.sock-bind variant).
+- Ports tile: PortList repopulates with the container's current sockets.
+- Processes tile: ProcessList repopulates with the container's current processes.
+
+→ **Pass**: Fleet glyph returns to `●`; all three tiles' subscriptions resume with fresh data from the new agent session; no stale pre-disconnect rows linger in any tile.
+
+**Scenario 8 — Capability-greying correctness: picker on Docker tile shows `demo6b` greyed with `(no docker)`.**
+
+Focus the Docker tile. Press `Ctrl-b t`. Observe:
+- `Local` row: not greyed (local has docker, or at least is the default target).
+- `demo6b` row: **greyed** (DarkGray + DIM) with the inline annotation `(no docker)` — because the agent's capabilities list advertises `ports` + `processes` but not `docker` (no socket bind-mount).
+
+Now press `Ctrl-b t` from the Ports tile:
+- `Local` row: not greyed.
+- `demo6b` row: **NOT greyed** (Ports capability is always present on supported platforms).
+
+Press `↓` / `j` to highlight `demo6b`, then press `Enter` on the picker from the Docker tile. The picker stays open (commit on greyed is no-op). `Esc` dismisses.
+
+→ **Pass**: picker correctly greys per-tile-capability (Docker picker greys demo6b with `(no docker)`; Ports picker does not grey demo6b); `Enter` on a greyed row is a no-op; picker stays open.
+
+### Pass/fail matrix
+
+| # | Scenario | Pass |
+|---|---|---|
+| 1 | Docker retarget: `Ctrl-b t` opens picker, `demo6b` shows `(no docker)` greyed, Enter on greyed is noop | ☐ |
+| 2 | Docker-capable remote: ContainerList populates after retarget; `r` on a row produces Success toast + state change | ☐ |
+| 3 | Ports retarget to `demo6b`: title suffix + PortList shows container's sockets only (sshd :22), not host's | ☐ |
+| 4 | Processes retarget to `demo6b`: title suffix + ProcessList shows container's ~5–15 procs; `p` toggle preserves independent targets | ☐ |
+| 5 | Concurrent multi-tile: Docker + Ports + Processes coexist on `demo6b`; per-tile state independent | ☐ |
+| 6 | `docker kill`: Fleet glyph → `○` within heartbeat window; three Unavailable events land, no crashes | ☐ |
+| 7 | `docker start`: Fleet glyph → `●`; Ports + Processes auto-resubscribe with fresh data; no stale rows | ☐ |
+| 8 | Picker greying correctness: Docker picker greys `demo6b` with `(no docker)`; Ports picker does not | ☐ |
+
+**All 8 scenarios are the gate.** Scenarios 1, 3, 4, 5, 6, 7, 8 work against the stock fixture; scenario 2 requires either the docker.sock bind-mount extension (Option A under scenario 2) or a real remote with Docker (Option B). If scenario 2 cannot be walked because the user has no Docker-capable remote available, it degrades to "seen the retarget UX work against a known-unreachable-Docker target" (which overlaps scenario 1) — note the gap in the close-commit message rather than blocking Phase 6 ship.
+
+If any scenario fails, file a 6e polish item in `docs/ISSUES.md` — fix before the Phase 6 close commit flips STATUS row 6 to ✅.
+
+### Tear down
+
+In Terminal 3: `Ctrl-b d` — detach from TUI.
+In Terminal 2: `Ctrl-C` — stop the daemon.
+In Terminal 1 (or any shell): `cargo xtask demo-phase-6 down --remote` — removes the sshd container + demo root (idempotent; safe to run multiple times).
+
+If any of those terminals is already gone (crashed, closed), `down --remote` from any shell handles the container + root cleanup. The daemon writes no PID file in this flow; if it's orphaned, use `ps | grep tepegoz` to find and kill it.
 
 ## SSH Fleet discovery (Phase 5 Slice 5b)
 

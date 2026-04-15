@@ -838,7 +838,9 @@ fn print_handshake(response: Envelope) -> Result<()> {
             println!("    os:           {os}");
             println!("    arch:         {arch}");
             if capabilities.is_empty() {
-                println!("    capabilities: (none — 6a ships an empty list; 6c/d populate)");
+                println!(
+                    "    capabilities: (none — unexpected; 6d-ii populates ports + processes always)"
+                );
             } else {
                 println!("    capabilities: {}", capabilities.join(", "));
             }

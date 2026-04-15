@@ -129,7 +129,7 @@ the user's mental model.
 
 Slice 6b's brief permitted landing universal macOS `lipo` "if straightforward; defer to Phase 10 release pipeline with ISSUES pointer if painful." Skipped because `lipo` requires Xcode / `llvm-lipo` tooling that isn't guaranteed on developer machines or CI runners; fabricating it via zigbuild + custom wrapper scripts isn't worth the complexity for a slice whose value is the deploy pipeline, not the build ergonomics. Impact: controllers embed two separate darwin binaries (x86_64 + aarch64) rather than one fat binary. Total size overhead: ~250–400 KiB depending on release-agent profile compression. Phase 10 release pipeline revisits this alongside minisign signing + the full release artifact matrix — that's where an Xcode-bearing build machine is already a prerequisite. No ISSUES cross-references bite 6b's downstream work; remote deploy path already selects the right arch binary via `detect_target`.
 
-### Panes past slot 9 are not reachable today (Slice 6.0 regression)
+### Panes past slot 9 are not reachable today (Slice 6.0 regression, Phase 6 close carve-out)
 
 Slice 6.0 removed `Ctrl-b 0..9`, `Ctrl-b n`, `Ctrl-b p` in favor of
 click-to-switch on the mouse-driven tab strip. The strip still caps
@@ -145,21 +145,126 @@ Workarounds today: close a visible pane via the `[×]` affordance
 documented `tepegoz connect <alias>` CLI to drop directly into a
 remote shell without going through the stack.
 
-**Phase 6 upgrade path**. The agent-based multiplex (one SSH
-connection per host, many panes over it) makes >9-pane workloads
-much more likely, so Phase 6 revisits the overflow overlay — either
-a clickable pane-list modal off the `[+N]` glyph, or an infinite-
-scroll horizontal tab strip. The right design question will surface
-concretely once the agent pipeline is in place; deferring until
-then avoids locking in an overlay the agent UX might obsolete.
+**v1.1 polish path (Phase 6 close accepted this as v1.1 rather than
+6e)**. The Phase 6 close manual-demo walk did not surface this as
+a real user-blocker (8-scenario script doesn't stack >9 panes).
+Deferred with three candidate shapes enumerated for the v1.1
+pickup:
+
+1. **Clickable `[+N]` modal.** Click the overflow glyph → centered
+   pane-list modal (same shape as the 6c-iii host picker / 6.0
+   help overlay); arrow keys + Enter select; Esc dismisses. Zero
+   horizontal strip change; reuses the modal chrome we already
+   have. Keyboard equivalent: a dedicated keybind (`Ctrl-b w`
+   reopened, or a new one) or click-only.
+2. **Horizontal-scroll tab strip.** Strip renders the first N tabs
+   that fit the width; mouse wheel / drag scrolls the strip; the
+   `[+N]` glyph becomes a "more →" arrow at the edges. Closer to
+   traditional terminal multiplexer UX but requires hit-testing
+   logic for partial-tab clicks.
+3. **Agent-shaped alternative.** Once Phase 6's agent multiplex
+   makes >9-pane workloads common, the right answer may be a
+   session-level pane grouping (per host, collapsed to one tab by
+   default, expanded via click) — natural fit for remote-heavy
+   workflows. More design work; not a v1 shape.
+
+Pick at v1.1 time based on what the user's real usage surfaces.
+
+### Fleet procs column aggregation deferred to v1.1 (Phase 6 close carve-out)
+
+The Fleet tile's `procs` column renders as em-dash (`—`) for every
+host — Phase 5 shipped it as a placeholder, Phase 6 Slice 6d did
+NOT fill it in. The original Phase 6 plan had per-host procs
+aggregation filling the column from remote Processes probes; the
+Slice 6d scope cut it (accepted CTO carve-out) because cross-host
+simultaneous Processes subscription doesn't fit 6d's single-target
+picker model — the picker retargets ONE tile to ONE host, so
+rendering a count per Fleet row would require a distinct
+aggregation layer (every host's agent subscribed to Processes
+concurrently, daemon aggregates + emits per-host counts on every
+Fleet refresh).
+
+**Workaround today (Phase 6 Slice 6d-ii shipping behavior)**. `Ctrl-b t`
+on the Processes tile opens the host picker; selecting a specific
+host retargets Processes to that host, and the live process list
+renders in the Processes tile (full per-host detail, not just a
+count). This is the intended path for "show me what's running on
+host X" — the Fleet column's em-dash is honest about "we don't
+show counts here" rather than misleading.
+
+**v1.1 polish path**. Two shapes to choose between:
+
+1. **Background-aggregation daemon task.** A new `Subscription::FleetProcs`
+   subscribes N host agents to Processes + emits one `FleetProcsCount
+   { counts: HashMap<String, u32> }` event per daemon Tick. Fleet
+   tile renders the count. Costs: extra daemon-side state, extra
+   agent-side CPU (every host running a Processes probe continuously
+   even when no one's looking at it), wire bump for the new event.
+2. **On-demand probe per Fleet refresh.** No continuous subscription;
+   instead, on each Fleet refresh the daemon dispatches a one-shot
+   Processes query to each connected agent (similar to
+   `tepegoz doctor --agents`'s fan-out shape). Lower idle cost but
+   higher latency on the Fleet row update.
+
+Neither is locked in. Pick at v1.1 when the user's real multi-host
+usage surfaces a clear preference (or when Phase 9's Claude Code
+awareness makes per-host aggregation the common shape).
+
+### ContainerList-over-SSH positive-arm fixture (Phase 6 close carve-out)
+
+`crates/tepegoz-core/tests/remote_docker_subscription_roundtrip.rs`
+asserts the remote Docker subscription pipeline reaches either
+`Event::ContainerList` OR `Event::DockerUnavailable` on the client's
+sub id — proving the routing + id translation + unsubscribe teardown
+work. In the stock fixture (`lscr.io/linuxserver/openssh-server`
+without `/var/run/docker.sock` bind-mount), only the
+`DockerUnavailable` arm actually executes; the `ContainerList` arm
+is covered by `agent::tests::daemon_routes_subscribe_through_real_
+agent_and_sees_unavailable_when_docker_missing` via in-process
+`tokio::io::duplex` streams (no SSH), not end-to-end over SSH.
+
+**Why the Phase 6 Slice 6e fixture extension bust scope.** Getting
+the non-root `tepegoz` user inside the sshd container to access a
+bind-mounted host docker.sock requires either (a) setting `PGID`
+equal to docker.sock's gid — conflicts with the linuxserver image's
+s6 init `groupmod` flow when the gid is 0 (common on macOS Docker
+Desktop where the VM's docker daemon runs as root:root); (b)
+`--group-add <gid>` — adds the gid as a supplementary group to
+container PID 1, but sshd children created per SSH login don't
+reliably inherit (depends on PAM session + NSS cache); (c) `chmod
+666` on docker.sock from inside the container — works but modifies
+the HOST's docker.sock permissions via bind-mount semantics,
+unacceptable for a developer's running Docker daemon; (d) nested
+docker-in-docker (`docker:dind` base + sshd) — cleanest, but
+significant fixture scope (custom Dockerfile + sshd setup + TLS
+between dind + bollard, or dind-with-unix-socket).
+
+**v1.1 upgrade path.** When CI needs the positive-arm coverage
+(likely at release hardening or when a real SSH + docker routing
+regression surfaces), adopt path (d): custom Dockerfile inheriting
+from `docker:dind-rootless` (or `docker:dind` + plain OpenSSH
+overlay), publishing a nested docker daemon accessible as the SSH
+user. Budget: ~1 hour for fixture + another ~30 min for test
+stability against the opt-in env gate. Alternative: tests run
+against a real managed VM in CI (e.g., an ephemeral EC2 instance
+with docker preinstalled), which sidesteps the userns gymnastics
+but adds a cloud-credential layer to the CI surface.
+
+Diagnostic path if a user reports "remote Docker works but I can't
+see container list": re-run the opt-in test under `RUST_LOG=trace`;
+confirm the agent's handshake response includes `"docker"` in
+capabilities; check the daemon's `agent_conns` entry has a live
+writer; confirm `route_remote_subscribe` is NOT short-circuiting
+to `DockerUnavailable` via the missing-capability branch.
 
 ### `Ctrl-b w` pane-list overlay deferred to v1.1 *(superseded by Slice 6.0)*
 
 5d-ii originally reserved `Ctrl-b w` for a pane-list overlay to
 enumerate panes past slot 9. Slice 6.0 removed `Ctrl-b w` entirely
 along with the other pane-nav keybinds; the overlay concept is
-re-scoped under "Panes past slot 9 are not reachable today" above,
-with the Phase 6 revisit owning the final design decision.
+re-scoped under "Panes past slot 9 are not reachable today" above
+with three v1.1 candidate shapes (`[+N]` modal vs. horizontal-
+scroll strip vs. agent-shaped grouping).
 
 ### Pane stack is session-local (5d-ii → Phase 6 agent consolidation)
 
