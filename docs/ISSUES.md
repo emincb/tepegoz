@@ -10,6 +10,60 @@ _(none)_
 
 ---
 
+## Phase 5 close caveats (manual demo coverage gap)
+
+Phase 5 closed on 2026-04-15 with scenarios 1-4 of the 8-scenario
+manual demo walked by the user; scenarios 5-8 were not manually
+validated. Each underlying piece of the failure-mode machinery IS
+machine-tested, but the end-to-end "real SSH failure → red toast
+renders" path is only exercised by opt-in integration tests, never
+by a live user eyeball.
+
+**What IS verified at close:**
+
+- Scenarios 1-4 (CLI connect, multi-pane open via Fleet, tab
+  switching, detach/reattach): manually walked end-to-end against a
+  live `lscr.io/linuxserver/openssh-server` container.
+- Scenario 5-6 daemon machinery (heartbeat → Degraded → Disconnected
+  → reconnect): `crates/tepegoz-core/tests/fleet_scope.rs::
+  fleet_supervisor_connects_autoconnect_host_and_reconnects_after_
+  container_kill` (opt-in, ran green at 5c-i).
+- Scenario 7-8 pieces: `tepegoz-ssh::known_hosts` tests (mismatch
+  returns file:line, `forget` preserves hand-edited entries, 0600
+  mode), `tepegoz-ssh::session` auth-chain tests (passphrase-key-no-
+  agent surfaces verbatim), `tepegoz-tui::scope::fleet` render tests
+  (4 glyphs render correctly per state), TUI toast-gating unit tests
+  (transition-into-terminal only).
+
+**What IS NOT verified:**
+
+- End-to-end TUI rendering on a real SSH failure: does the red toast
+  text read correctly? does the `⚠` glyph appear with the right
+  timing? does `tepegoz doctor --ssh-forget <alias>` followed by
+  reconnect actually re-TOFU cleanly?
+
+**If a user reports a bug in this area:**
+
+- Check `${XDG_CACHE_HOME:-~/.cache}/tepegoz/tui.log` for
+  `HostStateChanged` trace events around the reported failure.
+- Re-run the opt-in integration test with
+  `TEPEGOZ_SSH_TEST=1 TEPEGOZ_DOCKER_TEST=1 cargo test -p
+  tepegoz-core --test fleet_scope` to confirm the daemon still
+  transitions correctly.
+- If the daemon transitions correctly but the TUI doesn't render the
+  expected toast, the bug is in `app.rs::handle_fleet_event` (toast
+  gating) or `scope/fleet.rs` (glyph mapping). Neither path has been
+  touched since 5c-ii.
+
+**Why close anyway:** the failure-mode UX is insurance-tier
+functionality, not daily-use; the user's explicit priority call is
+"move on, fix if reports surface." Slice 6.0 touches the TUI
+rendering layer anyway (mouse capture + hover states + help
+overlay), so any real regression in this area would likely surface
+during 6.0 work.
+
+---
+
 ## Known limitations, Phase 6 upgrade path
 
 Documented gaps that are **not bugs** — they're accepted scope

@@ -399,11 +399,13 @@ Proposal pass signed off 2026-04-14: (Q1) Processes lives as a toggle-mode sub-s
 
 ---
 
-## Phase 5 — SSH transport + remote pty · 🟠 (5a + 5b landed)
+## Phase 5 — SSH transport + remote pty · ✅ (2026-04-15)
 
-**Goal.** `tepegoz connect user@host` opens a remote pty pane — same UX as local.
+**Goal.** `tepegoz connect <alias>` opens a remote pty pane — same UX as local.
 
 Proposal pass signed off 2026-04-14: Q1 ssh concrete + trait-in-Phase-10; Q2 ssh_config + overrides (config.toml + env) with first-non-empty-wins + `tepegoz doctor --ssh-hosts` diagnostic; Q3 russh-direct in Phase 5, agent-backed in Phase 6; Q4 SSH_AUTH_SOCK + IdentityFile (NOT layered under Decision #2); **Q5 tab-strip inside PTY tile** (option b per README mockup — "all activity visible" is the product promise, one line of chrome is the point); Q6 four-state markers (`●`/`◐`/`○`/`⚠`) + state machine + Ctrl-b r recovery; Q7 five sub-slices.
+
+Close commit lands after user signed off scenarios 1-4 of the `cargo xtask demo-phase-5 up`-driven manual demo (CLI connect, multi-pane Fleet open, Ctrl-b pane nav, detach/reattach). Scenarios 5-8 (SSH drop, reconnect, auth fail, host-key mismatch) NOT manually walked — documented coverage gap in `docs/ISSUES.md#phase-5-close-caveats-manual-demo-coverage-gap` with per-layer machine-test citations + diagnostic path if bugs surface.
 
 ### Slice 5a — `tepegoz-ssh` crate: connect + auth + TOFU + ssh_config · ✅ (`2b54d2e`)
 
@@ -478,13 +480,26 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
 
 **Phase 5 limitation**: dropped SSH connection kills the pane. Client renders a terminal `PaneExit` event and the pane is dead; user must open a fresh one. Phase 6's agent-backed pty (same wire shape) survives SSH flaps. Documented in `docs/ISSUES.md` under "Known limitations, Phase 6 upgrade path".
 
-### Slice 5d-ii — Pane-stack + tab strip + Ctrl-b keybinds + `tepegoz connect <alias>` · ⚪
+### Slice 5d-ii — Pane-stack + tab strip + Ctrl-b keybinds + `tepegoz connect <alias>` · ✅ (`35e7fd9`)
 
-Upcoming. TUI `pane_stack: Vec<PaneId>` + `active_pane: usize`; 1-line tab strip inside the PTY tile's Rect (active marked with `*` suffix, inactive rendered with `Modifier::DIM` — not bright cyan, reserved for tile-focus); `Ctrl-b 0..9` jump, `Ctrl-b n`/`p` cycle, `Ctrl-b &` close current (re-opens local root if stack would empty); `Ctrl-b Enter` on focused Fleet row opens a remote pane + pushes + focuses. `tepegoz connect <alias>` CLI subcommand. 5e's manual demo gates Phase 5 close.
+**Delivered.**
+- TUI `App` gains `pane_stack: Vec<PaneEntry>` + `active_pane: usize` + `pending_opens: VecDeque<PendingOpen>`. Each `PaneEntry` carries `pane_id` + `sub_id` + `label` + its own `vt100::Parser` — switching tabs restores each pane's screen without a daemon re-subscribe.
+- 1-row tab strip inside the PTY tile's Rect (`pty_content_dims()` carves the chrome off `pty_tile_dims()`; daemon-side ResizePane + parser sizing both use content dims so vim et al. render inside the box, not one row taller). Format: `[N label*]` with `*` suffix on active; `Modifier::BOLD` + default-fg on active, `DarkGray + DIM` on inactive (not bright cyan — reserved for tile-focus per the existing scope-renderer contract). `[+N]` overflow indicator when >9 panes; the full list-view overlay is deferred to v1.1 and `Ctrl-b w` is explicitly swallowed in the input filter so accidental presses don't leak `w` to the pty.
+- `Ctrl-b 0..9` jump (digit 0 = slot 10 per tmux muscle memory); `Ctrl-b n`/`p` cycle with wrap; `Ctrl-b &` close active (ClosePane + Unsubscribe + auto-reopen-local-root if stack would empty); `Ctrl-b Enter` on focused Fleet row dispatches `OpenPane { target: Remote { alias } }` for the selected host (Info toast "opening ssh:`<alias>`…"; PaneOpened response pushes + focuses PTY). `Ctrl-b h/j/k/l` + `Ctrl-b &` stay as undocumented aliases in Slice 6.0 post-simplification.
+- `tepegoz connect <alias>` CLI subcommand via `run_with_initial_target(config, Remote { alias }, reuse_alive=false)`. Shares session-path code with `tepegoz tui`'s `run()` (which uses `Local + reuse_alive=true`); `ensure_pane` skips `ListPanes` when `reuse_alive=false` so the CLI always opens a fresh pane. Failure paths out as `anyhow::bail!` → stderr + non-zero exit.
+- FIFO correlation for `PaneOpened` responses via `pending_opens` queue. Wire protocol has no per-request id on `OpenPane`; daemon processes commands serially so FIFO works. Edge case documented: 5e's prefix-guard (`info.message.starts_with("open pane")` / `"open remote pane"`) keeps unrelated `Error` envelopes from mis-consuming the queue, but a proper per-OpenPane `request_id` lands in Phase 6 wire v10.
+- `PaneExit` on empty stack → `Detach` (preserves `tepegoz connect`'s "return to outer shell when remote dies"); `Ctrl-b &` on empty stack → auto-reopen local root (preserves `tepegoz tui`'s "PTY tile never goes blank").
+- Two 5e polish items folded ahead of schedule: FleetScope discovery-error body-text branch (source starts-with `"discovery error:"` → "Host discovery failed — see source label above" instead of blaming user config); toast-gating comment rewrite per CTO Option B (state-only gating is honest v1; reason-diff retoasting is v1.1 polish).
+- Integration test `two_panes_multiplex_bytes_on_independent_subscriptions` pins byte-isolation across panes via local-pane stand-ins (identical wire shape — remote wire path covered by 5d-i's opt-in test). 27 new TUI lib tests (166 → 193); implementation ~420 LOC; CI green all 7 jobs.
 
-### Slice 5e — Error surfaces + disconnect recovery + e2e manual demo · ⚪
+### Slice 5e — 5e polish + manual demo runner + close · ✅ (`edbf360` + `da85cb8` + `e51cf35` + `b226c03` + _close commit_)
 
-Upcoming. Inline "`— ssh connection lost: <reason> —`" marker in the pane scrollback; `⚠` red state rendering with russh-verbatim toast; host-key-change rejection path. Phase 5 close: 8-scenario manual demo.
+**Delivered.**
+- **Polish** (`edbf360`). FIFO correlation prefix-guard (new regression `unrelated_error_while_open_pending_does_not_consume_fifo`); `scope::fleet::short_source` magic numbers hoisted to `STATUS_BAR_NON_SOURCE_COMFORT` / `STATUS_BAR_NON_SOURCE_TRUNCATE` / `SOURCE_MIN_CHARS`; `PtyManager::open` gains a `debug_assert!(id < (1u64 << 32))` tripwire on the disjoint local-vs-remote `PaneId` namespace invariant. +1 TUI lib test.
+- **Demo prep** (`da85cb8`). `docs/OPERATIONS.md` gains a "Slice 5e manual demo prep (Phase 5 close)" section mirroring 4d's shape — 8 scenarios (CLI connect / multi-pane Fleet open / pane nav / detach-reattach / SSH drop / reconnect / auth fail / TOFU-mismatch) + pass/fail matrix + teardown. `docs/ISSUES.md` adds two new entries under "Known limitations, Phase 6 upgrade path": pane-stack-session-local (reattach shows one pane per the simpler v1 policy; Phase 6 unlocks `SessionResume` wire) + FIFO-OpenPane-correlation edge cases (brittle to malformed AttachPane prefix collision; Phase 6 wire v10 `request_id` deletes the guard).
+- **Manual-demo xtask** (`e51cf35`). `cargo xtask demo-phase-5 up/down` replaces the ~60-line multi-terminal shell-setup Prep block with a one-command runner — preflight (docker + ssh-keygen + cargo + `docker info` reachable) → stable tempdir at `$TMPDIR/tepegoz-demo-phase-5/` → ed25519 keypair → `tepegoz-demo-phase-5-sshd` container on random host port → tepegoz config.toml pointing `staging` at the fixture → `cargo build` → spawn daemon with `TEPEGOZ_CONFIG_DIR`/`TEPEGOZ_DATA_DIR` env vars → wait for socket at `default_socket_path()` → print "Ready. Run 'tepegoz tui' in a new terminal." → block on SIGINT via `ctrlc` crate. `down` subcommand tears down idempotently (kill daemon via PID file, `docker rm -f` the fixture, remove the tempdir). New standing rule captured in memory + CTO relay: every phase with a manual-demo gate ships a `cargo xtask demo-<phase>` runner alongside the phase's first meaningful implementation, never deferred to the close slice.
+- **Preflight fix** (`b226c03`). Original preflight's `--version`-exit-zero probe falsely flagged macOS `ssh-keygen` (OpenBSD-derived, rejects `--version` with non-zero exit) as missing. Fix: match on `Command::status()`'s `Err(NotFound)` vs. `Ok(_)` to distinguish "binary not on PATH" from "binary ran with non-zero exit" — the exit code was always a red herring.
+- **Phase 5 close caveat**. User ran scenarios 1-4 manually and signed off; scenarios 5-8 not walked. Each failure-mode machinery piece IS machine-tested at the layer level (opt-in `fleet_scope.rs` covers the supervisor path; `known_hosts` / `session` / `scope::fleet` unit tests cover scenarios 7-8 pieces). The end-to-end UX rendering on a real SSH failure remains the documented coverage gap in `docs/ISSUES.md#phase-5-close-caveats-manual-demo-coverage-gap`. Slice 6.0's TUI-rendering-layer changes (mouse + hover + help overlay) touch this area and would likely surface any regression.
 
 **Not in scope.** QUIC (Phase 10). Multi-host agent coordination (Phase 6). ProxyJump (v1.1). SSH certificate auth (v1.1). PKCS#11 hardware tokens (v1.1, indirect via ssh-agent).
 
