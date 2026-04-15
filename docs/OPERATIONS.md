@@ -736,6 +736,48 @@ cargo xtask demo-phase-5 down
 
 `down` is safe to run multiple times; when there's nothing to clean up it prints `Torn down.` and exits 0.
 
+## Building agents + Phase 6 Slice 6a demo
+
+**Cross-compile all four agent targets.** Requires `zig` + `cargo-zigbuild` on PATH (plain cargo can't cross-link a Darwin SDK from a Linux host or vice versa):
+
+```sh
+# One-time setup
+brew install zig                          # or https://ziglang.org/download/
+cargo install cargo-zigbuild
+
+# Build agents for all four target triples
+cargo xtask build-agents
+```
+
+Output layout:
+
+```text
+target/agents/x86_64-unknown-linux-musl/{tepegoz-agent, manifest.json}
+target/agents/aarch64-unknown-linux-musl/{tepegoz-agent, manifest.json}
+target/agents/x86_64-apple-darwin/{tepegoz-agent, manifest.json}
+target/agents/aarch64-apple-darwin/{tepegoz-agent, manifest.json}
+```
+
+Each `manifest.json` carries the compiled-in `protocol_version`, `target_triple`, and `built_at_unix_secs`. The controller's `build.rs` (`crates/tepegoz/build.rs`) picks these up on the next `cargo build` and embeds each binary via `include_bytes!`, asserting the manifest `protocol_version` matches the proto text file at `crates/tepegoz-proto/PROTOCOL_VERSION`. Mismatch is a hard compile failure; the diagnostic names the offending triple and suggests `cargo xtask build-agents` as the fix.
+
+Plain `cargo build` (no `build-agents` invocation) still succeeds: the `build.rs` emits one `cargo:warning` about the missing tree and populates every `agents::embedded_agents::<ARCH>` slot with `None`. Remote deploy (Phase 6 Slice 6b onward) will surface a runtime error in that state; until 6b lands the fallback path is a harmless no-op.
+
+**Phase 6 Slice 6a local handshake demo.** No SSH yet — this builds `tepegoz-agent` for the host target only, spawns it as a subprocess with piped stdio, drives a single `AgentHandshake` envelope, prints the pretty-formatted response. Proves the agent + wire + codec scaffolding work end-to-end:
+
+```sh
+cargo xtask demo-phase-6 up
+# Expect output like:
+#   agent handshake ✓
+#     request_id:   1
+#     version:      10
+#     os:           macos
+#     arch:         aarch64
+#     capabilities: (none — 6a ships an empty list; 6c/d populate)
+
+cargo xtask demo-phase-6 down
+# Idempotent tempdir cleanup; nothing persistent to remove in 6a.
+```
+
 ## SSH Fleet discovery (Phase 5 Slice 5b)
 
 Tepegöz resolves the SSH Fleet host list from three sources, in strict

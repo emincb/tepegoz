@@ -507,22 +507,21 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
 
 ---
 
-## Phase 6 — Agent binary + remote scope panels · ⚪
+## Phase 6 — Agent binary + remote scope panels · 🟠 (6a landed 2026-04-15)
 
 **Goal.** Deploy a lightweight agent to remote hosts; the same scope panels work against remote as against local.
 
-**Scope.**
-- `tepegoz-agent` subcommand runs a stdio-framed protocol server. Targets: static musl Linux (x86_64 + aarch64), universal macOS. <5 MB per target.
-- `xtask build-agents` cross-compiles all four targets into `target/agents/`.
-- Controller `build.rs` reads `target/agents/` and `include_bytes!`s each arch.
-- Daemon: detect remote OS + arch over SSH → `scp` the matching agent binary to `~/.cache/tepegoz/agent-<version>` → verify SHA256 → exec over SSH with stdio carrying the protocol.
-- Remote scope panels: Docker, Ports, Processes — same wire protocol, agent-backed.
+**Slice 6a — Agent scaffolding + local handshake (landed 2026-04-15).** `tepegoz-agent` is a real stdio-framed protocol server with a reusable `lib::run_stdio()` entry point; the controller's `tepegoz agent --stdio` subcommand routes through the same `run_stdio`. Wire protocol bumped to v10 with `Payload::AgentHandshake { request_id }` + `Payload::AgentHandshakeResponse { request_id, version, os, arch, capabilities }`. `PROTOCOL_VERSION` moved to a plain-text source of truth at `crates/tepegoz-proto/PROTOCOL_VERSION` read by the proto `build.rs`, the controller `build.rs`, and the xtask. Controller `build.rs` embeds each populated agent via `include_bytes!` + asserts the manifest `protocol_version` matches the text file at compile time (hard failure on drift). Graceful fallback: `cargo build` without a populated `target/agents/` emits one `cargo:warning` and every embedded slot is `None`. `cargo xtask build-agents` cross-compiles the 4 targets via `cargo zigbuild --profile release-agent` and writes `manifest.json` sidecars. `cargo xtask demo-phase-6 up/down` spawns a host-target agent, drives the handshake, prints the response. Universal macOS `lipo` deferred to 6b. Acceptance: `agent_handshake_roundtrip` integration test (spawns real subprocess, asserts full wire round-trip).
 
-**Acceptance.** Full fleet test: deploy agent to a test VM via SSH, open a remote pane, verify docker panel works against remote docker, verify port scan finds a known open port on remote host.
+**Slice 6b — SSH deploy (not started).** Daemon detects remote OS + arch over SSH → `scp` the matching agent binary to `~/.cache/tepegoz/agent-<version>` → verify SHA256 → exec over SSH with stdio carrying the protocol. `tepegoz doctor --agents` diagnostic lists deployed agents + their versions. Agent TOFU (record the agent binary hash per-host on first deploy, reject mismatches thereafter). Universal macOS `lipo` rolls up here if the two darwin binaries cause operator pain. Extends `cargo xtask demo-phase-6` to exercise the full deploy + handshake round-trip against the existing Phase 5 sshd container fixture.
+
+**Slices 6c/d — Remote scope panels.** Docker, Ports, Processes — same wire protocol, agent-backed. Agent `capabilities` list (empty in 6a) populates as probes land.
+
+**Acceptance (full phase).** Full fleet test: deploy agent to a test VM via SSH, open a remote pane, verify docker panel works against remote docker, verify port scan finds a known open port on remote host.
 
 **Not in scope.** Agent auto-update (agents are redeployed per controller version). Multi-user agents.
 
-**Risks.** Cross-compiling the agent for 4 targets is real work. Protocol/library version drift between controller and embedded agents must be caught by CI.
+**Risks.** Cross-compiling the agent for 4 targets is real work (6a proved out the zig-backed path). Protocol/library version drift between controller and embedded agents is caught by the 6a build.rs drift check + runtime handshake version field.
 
 ---
 

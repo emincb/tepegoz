@@ -3902,6 +3902,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
  "tepegoz-agent",
  "tepegoz-core",
  "tepegoz-ssh",
@@ -3919,6 +3920,7 @@ dependencies = [
  "tepegoz-proto",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5136,6 +5138,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "tepegoz-proto",
+ "tokio",
 ]
 
 [[package]]

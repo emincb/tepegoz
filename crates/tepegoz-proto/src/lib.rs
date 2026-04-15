@@ -16,28 +16,43 @@ use rkyv::{Archive, Deserialize, Serialize};
 pub mod codec;
 pub mod socket;
 
-/// Current wire protocol version. Bumps on breaking change.
-///
-/// Version history:
-/// - **v3 (Phase 3 Slice A)**: `Subscription::Docker`, `Event::ContainerList`,
-///   `Event::DockerUnavailable`, `DockerContainer`/`DockerPort`/`KeyValue`.
-/// - **v4 (Phase 3 Slice B)**: `Subscription::DockerLogs` /
-///   `Subscription::DockerStats`, `Payload::DockerAction` +
-///   `Payload::DockerActionResult`, `Event::ContainerLog` /
-///   `Event::ContainerStats` / `Event::DockerStreamEnded`, plus
-///   `DockerActionKind`, `DockerActionOutcome`, `LogStream`, `DockerStats`.
-/// - **v5 (Phase 4 Slice 4a)**: `Subscription::Ports`, `Event::PortList`,
-///   `Event::PortsUnavailable`, `ProbePort`. Daemon-side port → process →
-///   container correlation delivers pre-joined rows so clients stay dumb.
-/// - **v6 (Phase 4 Slice 4b)**: `Subscription::Processes`,
-///   `Event::ProcessList`, `Event::ProcessesUnavailable`, `ProbeProcess`.
-///   `cpu_percent: Option<f32>` — `None` on the first sample after
-///   subscription (sysinfo has no prior delta to compute against); the TUI
-///   renders `None` as an em-dash rather than `0.0%` to disambiguate
-///   "not-yet-measured" from "idle". `start_time_unix_secs` pairs with
-///   `pid` to form a stable identity for selection persistence under pid
-///   reuse.
-pub const PROTOCOL_VERSION: u32 = 9;
+// Current wire protocol version. Bumps on breaking change.
+//
+// The literal value is *not* declared here — it's read at build time
+// from `crates/tepegoz-proto/PROTOCOL_VERSION` (a plain text file)
+// by `build.rs`, which emits the const into `OUT_DIR/version.rs`.
+// The text file is the single source of truth shared with the
+// agent's manifest writer, the controller's `include_bytes!` +
+// version-drift `build.rs`, and the `xtask::build_agents` runtime.
+// See the build.rs header for the rationale.
+//
+// Version history:
+// - v3 (Phase 3 Slice A): `Subscription::Docker`, `Event::ContainerList`,
+//   `Event::DockerUnavailable`, `DockerContainer` / `DockerPort` / `KeyValue`.
+// - v4 (Phase 3 Slice B): `Subscription::DockerLogs` /
+//   `Subscription::DockerStats`, `Payload::DockerAction` +
+//   `Payload::DockerActionResult`, `Event::ContainerLog` /
+//   `Event::ContainerStats` / `Event::DockerStreamEnded`, plus
+//   `DockerActionKind`, `DockerActionOutcome`, `LogStream`, `DockerStats`.
+// - v5 (Phase 4 Slice 4a): `Subscription::Ports`, `Event::PortList`,
+//   `Event::PortsUnavailable`, `ProbePort`. Daemon-side port → process →
+//   container correlation delivers pre-joined rows so clients stay dumb.
+// - v6 (Phase 4 Slice 4b): `Subscription::Processes`,
+//   `Event::ProcessList`, `Event::ProcessesUnavailable`, `ProbeProcess`.
+//   `cpu_percent: Option<f32>` — `None` on the first sample after
+//   subscription (sysinfo has no prior delta to compute against).
+// - v7 (Phase 5 Slice 5b): `Subscription::Fleet`, `Event::HostList`,
+//   `Event::HostStateChanged`, `HostEntry`, `HostState`.
+// - v8 (Phase 5 Slice 5c-ii): `Payload::FleetAction` +
+//   `Payload::FleetActionResult`; `Event::HostStateChanged.reason`.
+// - v9 (Phase 5 Slice 5d-i): `OpenPaneSpec.target:
+//   PaneTarget::{Local, Remote { alias }}`.
+// - v10 (Phase 6 Slice 6a): `Payload::AgentHandshake { request_id }`
+//   + `Payload::AgentHandshakeResponse { request_id, version, os,
+//   arch, capabilities }`. Capabilities are strings for forward-
+//   compatibility as 6c/d add real docker / ports / processes / pty
+//   probes.
+include!(concat!(env!("OUT_DIR"), "/version.rs"));
 
 /// Identifier for a pty pane owned by the daemon.
 pub type PaneId = u64;
@@ -92,6 +107,18 @@ pub enum Payload {
     /// shape for pending-action correlation + toast UX.
     FleetAction(FleetActionRequest),
 
+    // agent handshake (controller → agent, Phase 6 Slice 6a)
+    /// First message a controller sends down the stdio channel after
+    /// the agent process starts. The agent replies with
+    /// `AgentHandshakeResponse` carrying the same `request_id` so
+    /// later parallel channels (Phase 6 multiplexing) can correlate.
+    /// `request_id` is the allocator value — single monotonic
+    /// counter shared across subscription ids + one-shot requests
+    /// per the existing pattern.
+    AgentHandshake {
+        request_id: u64,
+    },
+
     // ---- daemon → client ----
     Welcome(Welcome),
     Pong,
@@ -108,6 +135,28 @@ pub enum Payload {
     /// supervisor" — actual connection outcome arrives via
     /// `HostStateChanged` events, not this reply.
     FleetActionResult(FleetActionResult),
+
+    // agent handshake response (agent → controller, Phase 6 Slice 6a)
+    /// Agent's reply to `AgentHandshake`. `request_id` echoes the
+    /// originating request; `version` is the agent binary's
+    /// compiled-in `PROTOCOL_VERSION`, checked by the controller
+    /// against its own constant as the runtime arm of the version-
+    /// drift defence (the compile-time arm lives in the controller
+    /// `build.rs` against embedded-agent manifests). `os` / `arch`
+    /// mirror `std::env::consts::{OS, ARCH}` so the controller can
+    /// log / route per remote environment. `capabilities` is
+    /// forward-compatibly carried as free-form strings
+    /// (`"docker"` / `"ports"` / `"processes"` / `"pty"` as the 6c/d
+    /// probes land) — adding a new probe kind in later slices
+    /// doesn't require a wire bump.
+    AgentHandshakeResponse {
+        request_id: u64,
+        version: u32,
+        os: String,
+        arch: String,
+        capabilities: Vec<String>,
+    },
+
     Error(ErrorInfo),
 }
 

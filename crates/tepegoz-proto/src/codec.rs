@@ -57,6 +57,8 @@ fn payload_variant(p: &Payload) -> &'static str {
         Payload::PaneList { .. } => "PaneList",
         Payload::DockerActionResult(_) => "DockerActionResult",
         Payload::FleetActionResult(_) => "FleetActionResult",
+        Payload::AgentHandshake { .. } => "AgentHandshake",
+        Payload::AgentHandshakeResponse { .. } => "AgentHandshakeResponse",
         Payload::Error(_) => "Error",
     }
 }
@@ -951,6 +953,86 @@ mod tests {
                 other => panic!("expected Remote target, got {other:?}"),
             },
             other => panic!("expected OpenPane, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_handshake_roundtrip_preserves_request_id() {
+        // Phase 6 Slice 6a wire-v10 addition. Controller → agent
+        // variant — a single `request_id` field.
+        let (mut a, mut b) = tokio::io::duplex(256);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::AgentHandshake { request_id: 42 },
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::AgentHandshake { request_id } => assert_eq!(request_id, 42),
+            other => panic!("expected AgentHandshake, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_handshake_response_roundtrip_preserves_all_fields() {
+        // Phase 6 Slice 6a wire-v10 addition. Agent → controller
+        // variant. Capabilities carried as strings — adding a new
+        // kind (`"pty"`, `"scan"`, etc.) must not require a wire
+        // bump.
+        let (mut a, mut b) = tokio::io::duplex(512);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::AgentHandshakeResponse {
+                request_id: 42,
+                version: PROTOCOL_VERSION,
+                os: "linux".into(),
+                arch: "aarch64".into(),
+                capabilities: vec!["docker".into(), "ports".into(), "processes".into()],
+            },
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::AgentHandshakeResponse {
+                request_id,
+                version,
+                os,
+                arch,
+                capabilities,
+            } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(version, PROTOCOL_VERSION);
+                assert_eq!(os, "linux");
+                assert_eq!(arch, "aarch64");
+                assert_eq!(capabilities, vec!["docker", "ports", "processes"]);
+            }
+            other => panic!("expected AgentHandshakeResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_handshake_response_roundtrip_preserves_empty_capabilities() {
+        // 6a-specific expectation: the agent ships an empty
+        // capabilities list because no probes are wired yet.
+        // Capabilities will populate as 6c/d land.
+        let (mut a, mut b) = tokio::io::duplex(256);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::AgentHandshakeResponse {
+                request_id: 1,
+                version: PROTOCOL_VERSION,
+                os: "macos".into(),
+                arch: "x86_64".into(),
+                capabilities: Vec::new(),
+            },
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::AgentHandshakeResponse { capabilities, .. } => {
+                assert!(capabilities.is_empty());
+            }
+            other => panic!("expected AgentHandshakeResponse, got {other:?}"),
         }
     }
 }

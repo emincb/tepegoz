@@ -23,3 +23,9 @@ tepegoz-core = { workspace = true }
 tepegoz-tui = { workspace = true }
 tepegoz-agent = { workspace = true }
 tepegoz-ssh = { workspace = true }
+
+[build-dependencies]
+# build.rs parses manifest.json sidecars written by `cargo xtask
+# build-agents`. serde_json is the cheapest way to do that without
+# bespoke parsing — the sidecar format is a single flat object.
+serde_json = "1"

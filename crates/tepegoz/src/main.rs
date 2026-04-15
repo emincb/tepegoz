@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod agents;
+
 #[derive(Parser)]
 #[command(
     name = "tepegoz",
@@ -115,9 +117,20 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Agent { stdio } => {
-            init_stdout_tracing(&cli.log_level);
-            tracing::info!(stdio, "agent mode — not yet implemented (Phase 6)");
-            Ok(())
+            // --stdio is the only mode today. Kept as a flag so
+            // future variants (e.g. a local-socket transport for
+            // co-located agent experiments) don't need a breaking
+            // CLI rewrite. Tracing goes to stderr so it doesn't
+            // corrupt the wire on stdout.
+            init_stderr_tracing(&cli.log_level);
+            if !stdio {
+                anyhow::bail!(
+                    "tepegoz agent: only --stdio is supported in Phase 6 Slice 6a. \
+                     Re-invoke with --stdio, or run the standalone `tepegoz-agent` \
+                     binary directly (same code path, same behavior)."
+                );
+            }
+            tepegoz_agent::run_stdio().await
         }
         Command::Doctor {
             claude_layout,
@@ -214,4 +227,26 @@ fn init_stdout_tracing(default_level: &str) {
         .from_env_lossy();
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// Like [`init_stdout_tracing`] but routes log output to stderr. Used
+/// by `tepegoz agent`, where stdout is reserved for the wire
+/// protocol — any log line on stdout would corrupt the envelope
+/// stream.
+fn init_stderr_tracing(default_level: &str) {
+    use tracing_subscriber::EnvFilter;
+
+    let default_directive = default_level
+        .parse()
+        .unwrap_or_else(|_| tracing::Level::WARN.into());
+
+    let filter = EnvFilter::builder()
+        .with_default_directive(default_directive)
+        .with_env_var("RUST_LOG")
+        .from_env_lossy();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }

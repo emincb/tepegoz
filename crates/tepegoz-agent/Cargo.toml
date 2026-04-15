@@ -8,8 +8,13 @@ license.workspace = true
 repository.workspace = true
 description = "Tepegöz remote agent logic (invoked over SSH stdio)."
 
+[[bin]]
+name = "tepegoz-agent"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 tepegoz-proto = { workspace = true }

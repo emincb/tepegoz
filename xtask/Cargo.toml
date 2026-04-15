@@ -17,8 +17,16 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 # Workspace-internal: share the daemon's default-socket-path resolution
 # so the demo's readiness check matches what `tepegoz tui` looks for
-# when the user connects in a new terminal.
+# when the user connects in a new terminal. `tepegoz-proto::codec` also
+# drives demo-phase-6's wire-protocol handshake against the agent
+# subprocess.
 tepegoz-proto = { workspace = true }
+# demo-phase-6 runs a tiny tokio runtime for the async codec (the
+# existing read_envelope/write_envelope surface is AsyncRead/Write-
+# shaped). Pulled in with `full` via the workspace dep spec —
+# negligible code-size impact because xtask only ships as a
+# developer-facing binary, never in the release bundle.
+tokio = { workspace = true }
 # Tiny pure-Rust SIGINT handler. std doesn't cover cross-platform
 # signal handling cleanly, so this is the minimum new dependency
 # needed to gracefully tear the demo fixture down on Ctrl-C.
