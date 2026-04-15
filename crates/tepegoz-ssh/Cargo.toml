@@ -40,5 +40,24 @@ dirs = "6"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+# Phase 6 Slice 6b — content-hash verification of deployed agent
+# binaries. `sha2` hashes the embedded bytes locally; the remote hash
+# comes from `sha256sum -b` (Linux) or `shasum -a 256 -b` (macOS),
+# picked per OS detected via `uname -sm` at deploy time. `hex`
+# formats the 32-byte digest for user-visible output + error
+# diagnostics.
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Phase 6 Slice 6b — the handshake round-trip at the end of a deploy
+# serializes `Payload::AgentHandshake` via tepegoz-proto, but the russh
+# channel's write path takes a `CryptoVec` instead of `AsyncWrite`. We
+# call `rkyv::to_bytes` directly for the outbound envelope and push the
+# bytes through `channel.data(...)` — the only cross-crate writer
+# path that needs the rkyv dep here.
+rkyv = "0.8"
+
 [dev-dependencies]
 tempfile = "3"
+# Opt-in integration test `remote_agent_deploy.rs` drives wire v10
+# envelopes via tepegoz-proto's PROTOCOL_VERSION constant.
+tepegoz-proto = { workspace = true }

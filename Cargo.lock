@@ -3902,9 +3902,12 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "serde_json",
+ "sha2 0.10.9",
  "tepegoz-agent",
  "tepegoz-core",
+ "tepegoz-proto",
  "tepegoz-ssh",
  "tepegoz-tui",
  "tokio",
@@ -4014,9 +4017,12 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "dirs",
+ "hex",
+ "rkyv",
  "russh",
  "russh-config",
  "serde",
+ "sha2 0.10.9",
  "tempfile",
  "tepegoz-proto",
  "thiserror 1.0.69",
@@ -5138,6 +5144,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "tepegoz-proto",
+ "tepegoz-ssh",
  "tokio",
 ]
 

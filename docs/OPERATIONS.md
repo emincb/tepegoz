@@ -778,6 +778,56 @@ cargo xtask demo-phase-6 down
 # Idempotent tempdir cleanup; nothing persistent to remove in 6a.
 ```
 
+## Remote agent deploy + handshake (Phase 6 Slice 6b)
+
+Slice 6b turns the 6a-embedded agent binaries into something you can actually run on a remote host. Three moving parts:
+
+1. **`cargo xtask demo-phase-6 up --remote`** — spawns a throwaway sshd container (`tepegoz-demo-phase-6-sshd`, separate from demo-phase-5's), cross-builds `tepegoz-agent` for `x86_64-unknown-linux-musl`, connects via tepegoz-ssh, deploys, and drives one handshake round-trip over the exec channel. Validates the full Slice 6b pipeline end-to-end against a known fixture.
+
+   ```sh
+   # Requires: docker, ssh-keygen, cargo-zigbuild (cross-platform) OR
+   # a Linux host with the musl target + linker installed.
+   cargo xtask demo-phase-6 up --remote
+   # Expect:
+   #   [demo-phase-6] sshd listening at 127.0.0.1:<port>
+   #   [demo-phase-6] cross-building tepegoz-agent for x86_64-unknown-linux-musl…
+   #   [demo-phase-6] connecting via SSH (TOFU → isolated known_hosts)…
+   #   [demo-phase-6] deploying agent (idempotent — cache hit if already matching)…
+   #   [demo-phase-6]   path: /config/.cache/tepegoz/agent-v10 (uploaded now)
+   #   remote agent handshake ✓
+   #     version:      10
+   #     os:           linux
+   #     arch:         x86_64
+   #     capabilities: (none — 6a/6b ship empty; 6c/d populate)
+   cargo xtask demo-phase-6 down --remote
+   # → docker rm -f + tempdir cleanup (idempotent)
+   ```
+
+2. **`tepegoz doctor --agents`** — observation-only report of the remote-agent deploy state across every Fleet host. For each host: connects via SSH → `uname -sm` → looks up the embedded blob for that target → inspects `$HOME/.cache/tepegoz/agent-v<N>` on the remote → reports presence/absence + SHA256 match. Non-fatal on per-host errors (unreachable hosts, etc. — logged inline + iteration continues).
+
+   ```sh
+   tepegoz doctor --agents
+   # Example output:
+   # source: ssh_config (/Users/emin/.ssh/config)
+   # agents (3 host(s)):
+   #   staging              x86_64-unknown-linux-musl       ✓ matches embedded
+   #     /home/ubuntu/.cache/tepegoz/agent-v10 (214008 bytes, mtime 1744000000)
+   #     remote   sha256: 3a7b5f2e8c1d4f9b
+   #   dev                  aarch64-apple-darwin            ✗ absent — would deploy on next connect
+   #   old-box              x86_64-unknown-linux-musl       ⚠ drift — redeploy needed
+   #     /home/ubuntu/.cache/tepegoz/agent-v10 (203456 bytes, mtime 1743800000)
+   #     remote   sha256: 9f8e7d6c5b4a3928
+   #     embedded sha256: 3a7b5f2e8c1d4f9b
+   ```
+
+   `doctor --agents` does NOT deploy — it reports what a fresh `tepegoz connect <alias>` (or a Slice 6c+ remote subscription) would do. Use it before deploys / after version bumps / when a remote flow fails unexpectedly.
+
+3. **Agent TOFU model**. Slice 6b does NOT maintain a first-seen stored-hash database for agent binaries (unlike SSH host keys). The embedded binary is the source of truth — every deploy verifies by content-hash against `sha2::Sha256::digest(&embedded_bytes)`. If the remote's file matches, no upload happens (cache-hit branch). If it diverges, we upload + verify + one-retry on mismatch + terminal error on second mismatch. Rationale: the agent's identity is its binary hash + `PROTOCOL_VERSION`, both controller-owned at build time — SSH-style "first-seen-wins" semantics don't add safety here, just complexity.
+
+**Known limitations** (`docs/ISSUES.md`):
+- Protocol version bumps leave orphaned `agent-v<N-1>` binaries on remote hosts (~1 MB each). Not a correctness issue; Phase 6 close or v1.1 will add a cleanup helper.
+- Universal macOS `lipo` deferred to the Phase 10 release pipeline (requires Xcode tooling not guaranteed on dev/CI boxes). Controllers embed two separate darwin binaries for now.
+
 ## SSH Fleet discovery (Phase 5 Slice 5b)
 
 Tepegöz resolves the SSH Fleet host list from three sources, in strict

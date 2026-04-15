@@ -41,13 +41,17 @@ enum Command {
         #[command(subcommand)]
         action: DemoAction,
     },
-    /// Phase 6 Slice 6a local handshake demo. Builds `tepegoz-agent`
+    /// Phase 6 Slice 6a local handshake demo — builds `tepegoz-agent`
     /// for the host target, spawns it as a subprocess, drives a
-    /// single `AgentHandshake` envelope, prints the response.
+    /// single `AgentHandshake` envelope, prints the response. With
+    /// `--remote` (Slice 6b), spawns an sshd container, cross-
+    /// compiles the agent for `x86_64-unknown-linux-musl`, deploys
+    /// via tepegoz-ssh + verifies sha256 + handshakes over the
+    /// exec channel.
     #[command(name = "demo-phase-6")]
     DemoPhase6 {
         #[command(subcommand)]
-        action: DemoAction,
+        action: Demo6Action,
     },
 }
 
@@ -57,6 +61,30 @@ enum DemoAction {
     Up,
     /// Tear the demo fixture down (idempotent).
     Down,
+}
+
+#[derive(Subcommand)]
+enum Demo6Action {
+    /// Bring the demo up (local subprocess handshake by default;
+    /// use `--remote` for the Slice 6b SSH deploy + handshake flow).
+    Up {
+        /// Switch to Slice 6b's full remote deploy scenario:
+        /// sshd container + cross-compile + tepegoz-ssh deploy +
+        /// handshake over the exec channel. Requires docker,
+        /// ssh-keygen, and either cargo-zigbuild (cross-platform)
+        /// or a host that can natively build
+        /// `x86_64-unknown-linux-musl` (Linux + musl target).
+        #[arg(long)]
+        remote: bool,
+    },
+    /// Tear the demo fixture down (idempotent).
+    Down {
+        /// Use Slice 6b's teardown: `docker rm -f` the sshd
+        /// container in addition to removing the tempdir. Harmless
+        /// if the container was never spawned.
+        #[arg(long)]
+        remote: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -71,8 +99,8 @@ fn main() -> anyhow::Result<()> {
             DemoAction::Down => demo::down()?,
         },
         Command::DemoPhase6 { action } => match action {
-            DemoAction::Up => demo_phase_6::up()?,
-            DemoAction::Down => demo_phase_6::down()?,
+            Demo6Action::Up { remote } => demo_phase_6::up(remote)?,
+            Demo6Action::Down { remote } => demo_phase_6::down(remote)?,
         },
     }
     Ok(())

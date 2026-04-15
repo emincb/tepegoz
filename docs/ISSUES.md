@@ -121,6 +121,14 @@ channel. Panes become cheap (one `OpenPane` wire frame each), and
 the "how many connections am I opening?" question disappears from
 the user's mental model.
 
+### Orphaned old-version agent binaries on remote hosts (Phase 6 Slice 6b known limitation)
+
+`tepegoz-ssh::deploy_agent` uploads to `$HOME/.cache/tepegoz/agent-v<N>` where N is the current `PROTOCOL_VERSION`. When N bumps (Phase 6 later slice or Phase 10 release), old `agent-v<N-1>` files stay behind on remote hosts — nothing garbage-collects them. Impact: a few hundred KB of stranded storage per host per protocol bump. Not a correctness bug (controller only ever looks at the current-N path) and not a 6b blocker per the brief. Recovery if it matters: `ssh <host> rm -f '~/.cache/tepegoz/agent-v*'` then reconnect to trigger a fresh deploy. Proper fix is a `cleanup_stale_versions` helper called from `deploy_agent` that rms any `agent-v*` not matching the current protocol version. Landing path: Phase 6 close polish or v1.1.
+
+### Universal macOS `lipo` deferred to Phase 10 release pipeline
+
+Slice 6b's brief permitted landing universal macOS `lipo` "if straightforward; defer to Phase 10 release pipeline with ISSUES pointer if painful." Skipped because `lipo` requires Xcode / `llvm-lipo` tooling that isn't guaranteed on developer machines or CI runners; fabricating it via zigbuild + custom wrapper scripts isn't worth the complexity for a slice whose value is the deploy pipeline, not the build ergonomics. Impact: controllers embed two separate darwin binaries (x86_64 + aarch64) rather than one fat binary. Total size overhead: ~250–400 KiB depending on release-agent profile compression. Phase 10 release pipeline revisits this alongside minisign signing + the full release artifact matrix — that's where an Xcode-bearing build machine is already a prerequisite. No ISSUES cross-references bite 6b's downstream work; remote deploy path already selects the right arch binary via `detect_target`.
+
 ### Panes past slot 9 are not reachable today (Slice 6.0 regression)
 
 Slice 6.0 removed `Ctrl-b 0..9`, `Ctrl-b n`, `Ctrl-b p` in favor of

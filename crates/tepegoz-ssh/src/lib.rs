@@ -31,12 +31,17 @@
 //! [`SshError::HostKeyMismatch`](crate::error::SshError::HostKeyMismatch).
 
 pub mod config;
+pub mod deploy;
 pub mod error;
 pub mod known_hosts;
 pub mod paths;
 pub mod session;
 
 pub use config::{HostEntry, HostList, HostSource};
+pub use deploy::{
+    AgentInfo, DeployOutcome, DetectedTarget, RemoteAgentStatus, deploy_agent, detect_target,
+    handshake_agent, inspect_remote_agent, remote_agent_path, spawn_agent_channel,
+};
 pub use error::SshError;
 pub use known_hosts::{HostKeyVerdict, KnownHostsStore};
 pub use session::{SshChannel, SshSession, connect_host, open_session};

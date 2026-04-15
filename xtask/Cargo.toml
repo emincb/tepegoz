@@ -21,6 +21,11 @@ anyhow = { workspace = true }
 # drives demo-phase-6's wire-protocol handshake against the agent
 # subprocess.
 tepegoz-proto = { workspace = true }
+# Phase 6 Slice 6b — demo-phase-6 --remote drives the remote deploy
+# + handshake through tepegoz-ssh::{connect_host, deploy_agent,
+# spawn_agent_channel, handshake_agent}. Same crate the controller
+# binary calls from `tepegoz doctor --agents`.
+tepegoz-ssh = { workspace = true }
 # demo-phase-6 runs a tiny tokio runtime for the async codec (the
 # existing read_envelope/write_envelope surface is AsyncRead/Write-
 # shaped). Pulled in with `full` via the workspace dep spec —

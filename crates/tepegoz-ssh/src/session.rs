@@ -86,6 +86,14 @@ impl SshChannel {
     pub fn channel_mut(&mut self) -> &mut russh::Channel<client::Msg> {
         &mut self.channel
     }
+
+    /// Wrap a raw russh channel that was opened outside `open_session`
+    /// — used by the deploy module (Phase 6 Slice 6b) which needs to
+    /// combine an `open_session + exec` into the same `SshChannel`
+    /// shape other callers expect.
+    pub(crate) fn from_raw(channel: russh::Channel<client::Msg>) -> Self {
+        Self { channel }
+    }
 }
 
 /// Connect to the host identified by `alias`.

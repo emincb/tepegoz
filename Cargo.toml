@@ -39,6 +39,14 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# hashing (Phase 6 Slice 6b — agent deploy integrity check; also already
+# transitively present via russh's key machinery, but expose explicitly
+# here so the deploy module doesn't reach into a transitive dep by accident)
+sha2 = "0.10"
+# byte-to-hex formatting for user-visible sha256 digests in
+# `tepegoz doctor --agents` output + error diagnostics
+hex = "0.4"
+
 # internal crates
 tepegoz-proto = { path = "crates/tepegoz-proto" }
 tepegoz-core = { path = "crates/tepegoz-core" }

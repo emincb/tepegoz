@@ -22,7 +22,15 @@ anyhow = { workspace = true }
 tepegoz-core = { workspace = true }
 tepegoz-tui = { workspace = true }
 tepegoz-agent = { workspace = true }
+tepegoz-proto = { workspace = true }
 tepegoz-ssh = { workspace = true }
+
+# Phase 6 Slice 6b — `tepegoz doctor --agents` hashes the embedded
+# agent bytes locally and prints a short prefix against the remote
+# digest for a quick visual diff. `sha2` + `hex` are workspace-shared
+# with tepegoz-ssh's deploy module.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 # build.rs parses manifest.json sidecars written by `cargo xtask
