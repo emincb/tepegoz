@@ -3920,6 +3920,8 @@ name = "tepegoz-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "futures-util",
+ "tepegoz-docker",
  "tepegoz-proto",
  "tokio",
  "tracing",
@@ -3933,8 +3935,10 @@ dependencies = [
  "anyhow",
  "bytes",
  "futures-util",
+ "rkyv",
  "russh",
  "tempfile",
+ "tepegoz-agent",
  "tepegoz-docker",
  "tepegoz-probe",
  "tepegoz-proto",

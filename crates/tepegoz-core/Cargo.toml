@@ -20,6 +20,11 @@ bytes = "1"
 # here makes the direct use in `remote_pane` explicit + pins the same
 # feature set (`ring` crypto backend) so cross-build stays green.
 russh = { version = "0.60", default-features = false, features = ["flate2", "ring", "rsa"] }
+# Direct use in `agent` module for serializing envelopes into the bytes
+# we hand to `russh::Channel::data` (russh's channel lacks an AsyncWrite
+# impl, so the usual `codec::write_envelope` path doesn't apply). Same
+# version as the workspace's transitive use via tepegoz-proto.
+rkyv = "0.8"
 tepegoz-proto = { workspace = true }
 tepegoz-pty = { workspace = true }
 tepegoz-docker = { workspace = true }
@@ -29,3 +34,7 @@ tepegoz-ssh = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 vt100 = "0.16"
+# Agent module unit test spawns a real `tepegoz_agent::serve` inside
+# the same process, pipes bytes through tokio duplex streams, and
+# exercises the full routing path.
+tepegoz-agent = { workspace = true }

@@ -17,4 +17,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+futures-util = "0.3"
 tepegoz-proto = { workspace = true }
+tepegoz-docker = { workspace = true }

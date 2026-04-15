@@ -7,10 +7,27 @@ use tokio::signal;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::config::DaemonConfig;
+use crate::config::{AgentResolver, DaemonConfig};
 use crate::state::SharedState;
 
+/// Entry point for the default daemon path — no remote-agent
+/// deployment. Tests + tooling that don't need Phase 6's remote
+/// scopes call this; the controller's main.rs calls
+/// [`run_daemon_with_resolver`] with its compile-time-embedded agent
+/// binaries.
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
+    run_daemon_with_resolver(config, None).await
+}
+
+/// Entry point wired from `tepegoz::main` with the compile-time-
+/// embedded `agents::embedded_agents::for_target` resolver. Populating
+/// a resolver enables the Fleet supervisor's Phase 6 Slice 6c-proper
+/// agent-deploy-on-Connect path; `None` is the test / tooling
+/// fallback (remote subscriptions surface DockerUnavailable).
+pub async fn run_daemon_with_resolver(
+    config: DaemonConfig,
+    agent_resolver: Option<AgentResolver>,
+) -> anyhow::Result<()> {
     let is_default_path = config.socket_path.is_none();
     let socket_path = config
         .socket_path
@@ -22,7 +39,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     set_socket_perms(&socket_path)?;
 
-    let state = Arc::new(SharedState::new(socket_path.clone()));
+    let state = Arc::new(SharedState::new(socket_path.clone(), agent_resolver));
 
     info!(
         pid = state.daemon_pid,

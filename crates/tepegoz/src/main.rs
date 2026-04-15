@@ -104,9 +104,19 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Daemon { socket } => {
             init_stdout_tracing(&cli.log_level);
-            tepegoz_core::run_daemon(tepegoz_core::DaemonConfig {
-                socket_path: socket,
-            })
+            // Phase 6 Slice 6c-proper: hand the daemon the compile-time-
+            // embedded agent resolver so Fleet-Connected can deploy the
+            // right-target agent + register it in the pool. `for_target`
+            // returns `None` for any target whose binary wasn't populated
+            // at build time — `cargo xtask build-agents` is the populate
+            // step; plain `cargo build` leaves all four slots empty and
+            // Fleet logs a single warning about unavailable remote scopes.
+            tepegoz_core::run_daemon_with_resolver(
+                tepegoz_core::DaemonConfig {
+                    socket_path: socket,
+                },
+                Some(agents::embedded_agents::for_target),
+            )
             .await
         }
         Command::Tui { socket } => {

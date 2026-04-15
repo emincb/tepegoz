@@ -5,11 +5,12 @@
 //! web/phone clients and the AI orchestrator) are clients that observe and
 //! act on this state through the protocol.
 
+mod agent;
 mod client;
 mod config;
 mod daemon;
 mod remote_pane;
 mod state;
 
-pub use config::DaemonConfig;
-pub use daemon::run_daemon;
+pub use config::{AgentResolver, DaemonConfig};
+pub use daemon::{run_daemon, run_daemon_with_resolver};

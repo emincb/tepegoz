@@ -1,10 +1,12 @@
-//! Phase 6 Slice 6a integration test.
+//! Phase 6 Slice 6a integration test (extended in Slice 6c-proper for
+//! capability probing).
 //!
 //! Spawns the real `tepegoz-agent` binary as a subprocess with piped
 //! stdio, drives a handshake through the wire codec, and asserts the
-//! response carries the controller's expected shape. This is the
-//! acceptance test the CTO brief flagged — the full production path
-//! minus SSH deploy (6b) and real probes (6c/d).
+//! response carries the controller's expected shape. Capability list
+//! is environment-dependent — "docker" appears iff a local engine
+//! answers within the probe timeout — so we only assert that every
+//! entry is a known capability string.
 //!
 //! Cargo exposes the binary's built path via `CARGO_BIN_EXE_tepegoz-
 //! agent` during integration-test builds, so we don't need to hard-
@@ -80,10 +82,14 @@ async fn agent_handshake_roundtrip() {
                 std::env::consts::ARCH,
                 "agent's reported arch must match the test-process host"
             );
-            assert!(
-                capabilities.is_empty(),
-                "Slice 6a ships empty capabilities (populated by 6c/d as docker / ports / processes / pty land); got {capabilities:?}"
-            );
+            // Slice 6c-proper probes "docker" at handshake time; env-
+            // dependent, so accept any subset of the known caps.
+            for cap in &capabilities {
+                assert!(
+                    matches!(cap.as_str(), "docker"),
+                    "unexpected capability {cap:?} — known set is {{docker}} in 6c-proper"
+                );
+            }
         }
         other => panic!("expected AgentHandshakeResponse, got {other:?}"),
     }

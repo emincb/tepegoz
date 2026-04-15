@@ -20,11 +20,12 @@ use tracing::{debug, info, warn};
 use tepegoz_proto::{
     DockerActionOutcome, DockerActionRequest, DockerActionResult, DockerContainer, DockerStats,
     Envelope, ErrorInfo, ErrorKind, Event, EventFrame, LogStream, PROTOCOL_VERSION, Payload,
-    ProbePort, ProbeProcess, Subscription, Welcome,
+    ProbePort, ProbeProcess, ScopeTarget, Subscription, Welcome,
     codec::{read_envelope, write_envelope},
 };
 use tepegoz_pty::{OpenSpec as PtyOpenSpec, Pane, PaneUpdate};
 
+use crate::agent::{RoutedKind, RoutedScope, RoutedSub};
 use crate::state::{DAEMON_VERSION, SharedState};
 
 /// How often the docker subscription re-fetches the container list.
@@ -135,6 +136,14 @@ async fn session(
     let mut ports_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut processes_subs: HashMap<u64, AbortHandle> = HashMap::new();
     let mut fleet_subs: HashMap<u64, FleetSubHandle> = HashMap::new();
+    // Phase 6 Slice 6c-proper: per-client map of agent-routed
+    // subscriptions. Keyed by the client's id; `AgentSubHandle` carries
+    // the alias + daemon-allocated id so `Unsubscribe(client_id)` can
+    // find the matching routing entry to remove and forward an
+    // `Unsubscribe(daemon_id)` to the agent. Populated by
+    // `Subscribe(Docker*/Ports/Processes { Remote })` handling, drained
+    // on client disconnect.
+    let mut client_agent_subs: HashMap<u64, AgentSubHandle> = HashMap::new();
     let mut status_sub: Option<u64> = None;
     let mut ticker = tokio::time::interval(Duration::from_millis(1000));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -163,6 +172,7 @@ async fn session(
                     &mut ports_subs,
                     &mut processes_subs,
                     &mut fleet_subs,
+                    &mut client_agent_subs,
                 )
                 .await
                 {
@@ -187,6 +197,26 @@ async fn session(
     }
     for (_, handle) in fleet_subs.drain() {
         handle.abort_handle.abort();
+    }
+    // Phase 6 Slice 6c-proper: tear down any agent-routed
+    // subscriptions the client held. For each, remove the routing
+    // entry in `agent_conns[alias]` + forward an
+    // `Unsubscribe(daemon_id)` to the agent so its per-sub forwarder
+    // task aborts on the far side too. Missing `agent_conns` entry
+    // (alias disconnected mid-session) is idempotent.
+    if !client_agent_subs.is_empty() {
+        let agent_conns = state.agent_conns.lock().await;
+        for (_, handle) in client_agent_subs.drain() {
+            if let Some(conn) = agent_conns.get(&handle.alias) {
+                conn.routing.lock().await.remove(&handle.daemon_id);
+                let _ = conn.writer_tx.send(Envelope {
+                    version: PROTOCOL_VERSION,
+                    payload: Payload::Unsubscribe {
+                        id: handle.daemon_id,
+                    },
+                });
+            }
+        }
     }
     drop(event_tx);
     let _ = writer_handle.await;
@@ -219,6 +249,7 @@ async fn handle_command(
     ports_subs: &mut HashMap<u64, AbortHandle>,
     processes_subs: &mut HashMap<u64, AbortHandle>,
     fleet_subs: &mut HashMap<u64, FleetSubHandle>,
+    client_agent_subs: &mut HashMap<u64, AgentSubHandle>,
 ) -> anyhow::Result<()> {
     match payload {
         Payload::Ping => {
@@ -233,56 +264,106 @@ async fn handle_command(
             send_status(state, event_tx, id).await?;
         }
 
-        Payload::Subscribe(Subscription::Docker { id, target: _ }) => {
-            // Task A landed the v11 target-on-Subscription shape;
-            // Task D wires the Remote branch through agent_pool.
-            // Until D lands, the target is ignored and this path
-            // always runs the local forwarder. That's safe: pre-6c
-            // behaviour is the Local branch.
-            if let Some(prev) = docker_subs.remove(&id) {
-                debug!(id, "replacing existing docker subscription");
-                prev.abort();
+        Payload::Subscribe(Subscription::Docker { id, target }) => match target {
+            ScopeTarget::Local => {
+                if let Some(prev) = docker_subs.remove(&id) {
+                    debug!(id, "replacing existing docker subscription");
+                    prev.abort();
+                }
+                let tx = event_tx.clone();
+                let handle = tokio::spawn(async move {
+                    forward_docker(id, tx).await;
+                });
+                docker_subs.insert(id, handle.abort_handle());
             }
-            let tx = event_tx.clone();
-            let handle = tokio::spawn(async move {
-                forward_docker(id, tx).await;
-            });
-            docker_subs.insert(id, handle.abort_handle());
-        }
+            ScopeTarget::Remote { alias } => {
+                route_remote_subscribe(
+                    state,
+                    event_tx,
+                    client_agent_subs,
+                    id,
+                    alias,
+                    RoutedScope::Docker,
+                    |daemon_id| Subscription::Docker {
+                        id: daemon_id,
+                        target: ScopeTarget::Local,
+                    },
+                )
+                .await;
+            }
+        },
 
         Payload::Subscribe(Subscription::DockerLogs {
             id,
             container_id,
             follow,
             tail_lines,
-            target: _,
-        }) => {
-            if let Some(prev) = docker_subs.remove(&id) {
-                debug!(id, "replacing existing docker logs subscription");
-                prev.abort();
+            target,
+        }) => match target {
+            ScopeTarget::Local => {
+                if let Some(prev) = docker_subs.remove(&id) {
+                    debug!(id, "replacing existing docker logs subscription");
+                    prev.abort();
+                }
+                let tx = event_tx.clone();
+                let handle = tokio::spawn(async move {
+                    forward_docker_logs(id, container_id, follow, tail_lines, tx).await;
+                });
+                docker_subs.insert(id, handle.abort_handle());
             }
-            let tx = event_tx.clone();
-            let handle = tokio::spawn(async move {
-                forward_docker_logs(id, container_id, follow, tail_lines, tx).await;
-            });
-            docker_subs.insert(id, handle.abort_handle());
-        }
+            ScopeTarget::Remote { alias } => {
+                route_remote_subscribe(
+                    state,
+                    event_tx,
+                    client_agent_subs,
+                    id,
+                    alias,
+                    RoutedScope::DockerLogs,
+                    |daemon_id| Subscription::DockerLogs {
+                        id: daemon_id,
+                        container_id,
+                        follow,
+                        tail_lines,
+                        target: ScopeTarget::Local,
+                    },
+                )
+                .await;
+            }
+        },
 
         Payload::Subscribe(Subscription::DockerStats {
             id,
             container_id,
-            target: _,
-        }) => {
-            if let Some(prev) = docker_subs.remove(&id) {
-                debug!(id, "replacing existing docker stats subscription");
-                prev.abort();
+            target,
+        }) => match target {
+            ScopeTarget::Local => {
+                if let Some(prev) = docker_subs.remove(&id) {
+                    debug!(id, "replacing existing docker stats subscription");
+                    prev.abort();
+                }
+                let tx = event_tx.clone();
+                let handle = tokio::spawn(async move {
+                    forward_docker_stats(id, container_id, tx).await;
+                });
+                docker_subs.insert(id, handle.abort_handle());
             }
-            let tx = event_tx.clone();
-            let handle = tokio::spawn(async move {
-                forward_docker_stats(id, container_id, tx).await;
-            });
-            docker_subs.insert(id, handle.abort_handle());
-        }
+            ScopeTarget::Remote { alias } => {
+                route_remote_subscribe(
+                    state,
+                    event_tx,
+                    client_agent_subs,
+                    id,
+                    alias,
+                    RoutedScope::DockerStats,
+                    |daemon_id| Subscription::DockerStats {
+                        id: daemon_id,
+                        container_id,
+                        target: ScopeTarget::Local,
+                    },
+                )
+                .await;
+            }
+        },
 
         Payload::Subscribe(Subscription::Ports { id, target: _ }) => {
             if let Some(prev) = ports_subs.remove(&id) {
@@ -315,8 +396,9 @@ async fn handle_command(
             }
             let tx = event_tx.clone();
             let (action_tx, action_rx) = mpsc::unbounded_channel();
+            let fleet_state = Arc::clone(state);
             let handle = tokio::spawn(async move {
-                forward_fleet(id, tx, action_rx).await;
+                forward_fleet(id, fleet_state, tx, action_rx).await;
             });
             fleet_subs.insert(
                 id,
@@ -351,19 +433,25 @@ async fn handle_command(
             }
         }
 
-        Payload::DockerAction(req) => {
-            let tx = event_tx.clone();
-            // Spawn so a slow docker daemon doesn't stall the session loop.
-            // Each action is independent; we don't track these handles —
-            // the writer mpsc closing will collapse any orphaned task.
-            tokio::spawn(async move {
-                let result = run_docker_action(req).await;
-                let _ = tx.send(Envelope {
-                    version: PROTOCOL_VERSION,
-                    payload: Payload::DockerActionResult(result),
+        Payload::DockerAction(req) => match &req.target {
+            ScopeTarget::Local => {
+                let tx = event_tx.clone();
+                // Spawn so a slow docker daemon doesn't stall the session loop.
+                // Each action is independent; we don't track these handles —
+                // the writer mpsc closing will collapse any orphaned task.
+                tokio::spawn(async move {
+                    let result = run_docker_action(req).await;
+                    let _ = tx.send(Envelope {
+                        version: PROTOCOL_VERSION,
+                        payload: Payload::DockerActionResult(result),
+                    });
                 });
-            });
-        }
+            }
+            ScopeTarget::Remote { alias } => {
+                let alias = alias.clone();
+                route_remote_docker_action(state, event_tx, alias, req).await;
+            }
+        },
 
         Payload::Unsubscribe { id } => {
             if *status_sub == Some(id) {
@@ -383,6 +471,23 @@ async fn handle_command(
             }
             if let Some(handle) = fleet_subs.remove(&id) {
                 handle.abort_handle.abort();
+            }
+            // Phase 6 Slice 6c-proper: remote-routed subs live in
+            // `client_agent_subs`. Unsubscribe here means tearing down
+            // the daemon-side routing + forwarding the unsubscribe to
+            // the agent so its per-sub forwarder task aborts on the
+            // far side.
+            if let Some(handle) = client_agent_subs.remove(&id) {
+                let agent_conns = state.agent_conns.lock().await;
+                if let Some(conn) = agent_conns.get(&handle.alias) {
+                    conn.routing.lock().await.remove(&handle.daemon_id);
+                    let _ = conn.writer_tx.send(Envelope {
+                        version: PROTOCOL_VERSION,
+                        payload: Payload::Unsubscribe {
+                            id: handle.daemon_id,
+                        },
+                    });
+                }
             }
         }
 
@@ -700,6 +805,187 @@ fn error_envelope(kind: ErrorKind, message: &str) -> Envelope {
         payload: Payload::Error(ErrorInfo {
             kind,
             message: message.to_string(),
+        }),
+    }
+}
+
+/// Per-client bookkeeping entry for an agent-routed subscription.
+/// The client's `id` is the map key; `alias` + `daemon_id` let us
+/// reach into `state.agent_conns[alias].routing[daemon_id]` to drop
+/// the routing entry and forward `Unsubscribe { id: daemon_id }` to
+/// the far-side agent on teardown.
+pub(crate) struct AgentSubHandle {
+    pub(crate) alias: String,
+    pub(crate) daemon_id: u64,
+}
+
+/// Route a `Subscribe(..)` with `ScopeTarget::Remote { alias }`
+/// through an agent connection. Looks up the pool entry, verifies the
+/// agent advertises the requisite capability, allocates a daemon-side
+/// id, registers a routing entry, and forwards a Local-targeted copy
+/// of the subscription through the agent's stdio tunnel.
+///
+/// The `subscription_builder` closure takes the daemon-allocated id
+/// and returns the `Subscription` variant to forward — letting this
+/// helper serve Docker, DockerLogs, DockerStats (and, in Slice 6d,
+/// Ports + Processes) from one place.
+///
+/// On any failure path (alias unknown, agent missing capability, or
+/// the agent's writer channel already closed) we synthesize a
+/// `DockerUnavailable { reason: … }` on the client's event_tx — the
+/// same shape the TUI already handles for a local Docker engine
+/// outage — so retarget UX stays uniform across local / remote.
+async fn route_remote_subscribe(
+    state: &Arc<SharedState>,
+    event_tx: &mpsc::UnboundedSender<Envelope>,
+    client_agent_subs: &mut HashMap<u64, AgentSubHandle>,
+    client_id: u64,
+    alias: String,
+    scope: RoutedScope,
+    subscription_builder: impl FnOnce(u64) -> Subscription,
+) {
+    let conn = {
+        let guard = state.agent_conns.lock().await;
+        guard.get(&alias).cloned()
+    };
+    let Some(conn) = conn else {
+        let _ = event_tx.send(docker_unavailable_envelope(
+            client_id,
+            format!("agent not connected: {alias}"),
+        ));
+        return;
+    };
+
+    if !conn.capabilities.iter().any(|c| c == "docker") {
+        let _ = event_tx.send(docker_unavailable_envelope(
+            client_id,
+            format!("no docker on {alias}"),
+        ));
+        return;
+    }
+
+    let daemon_id = conn.alloc_id();
+    {
+        let mut routing = conn.routing.lock().await;
+        routing.insert(
+            daemon_id,
+            RoutedSub {
+                client_event_tx: event_tx.clone(),
+                client_id,
+                kind: RoutedKind::Subscription,
+                scope,
+            },
+        );
+    }
+
+    let sub = subscription_builder(daemon_id);
+    if conn
+        .writer_tx
+        .send(Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(sub),
+        })
+        .is_err()
+    {
+        // Agent's writer task has exited — routing entry is now
+        // orphaned. Clean up and surface the same Unavailable shape.
+        conn.routing.lock().await.remove(&daemon_id);
+        let _ = event_tx.send(docker_unavailable_envelope(
+            client_id,
+            format!("agent writer closed: {alias}"),
+        ));
+        return;
+    }
+
+    client_agent_subs.insert(client_id, AgentSubHandle { alias, daemon_id });
+}
+
+/// Route a `DockerAction { target: Remote }` through an agent. Allocates
+/// a daemon-side request_id, registers a OneShot routing entry (parser
+/// removes after forwarding the result), and forwards a Local-targeted
+/// copy through the agent's stdio tunnel.
+///
+/// On failure paths (alias unknown, agent missing capability, or agent
+/// writer closed) synthesize a `DockerActionResult { outcome: Failure }`
+/// with the client's original `request_id` so the TUI's pending-action
+/// toast clears rather than hanging.
+async fn route_remote_docker_action(
+    state: &Arc<SharedState>,
+    event_tx: &mpsc::UnboundedSender<Envelope>,
+    alias: String,
+    req: DockerActionRequest,
+) {
+    let conn = {
+        let guard = state.agent_conns.lock().await;
+        guard.get(&alias).cloned()
+    };
+    let Some(conn) = conn else {
+        let _ = event_tx.send(docker_action_failure_envelope(
+            &req,
+            format!("agent not connected: {alias}"),
+        ));
+        return;
+    };
+
+    if !conn.capabilities.iter().any(|c| c == "docker") {
+        let _ = event_tx.send(docker_action_failure_envelope(
+            &req,
+            format!("no docker on {alias}"),
+        ));
+        return;
+    }
+
+    let daemon_id = conn.alloc_id();
+    {
+        let mut routing = conn.routing.lock().await;
+        routing.insert(
+            daemon_id,
+            RoutedSub {
+                client_event_tx: event_tx.clone(),
+                client_id: req.request_id,
+                kind: RoutedKind::OneShot,
+                scope: RoutedScope::DockerAction {
+                    container_id: req.container_id.clone(),
+                    action_kind: req.kind,
+                },
+            },
+        );
+    }
+
+    // Forward the action with the daemon's request_id + Local target —
+    // agent-side `run_docker_action` will echo the daemon id back,
+    // which the parser rewrites to the client's id.
+    let forwarded = DockerActionRequest {
+        request_id: daemon_id,
+        container_id: req.container_id.clone(),
+        kind: req.kind,
+        target: ScopeTarget::Local,
+    };
+    if conn
+        .writer_tx
+        .send(Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerAction(forwarded),
+        })
+        .is_err()
+    {
+        conn.routing.lock().await.remove(&daemon_id);
+        let _ = event_tx.send(docker_action_failure_envelope(
+            &req,
+            format!("agent writer closed: {alias}"),
+        ));
+    }
+}
+
+fn docker_action_failure_envelope(req: &DockerActionRequest, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::DockerActionResult(DockerActionResult {
+            request_id: req.request_id,
+            container_id: req.container_id.clone(),
+            kind: req.kind,
+            outcome: DockerActionOutcome::Failure { reason },
+            target: req.target.clone(),
         }),
     }
 }
@@ -1273,6 +1559,7 @@ struct FleetSubHandle {
 
 async fn forward_fleet(
     subscription_id: u64,
+    state: Arc<SharedState>,
     event_tx: mpsc::UnboundedSender<Envelope>,
     mut fleet_action_rx: mpsc::UnboundedReceiver<tepegoz_proto::FleetActionRequest>,
 ) {
@@ -1322,8 +1609,17 @@ async fn forward_fleet(
         let alias = host.alias.clone();
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         host_senders.insert(alias, action_tx);
+        let supervisor_state = Arc::clone(&state);
         supervisors.spawn(async move {
-            host_supervisor(subscription_id, host, should_autoconnect, tx, action_rx).await;
+            host_supervisor(
+                subscription_id,
+                host,
+                should_autoconnect,
+                supervisor_state,
+                tx,
+                action_rx,
+            )
+            .await;
         });
     }
 
@@ -1413,10 +1709,16 @@ enum HostAction {
 /// on terminal `⚠` states); runs heartbeat while Connected; applies
 /// exponential backoff on reconnect; responds to `HostAction::Reconnect`
 /// / `Disconnect` messages from the coordinator at every select point.
+///
+/// Phase 6 Slice 6c-proper: on every `HostState::Connected` transition
+/// deploys + registers an agent for this alias in
+/// `state.agent_conns`; on every session end removes the entry and
+/// notifies any client subscriptions that had been routed through it.
 async fn host_supervisor(
     subscription_id: u64,
     entry: tepegoz_proto::HostEntry,
     autoconnect: bool,
+    state: Arc<SharedState>,
     event_tx: mpsc::UnboundedSender<Envelope>,
     mut action_rx: mpsc::UnboundedReceiver<HostAction>,
 ) {
@@ -1579,6 +1881,14 @@ async fn host_supervisor(
                     tepegoz_proto::HostState::Connected,
                     None,
                 );
+                // Phase 6 Slice 6c-proper: deploy + register agent
+                // best-effort on the same session. Deploy uses its
+                // own exec channels; the session continues into
+                // `run_connected_session` for heartbeat. On deploy
+                // failure we log + continue without pool entry —
+                // remote subs surface DockerUnavailable, heartbeat
+                // still runs normally.
+                crate::agent::deploy_and_register_agent(&alias, &session, &state).await;
                 let ended = run_connected_session(
                     &alias,
                     subscription_id,
@@ -1587,6 +1897,12 @@ async fn host_supervisor(
                     &mut action_rx,
                 )
                 .await;
+                // Session ended — the agent's russh channel is
+                // already closing, but the pool entry + routing need
+                // explicit cleanup so subsequent client subs surface
+                // DockerUnavailable, and registered subs get notified
+                // of the disconnect.
+                crate::agent::remove_and_shutdown_agent(&alias, &state).await;
                 match ended {
                     ConnectedOutcome::HeartbeatFailed => {
                         if connect_start.elapsed() >= SSH_RECONNECT_RESET_THRESHOLD {
