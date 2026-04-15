@@ -111,8 +111,16 @@ fn render_available(
     };
 
     if visible.is_empty() {
+        // Branch on source — a discovery-error source label means
+        // the host list is empty *because parsing failed*, not
+        // because the user hasn't added hosts yet. Blaming the
+        // user's config for a parse failure is confusing.
         let msg = if hosts.is_empty() {
-            "No SSH hosts configured — add entries to ~/.ssh/config or set TEPEGOZ_SSH_HOSTS"
+            if source.starts_with("discovery error:") {
+                "Host discovery failed — see source label above"
+            } else {
+                "No SSH hosts configured — add entries to ~/.ssh/config or set TEPEGOZ_SSH_HOSTS"
+            }
         } else {
             "No hosts match filter"
         };
@@ -347,6 +355,29 @@ mod tests {
         scope.filter = "nope".to_string();
         let out = render_to_string(&scope, false);
         assert!(out.contains("No hosts match filter"));
+    }
+
+    #[test]
+    fn discovery_error_source_swaps_empty_list_hint() {
+        // When the host list is empty *because discovery failed* —
+        // not because the user hasn't configured any hosts — the
+        // body text must point at the source label rather than
+        // blaming the user's config. Pinned so future refactors
+        // don't quietly regress the message.
+        let scope = scope_with(
+            vec![],
+            HashMap::new(),
+            "discovery error: io: permission denied",
+        );
+        let out = render_to_string(&scope, false);
+        assert!(
+            out.contains("Host discovery failed"),
+            "discovery-error source should surface as 'Host discovery failed'; got:\n{out}"
+        );
+        assert!(
+            !out.contains("~/.ssh/config"),
+            "must not blame user's config when the failure was a parse error; got:\n{out}"
+        );
     }
 
     #[test]

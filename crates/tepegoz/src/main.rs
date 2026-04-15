@@ -38,10 +38,18 @@ enum Command {
         socket: Option<PathBuf>,
     },
 
-    /// Open an SSH pane to a host via the running daemon.
+    /// Open an SSH pane to a host alias and attach immediately —
+    /// short-lived TUI, same god-view tile grid. Stack contains only
+    /// the remote pane; `Ctrl-b d` detaches and exits. Unknown
+    /// aliases / connection failures print to stderr and return a
+    /// non-zero exit status.
     Connect {
-        /// Target, e.g. `user@host[:port]`.
-        target: String,
+        /// Fleet alias to open (resolved through the daemon's host
+        /// list — same precedence as `tepegoz doctor --ssh-hosts`).
+        alias: String,
+        /// Override the daemon socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 
     /// Run as a remote agent (launched by the daemon over SSH).
@@ -95,10 +103,16 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        Command::Connect { target } => {
-            init_stdout_tracing(&cli.log_level);
-            tracing::info!(%target, "connect mode — not yet implemented (Phase 5)");
-            Ok(())
+        Command::Connect { alias, socket } => {
+            // TUI sets up its own file-backed tracing to avoid corrupting the display.
+            tepegoz_tui::run_connect(
+                tepegoz_tui::TuiConfig {
+                    socket_path: socket,
+                    log_level: cli.log_level,
+                },
+                alias,
+            )
+            .await
         }
         Command::Agent { stdio } => {
             init_stdout_tracing(&cli.log_level);

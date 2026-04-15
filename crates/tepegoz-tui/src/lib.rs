@@ -34,6 +34,20 @@ pub use config::TuiConfig;
 use tepegoz_proto::socket::default_socket_path;
 
 pub async fn run(config: TuiConfig) -> anyhow::Result<()> {
+    let socket_path = prepare_and_init(&config)?;
+    session::run(socket_path).await
+}
+
+/// Launch the TUI with an initial `OpenPane { target: Remote { alias } }`
+/// instead of the default local root — the implementation of
+/// `tepegoz connect <alias>`. Stack contains only the remote pane at
+/// startup; `Ctrl-b d` detaches and exits.
+pub async fn run_connect(config: TuiConfig, alias: String) -> anyhow::Result<()> {
+    let socket_path = prepare_and_init(&config)?;
+    session::run_connect(socket_path, alias).await
+}
+
+fn prepare_and_init(config: &TuiConfig) -> anyhow::Result<PathBuf> {
     // Refuse to recursively attach from inside a tepegoz-managed pane.
     // The daemon stamps `TEPEGOZ_PANE_ID` into every pty it spawns; if
     // that var is present, running another `tepegoz tui` here would
@@ -60,7 +74,7 @@ pub async fn run(config: TuiConfig) -> anyhow::Result<()> {
         );
     }
 
-    session::run(socket_path).await
+    Ok(socket_path)
 }
 
 /// Compat re-export so callers can import `tepegoz_tui::resolve_socket_path`.

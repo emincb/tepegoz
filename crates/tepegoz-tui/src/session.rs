@@ -51,6 +51,26 @@ use crate::toast;
 const TICK_INTERVAL: Duration = Duration::from_millis(33);
 
 pub(crate) async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
+    run_with_initial_target(socket_path, tepegoz_proto::PaneTarget::Local, true).await
+}
+
+/// Variant used by `tepegoz connect <alias>`: always opens a fresh
+/// remote pane for the alias (no reuse of an existing pane), so the
+/// CLI invocation is "just drop me into a remote shell."
+pub(crate) async fn run_connect(socket_path: PathBuf, alias: String) -> anyhow::Result<()> {
+    run_with_initial_target(
+        socket_path,
+        tepegoz_proto::PaneTarget::Remote { alias },
+        false,
+    )
+    .await
+}
+
+async fn run_with_initial_target(
+    socket_path: PathBuf,
+    target: tepegoz_proto::PaneTarget,
+    reuse_alive: bool,
+) -> anyhow::Result<()> {
     let stream = UnixStream::connect(&socket_path).await?;
     info!(socket = %socket_path.display(), "connected");
     let (mut reader, mut writer) = stream.into_split();
@@ -58,13 +78,13 @@ pub(crate) async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     handshake(&mut reader, &mut writer).await?;
 
     let (cols, rows) = terminal_size_fallback();
-    let pane = ensure_pane(&mut reader, &mut writer, rows, cols).await?;
+    let pane = ensure_pane(&mut reader, &mut writer, rows, cols, target, reuse_alive).await?;
     info!(pane_id = pane.id, alive = pane.alive, "attaching to pane");
 
     terminal::enter_raw(&format!("tepegoz · god view (pane {})", pane.id))?;
     let _guard = terminal::TerminalGuard;
 
-    let exit_reason = AppRuntime::new(reader, writer, pane.id, (rows, cols))?
+    let exit_reason = AppRuntime::new(reader, writer, pane.id, pane.shell.clone(), (rows, cols))?
         .run()
         .await;
 
@@ -109,24 +129,28 @@ async fn ensure_pane(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     rows: u16,
     cols: u16,
+    target: tepegoz_proto::PaneTarget,
+    reuse_alive: bool,
 ) -> anyhow::Result<PaneInfo> {
-    write_envelope(
-        writer,
-        &Envelope {
-            version: PROTOCOL_VERSION,
-            payload: Payload::ListPanes,
-        },
-    )
-    .await?;
+    if reuse_alive {
+        write_envelope(
+            writer,
+            &Envelope {
+                version: PROTOCOL_VERSION,
+                payload: Payload::ListPanes,
+            },
+        )
+        .await?;
 
-    let env = read_envelope(reader).await?;
-    let panes = match env.payload {
-        Payload::PaneList { panes } => panes,
-        other => anyhow::bail!("expected PaneList, got {other:?}"),
-    };
+        let env = read_envelope(reader).await?;
+        let panes = match env.payload {
+            Payload::PaneList { panes } => panes,
+            other => anyhow::bail!("expected PaneList, got {other:?}"),
+        };
 
-    if let Some(alive) = panes.into_iter().find(|p| p.alive) {
-        return Ok(alive);
+        if let Some(alive) = panes.into_iter().find(|p| p.alive) {
+            return Ok(alive);
+        }
     }
 
     let cwd = std::env::current_dir()
@@ -142,7 +166,7 @@ async fn ensure_pane(
                 env: Vec::new(),
                 rows,
                 cols,
-                target: tepegoz_proto::PaneTarget::Local,
+                target,
             }),
         },
     )
@@ -198,6 +222,7 @@ impl AppRuntime {
         reader: tokio::net::unix::OwnedReadHalf,
         writer: tokio::net::unix::OwnedWriteHalf,
         pane_id: tepegoz_proto::PaneId,
+        shell: String,
         terminal_size: (u16, u16),
     ) -> anyhow::Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Envelope>();
@@ -216,7 +241,7 @@ impl AppRuntime {
         let terminal = ratatui::Terminal::new(backend)?;
 
         Ok(Self {
-            app: App::new(pane_id, terminal_size),
+            app: App::new(pane_id, shell, terminal_size),
             cmd_tx,
             writer_handle,
             inbox_rx,
@@ -346,7 +371,7 @@ fn render_tiles(app: &App, frame: &mut Frame<'_>) {
         let focused = tile.id == app.view.focused;
         match &tile.kind {
             TileKind::Pty => {
-                pty_tile::render(&app.pty_parser, frame, tile.rect, focused);
+                pty_tile::render(&app.pane_stack, app.active_pane, frame, tile.rect, focused);
             }
             TileKind::Scope(ScopeKind::Docker) => {
                 scope::docker::render(&app.docker, frame, tile.rect, focused);

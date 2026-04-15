@@ -6,6 +6,15 @@
 //! - `h` / `j` / `k` / `l` → focus left / down / up / right
 //! - arrow keys (via CSI `ESC [ A/B/C/D`) → focus up / down / right / left
 //! - `?` → help overlay (C3; no-op in C1.5)
+//! - `0`..`9` → jump to pane at that 1-indexed tab slot (`0` = slot 10
+//!   per tmux muscle memory) (Phase 5 Slice 5d-ii)
+//! - `n` / `p` → cycle to next / previous pane (wrap)
+//! - `&` → close the active pane (auto-reopens a local root if would empty)
+//! - `Enter` (0x0d) → open a pane for the currently-selected row when
+//!   the Fleet tile is focused (otherwise no-op)
+//! - `w` → explicitly unwired — reserved for the `>9 panes` list-view
+//!   overlay (5e / v1.1 per `docs/ISSUES.md`). Silently consumed so
+//!   accidental presses don't leak `&w` to the pty.
 //!
 //! Anything else after `Ctrl-b` cancels the prefix and the raw bytes
 //! (Ctrl-b + the trailing bytes) are forwarded as-is, so the user's
@@ -26,6 +35,11 @@ const FOCUS_J: u8 = b'j';
 const FOCUS_K: u8 = b'k';
 const FOCUS_L: u8 = b'l';
 const HELP: u8 = b'?';
+const PANE_NEXT: u8 = b'n';
+const PANE_PREV: u8 = b'p';
+const PANE_CLOSE: u8 = b'&';
+const PANE_LIST: u8 = b'w';
+const ENTER: u8 = 0x0d;
 const ESC: u8 = 0x1b;
 const CSI_OPEN: u8 = b'[';
 const CSI_UP: u8 = b'A';
@@ -46,6 +60,20 @@ pub(crate) enum InputAction {
     FocusDirection(FocusDir),
     /// User pressed `Ctrl-b ?` — help overlay (C3).
     Help,
+    /// User pressed `Ctrl-b <digit>` — jump to pane at that slot.
+    /// `0`..=`9`; App maps `0` to the 10th slot.
+    PaneDigit(u8),
+    /// User pressed `Ctrl-b n` — cycle to the next pane (wrap).
+    PaneNext,
+    /// User pressed `Ctrl-b p` — cycle to the previous pane (wrap).
+    PanePrev,
+    /// User pressed `Ctrl-b &` — close the active pane. App opens a
+    /// fresh local root if this would empty the stack.
+    PaneClose,
+    /// User pressed `Ctrl-b Enter` — open a pane for the currently-
+    /// selected row when the Fleet tile is focused. App no-ops this
+    /// action on any other focus.
+    OpenPaneAtSelection,
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +124,25 @@ impl InputFilter {
                         FOCUS_K => Some(InputAction::FocusDirection(FocusDir::Up)),
                         FOCUS_L => Some(InputAction::FocusDirection(FocusDir::Right)),
                         HELP => Some(InputAction::Help),
+                        PANE_NEXT => Some(InputAction::PaneNext),
+                        PANE_PREV => Some(InputAction::PanePrev),
+                        PANE_CLOSE => Some(InputAction::PaneClose),
+                        ENTER => Some(InputAction::OpenPaneAtSelection),
+                        // `Ctrl-b w` is explicitly unwired in 5d-ii —
+                        // the >9 panes list-view overlay is reserved
+                        // for 5e / v1.1 (`docs/ISSUES.md#ctrl-b-w-
+                        // pane-list-overlay-deferred`). Swallow the
+                        // byte so accidental presses don't leak `w`
+                        // to the pty.
+                        PANE_LIST => {
+                            // Consume but emit nothing.
+                            self.state = FilterState::Normal;
+                            if !out.is_empty() {
+                                actions.push(InputAction::Forward(std::mem::take(&mut out)));
+                            }
+                            return actions;
+                        }
+                        b'0'..=b'9' => Some(InputAction::PaneDigit(b - b'0')),
                         _ => None,
                     };
                     if let Some(action) = control {
@@ -369,5 +416,59 @@ mod tests {
         let mut f = InputFilter::new();
         let a = f.process(b"\x02\x02");
         assert!(matches!(&a[..], [InputAction::Forward(v)] if v == b"\x02\x02"));
+    }
+
+    #[test]
+    fn ctrl_b_then_n_cycles_next_pane() {
+        let mut f = InputFilter::new();
+        let a = f.process(b"\x02n");
+        assert!(matches!(&a[..], [InputAction::PaneNext]));
+    }
+
+    #[test]
+    fn ctrl_b_then_p_cycles_prev_pane() {
+        let mut f = InputFilter::new();
+        let a = f.process(b"\x02p");
+        assert!(matches!(&a[..], [InputAction::PanePrev]));
+    }
+
+    #[test]
+    fn ctrl_b_then_ampersand_closes_pane() {
+        let mut f = InputFilter::new();
+        let a = f.process(b"\x02&");
+        assert!(matches!(&a[..], [InputAction::PaneClose]));
+    }
+
+    #[test]
+    fn ctrl_b_then_digit_selects_pane_slot() {
+        for d in 0..=9u8 {
+            let mut f = InputFilter::new();
+            let buf = [PREFIX_BYTE, b'0' + d];
+            let a = f.process(&buf);
+            assert!(
+                matches!(&a[..], [InputAction::PaneDigit(n)] if *n == d),
+                "digit {d} must yield PaneDigit({d})"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_b_then_enter_opens_pane_at_selection() {
+        let mut f = InputFilter::new();
+        let a = f.process(b"\x02\r");
+        assert!(matches!(&a[..], [InputAction::OpenPaneAtSelection]));
+    }
+
+    #[test]
+    fn ctrl_b_then_w_is_consumed_silently_for_deferred_overlay() {
+        // The `>9 panes` list overlay is deferred to 5e/v1.1 per
+        // docs/ISSUES.md. Pressing `Ctrl-b w` today must not leak a
+        // stray `w` into the pty; the filter swallows both bytes.
+        let mut f = InputFilter::new();
+        let a = f.process(b"\x02w");
+        assert!(
+            a.is_empty(),
+            "ctrl-b w must swallow silently until the overlay lands; got {a:?}"
+        );
     }
 }

@@ -27,7 +27,8 @@ use ratatui::layout::Rect;
 use tepegoz_proto::{
     DockerActionKind, DockerActionOutcome, DockerActionRequest, DockerContainer, Envelope, Event,
     EventFrame, FleetActionKind, FleetActionOutcome, FleetActionRequest, HostEntry, HostState,
-    LogStream, PROTOCOL_VERSION, PaneId, Payload, ProbePort, ProbeProcess, Subscription,
+    LogStream, OpenPaneSpec, PROTOCOL_VERSION, PaneId, PaneInfo, PaneTarget, Payload, ProbePort,
+    ProbeProcess, Subscription,
 };
 use vt100::Parser;
 
@@ -75,6 +76,13 @@ const VT100_SCROLLBACK_ROWS: usize = 1000;
 /// need non-zero defaults even when the pty tile isn't rendered.
 const FALLBACK_PTY_ROWS: u16 = 24;
 const FALLBACK_PTY_COLS: u16 = 80;
+
+/// Max pane tabs with dedicated `Ctrl-b <digit>` jump keybind. Tabs past
+/// this render as a `[+N]` overflow indicator; navigation past the 9th
+/// pane still works via `Ctrl-b n`/`p`. The list-view overlay for more
+/// than nine panes is explicitly deferred to 5e / v1.1 per
+/// `docs/ISSUES.md#ctrl-b-w-pane-list-overlay-deferred`.
+pub(crate) const MAX_TAB_DIGIT_SLOTS: usize = 9;
 
 /// Which scope panel a tile hosts. Slice C1.5 shipped `Docker`; Slice
 /// 4c adds `Ports` (one tile hosting both a Ports view and a Processes
@@ -955,18 +963,52 @@ impl ScopeKeyParser {
     }
 }
 
+/// One entry in the pane stack. Holds everything the TUI needs to
+/// multiplex bytes between multiple concurrent panes: the daemon's
+/// pane id, the subscription id on which `PaneOutput` / `PaneSnapshot`
+/// events arrive, a human-readable tab-strip label, and a per-pane
+/// `vt100::Parser` so switching tabs restores the previous screen
+/// without requiring a daemon re-subscribe.
+pub(crate) struct PaneEntry {
+    pub(crate) pane_id: PaneId,
+    pub(crate) sub_id: u64,
+    /// Short label for the tab strip: `"zsh"` for local shells (path
+    /// trimmed to the final component) or `"ssh:<alias>"` for remote
+    /// panes (the daemon's `remote_pane` module already formats it
+    /// this way in `PaneInfo.shell`).
+    pub(crate) label: String,
+    pub(crate) parser: Parser,
+}
+
+/// In-flight `OpenPane` request awaiting a `PaneOpened` response. The
+/// wire protocol has no per-request id for `OpenPane`; correlation is
+/// FIFO, which works because the daemon's session loop processes
+/// commands serially (one socket → one writer → in-order replies).
+pub(crate) struct PendingOpen {
+    /// Sub id pre-allocated at request time. The client uses this id
+    /// in the subsequent `AttachPane { pane_id, subscription_id }`
+    /// after the `PaneOpened` response arrives.
+    pub(crate) sub_id: u64,
+    /// Set for `Remote { alias }` opens — used to format a red toast
+    /// when the open fails (unknown alias, SSH dial error, auth
+    /// failure on first connect).
+    pub(crate) alias: Option<String>,
+}
+
 /// The pure state machine.
 pub(crate) struct App {
     pub(crate) view: View,
-    pub(crate) pane: PaneId,
-    /// Stable subscription id for the pty. Allocated at [`App::new`];
-    /// the subscription lives for the entire session.
-    pub(crate) pane_sub: u64,
-    /// vt100 terminal parser for the pty. Bytes arriving via
-    /// `Event::PaneOutput` / `Event::PaneSnapshot` feed the parser; the
-    /// pty tile renderer reads `parser.screen()` and projects cells into
-    /// ratatui.
-    pub(crate) pty_parser: Parser,
+    /// Ordered stack of open panes. The pty tile always renders
+    /// `pane_stack[active_pane]`; the tab strip renders all entries.
+    /// Startup populates with a single root pane; `Ctrl-b Enter` on
+    /// the Fleet tile pushes a remote pane; `Ctrl-b &` pops the
+    /// active entry.
+    pub(crate) pane_stack: Vec<PaneEntry>,
+    pub(crate) active_pane: usize,
+    /// FIFO queue of in-flight `OpenPane` requests. Popped when a
+    /// `PaneOpened` response or an `Error` (for a failed open)
+    /// arrives.
+    pub(crate) pending_opens: VecDeque<PendingOpen>,
     pub(crate) docker: DockerScope,
     /// Phase 4 Slice 4c: Ports tile (with Processes toggle-view). Both
     /// the Ports and Processes subscriptions live for the session; the
@@ -996,13 +1038,13 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(pane: PaneId, terminal_size: (u16, u16)) -> Self {
+    pub(crate) fn new(pane: PaneId, shell: String, terminal_size: (u16, u16)) -> Self {
         let (rows, cols) = terminal_size;
         let area = Rect::new(0, 0, cols, rows);
         let view = View::new(area);
 
-        let (pty_rows, pty_cols) = pty_tile_dims(&view.layout);
-        let pty_parser = Parser::new(pty_rows, pty_cols, VT100_SCROLLBACK_ROWS);
+        let (pty_rows, pty_cols) = pty_content_dims(&view.layout);
+        let root_parser = Parser::new(pty_rows, pty_cols, VT100_SCROLLBACK_ROWS);
 
         let mut next_sub_id: u64 = 1;
         let pane_sub = next_sub_id;
@@ -1016,11 +1058,18 @@ impl App {
         let fleet_sub = next_sub_id;
         next_sub_id += 1;
 
+        let root_entry = PaneEntry {
+            pane_id: pane,
+            sub_id: pane_sub,
+            label: pane_label_from_shell(&shell),
+            parser: root_parser,
+        };
+
         Self {
             view,
-            pane,
-            pane_sub,
-            pty_parser,
+            pane_stack: vec![root_entry],
+            active_pane: 0,
+            pending_opens: VecDeque::new(),
             docker: DockerScope::new(docker_sub),
             ports: PortsScope::new(ports_sub, processes_sub),
             fleet: FleetScope::new(fleet_sub),
@@ -1033,19 +1082,39 @@ impl App {
         }
     }
 
+    /// Currently-rendered pane id. Panics if the stack is empty — the
+    /// invariant is maintained by `close_active_pane` (auto-reopens
+    /// local root to keep the PTY tile from going blank) and by
+    /// `handle_pane_event` on `PaneExit` (detaches when the last
+    /// entry goes away).
+    pub(crate) fn active_pane_id(&self) -> PaneId {
+        self.pane_stack[self.active_pane].pane_id
+    }
+
+    /// Subscription id for the currently-rendered pane.
+    pub(crate) fn active_pane_sub(&self) -> u64 {
+        self.pane_stack[self.active_pane].sub_id
+    }
+
+    fn find_pane_by_sub(&self, sub_id: u64) -> Option<usize> {
+        self.pane_stack.iter().position(|p| p.sub_id == sub_id)
+    }
+
     /// Bootstrap actions for a fresh session: AttachPane, ResizePane
     /// (sized to the pty tile, not the whole terminal), Subscribe
     /// (Docker). All subscriptions are always-on for the life of the
     /// TUI; no mode switching.
     pub(crate) fn initial_actions(&mut self) -> Vec<AppAction> {
-        let (pty_rows, pty_cols) = pty_tile_dims(&self.view.layout);
+        let (pty_rows, pty_cols) = pty_content_dims(&self.view.layout);
+        let pane_id = self.active_pane_id();
+        let sub_id = self.active_pane_sub();
         vec![
             AppAction::SendEnvelope(envelope(Payload::AttachPane {
-                pane_id: self.pane,
-                subscription_id: self.pane_sub,
+                pane_id,
+                subscription_id: sub_id,
             })),
             AppAction::SendEnvelope(envelope(Payload::ResizePane {
-                pane_id: self.pane,
+                pane_id,
                 rows: pty_rows,
                 cols: pty_cols,
             })),
@@ -1098,14 +1167,49 @@ impl App {
                     // Ctrl-b ? as a no-op so C3 can wire the overlay
                     // without renaming anything.
                 }
+                InputAction::PaneNext => {
+                    if self.view.layout.routes_to_pty(self.view.focused) {
+                        self.pane_next(actions);
+                    }
+                }
+                InputAction::PanePrev => {
+                    if self.view.layout.routes_to_pty(self.view.focused) {
+                        self.pane_prev(actions);
+                    }
+                }
+                InputAction::PaneDigit(d) => {
+                    if self.view.layout.routes_to_pty(self.view.focused) {
+                        self.pane_select_digit(d, actions);
+                    }
+                }
+                InputAction::PaneClose => {
+                    if self.view.layout.routes_to_pty(self.view.focused) {
+                        self.close_active_pane(actions);
+                    }
+                }
+                InputAction::OpenPaneAtSelection => {
+                    // Per the Slice 5d-ii contract, Ctrl-b Enter on
+                    // the focused Fleet tile opens a remote pane for
+                    // the selected host. On any other focus (PTY,
+                    // Docker, Ports, Placeholder) the action is a
+                    // no-op — the Fleet tile is the only source of
+                    // aliases today.
+                    if matches!(
+                        self.view.layout.routes_to_scope(self.view.focused),
+                        Some(ScopeKind::Fleet)
+                    ) {
+                        self.dispatch_open_remote_pane(actions);
+                    }
+                }
             }
         }
     }
 
     fn handle_forward_bytes(&mut self, bytes: Vec<u8>, actions: &mut Vec<AppAction>) {
         if self.view.layout.routes_to_pty(self.view.focused) {
+            let pane_id = self.active_pane_id();
             actions.push(AppAction::SendEnvelope(envelope(Payload::SendInput {
-                pane_id: self.pane,
+                pane_id,
                 data: bytes,
             })));
             return;
@@ -1382,6 +1486,128 @@ impl App {
             // destructive. Uppercase `R` is explicitly a no-op.
             ScopeKey::Char(b'r') => self.dispatch_fleet_reconnect(actions),
             _ => {}
+        }
+    }
+
+    /// Open a fresh remote pane for the Fleet tile's selected row.
+    /// Called by `Ctrl-b Enter` on the focused Fleet tile. Allocates
+    /// a sub id, pushes a `PendingOpen` to correlate the response,
+    /// and sends `OpenPane { target: Remote { alias } }`. The
+    /// follow-up `AttachPane` + stack insertion happens when
+    /// `PaneOpened` arrives in `handle_pane_opened`; a failure lands
+    /// in `handle_daemon_envelope`'s `Error` arm via FIFO correlation.
+    fn dispatch_open_remote_pane(&mut self, actions: &mut Vec<AppAction>) {
+        let Some(host) = self.fleet.selected_host() else {
+            return;
+        };
+        let alias = host.alias.clone();
+        let (pty_rows, pty_cols) = pty_content_dims(&self.view.layout);
+        let sub_id = self.alloc_sub_id();
+        self.pending_opens.push_back(PendingOpen {
+            sub_id,
+            alias: Some(alias.clone()),
+        });
+        actions.push(AppAction::SendEnvelope(envelope(Payload::OpenPane(
+            OpenPaneSpec {
+                shell: None,
+                cwd: None,
+                env: Vec::new(),
+                rows: pty_rows,
+                cols: pty_cols,
+                target: PaneTarget::Remote {
+                    alias: alias.clone(),
+                },
+            },
+        ))));
+        self.push_toast(ToastKind::Info, format!("opening ssh:{alias}…"), actions);
+    }
+
+    /// Cycle to the next pane (wrap at the end). No-op if there's only
+    /// one pane.
+    fn pane_next(&mut self, actions: &mut Vec<AppAction>) {
+        if self.pane_stack.len() < 2 {
+            return;
+        }
+        self.active_pane = (self.active_pane + 1) % self.pane_stack.len();
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Cycle to the previous pane (wrap at the start).
+    fn pane_prev(&mut self, actions: &mut Vec<AppAction>) {
+        if self.pane_stack.len() < 2 {
+            return;
+        }
+        self.active_pane = if self.active_pane == 0 {
+            self.pane_stack.len() - 1
+        } else {
+            self.active_pane - 1
+        };
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Jump to pane by 1-indexed tab number (`Ctrl-b 1` = pane 0,
+    /// `Ctrl-b 0` = pane 9 per tmux muscle memory). Clamps silently
+    /// if the slot is beyond the current stack length.
+    fn pane_select_digit(&mut self, digit: u8, actions: &mut Vec<AppAction>) {
+        let idx = if digit == 0 { 9 } else { (digit - 1) as usize };
+        if idx < self.pane_stack.len() && idx != self.active_pane {
+            self.active_pane = idx;
+            actions.push(AppAction::DrawFrame);
+        }
+    }
+
+    /// Close the active pane. Sends `ClosePane` to the daemon,
+    /// eagerly removes the entry from the stack, and opens a fresh
+    /// local root pane if the stack would otherwise go empty so the
+    /// PTY tile is never blank. Stale `PaneExit` / `PaneOutput`
+    /// events that arrive after the close drop silently in
+    /// `handle_daemon_envelope` via `find_pane_by_sub`.
+    fn close_active_pane(&mut self, actions: &mut Vec<AppAction>) {
+        if self.pane_stack.is_empty() {
+            return;
+        }
+        let removed = self.pane_stack.remove(self.active_pane);
+        actions.push(AppAction::SendEnvelope(envelope(Payload::ClosePane {
+            pane_id: removed.pane_id,
+        })));
+        // Unsubscribe too — belt-and-suspenders. The daemon aborts
+        // the forwarder on ClosePane, but the uniform subscription
+        // shape means Unsubscribe works cleanly for pane subs as
+        // well, and stale byte buffers flushing to a discarded sub
+        // would otherwise surface in the toast path through the
+        // FIFO Error correlation.
+        actions.push(AppAction::SendEnvelope(envelope(Payload::Unsubscribe {
+            id: removed.sub_id,
+        })));
+        if self.pane_stack.is_empty() {
+            // Open a fresh local root so the PTY tile never goes
+            // blank (pane `removed` might have been remote; local
+            // is the safe default).
+            let (pty_rows, pty_cols) = pty_content_dims(&self.view.layout);
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.into_os_string().into_string().ok());
+            let sub_id = self.alloc_sub_id();
+            self.pending_opens.push_back(PendingOpen {
+                sub_id,
+                alias: None,
+            });
+            actions.push(AppAction::SendEnvelope(envelope(Payload::OpenPane(
+                OpenPaneSpec {
+                    shell: None,
+                    cwd,
+                    env: Vec::new(),
+                    rows: pty_rows,
+                    cols: pty_cols,
+                    target: PaneTarget::Local,
+                },
+            ))));
+            self.active_pane = 0; // will be valid once PaneOpened pushes the entry
+        } else {
+            if self.active_pane >= self.pane_stack.len() {
+                self.active_pane = self.pane_stack.len() - 1;
+            }
+            actions.push(AppAction::DrawFrame);
         }
     }
 
@@ -1789,8 +2015,8 @@ impl App {
                 subscription_id,
                 event,
             }) => {
-                if subscription_id == self.pane_sub {
-                    self.handle_pane_event(event, actions);
+                if let Some(idx) = self.find_pane_by_sub(subscription_id) {
+                    self.handle_pane_event(idx, event, actions);
                 } else if subscription_id == self.docker.sub_id {
                     self.handle_docker_event(event, actions);
                 } else if self.docker.is_current_logs_sub(subscription_id) {
@@ -1805,7 +2031,21 @@ impl App {
                 // Unknown sub id: stale event from a sub we've closed.
                 // Drop silently.
             }
+            Payload::PaneOpened(info) => {
+                self.handle_pane_opened(info, actions);
+            }
             Payload::Error(info) => {
+                // If an `OpenPane` is in flight, attribute the Error
+                // to the head of the FIFO (daemon processes commands
+                // serially, so a failed Open is the next envelope
+                // after the request). Falls through to a generic
+                // daemon-error toast when no open is pending.
+                if let Some(pending) = self.pending_opens.pop_front() {
+                    let alias = pending.alias.as_deref().unwrap_or("local");
+                    let message = format!("open pane {alias} failed: {}", info.message);
+                    self.push_toast(ToastKind::Error, message, actions);
+                    return;
+                }
                 let message = format!("daemon error {:?}: {}", info.kind, info.message);
                 self.push_toast(ToastKind::Error, message, actions);
             }
@@ -1867,20 +2107,54 @@ impl App {
         }
     }
 
-    fn handle_pane_event(&mut self, event: Event, actions: &mut Vec<AppAction>) {
+    fn handle_pane_event(&mut self, idx: usize, event: Event, actions: &mut Vec<AppAction>) {
         match event {
             Event::PaneSnapshot { scrollback, .. } => {
                 if !scrollback.is_empty() {
-                    self.pty_parser.process(&scrollback);
-                    actions.push(AppAction::DrawFrame);
+                    self.pane_stack[idx].parser.process(&scrollback);
+                    if idx == self.active_pane {
+                        actions.push(AppAction::DrawFrame);
+                    }
                 }
             }
             Event::PaneOutput { data } => {
-                self.pty_parser.process(&data);
-                actions.push(AppAction::DrawFrame);
+                self.pane_stack[idx].parser.process(&data);
+                if idx == self.active_pane {
+                    actions.push(AppAction::DrawFrame);
+                }
             }
             Event::PaneExit { exit_code } => {
-                actions.push(AppAction::Detach(DetachReason::PaneExited { exit_code }));
+                // A pane's backing process exited (local shell `exit`,
+                // remote SSH disconnect, `tepegoz doctor --ssh-forget`
+                // followed by a TOFU rejection, etc.). Remove the
+                // entry; if the stack empties, detach with the exit
+                // code so `tepegoz connect <alias>`'s lone pane dying
+                // returns the user to their outer shell. On a
+                // multi-pane TUI, just drop the tab and toast —
+                // neighboring panes keep running.
+                let label = self.pane_stack[idx].label.clone();
+                let was_active = idx == self.active_pane;
+                self.pane_stack.remove(idx);
+                if self.pane_stack.is_empty() {
+                    actions.push(AppAction::Detach(DetachReason::PaneExited { exit_code }));
+                    return;
+                }
+                if was_active || idx < self.active_pane {
+                    // Shift active down if we removed something at
+                    // or before it; clamp past-the-end.
+                    if idx <= self.active_pane && self.active_pane > 0 {
+                        self.active_pane -= 1;
+                    }
+                    if self.active_pane >= self.pane_stack.len() {
+                        self.active_pane = self.pane_stack.len() - 1;
+                    }
+                }
+                let detail = match exit_code {
+                    Some(code) => format!("pane {label} exited (code {code})"),
+                    None => format!("pane {label} exited"),
+                };
+                self.push_toast(ToastKind::Info, detail, actions);
+                actions.push(AppAction::DrawFrame);
             }
             Event::PaneLagged { .. } => {
                 // Visual lag indicator is future work; runtime logs
@@ -1888,6 +2162,48 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Correlate a `PaneOpened` response to the oldest in-flight
+    /// `OpenPane` request (FIFO — daemon processes commands serially).
+    /// Push a fresh entry onto the pane stack, make it active, focus
+    /// the PTY tile, and emit the follow-up `AttachPane` + `ResizePane`
+    /// needed to start the byte stream sized to the content area.
+    fn handle_pane_opened(&mut self, info: PaneInfo, actions: &mut Vec<AppAction>) {
+        let Some(pending) = self.pending_opens.pop_front() else {
+            // PaneOpened with no in-flight request — only reachable if
+            // another client on the same session opened a pane
+            // concurrently. Drop silently; the user can open their
+            // own panes via Ctrl-b Enter.
+            return;
+        };
+        let (pty_rows, pty_cols) = pty_content_dims(&self.view.layout);
+        let parser = Parser::new(pty_rows, pty_cols, VT100_SCROLLBACK_ROWS);
+        let entry = PaneEntry {
+            pane_id: info.id,
+            sub_id: pending.sub_id,
+            label: pane_label_from_shell(&info.shell),
+            parser,
+        };
+        self.pane_stack.push(entry);
+        self.active_pane = self.pane_stack.len() - 1;
+        // Move focus back to the PTY tile — the user just opened a
+        // pane from the Fleet tile and almost certainly wants to type
+        // into the remote shell, not keep navigating the Fleet list.
+        if self.view.focused != TileId::Pty && self.view.layout.tile(TileId::Pty).is_some() {
+            self.view.focused = TileId::Pty;
+            actions.push(AppAction::FocusTile(TileId::Pty));
+        }
+        actions.push(AppAction::SendEnvelope(envelope(Payload::AttachPane {
+            pane_id: info.id,
+            subscription_id: pending.sub_id,
+        })));
+        actions.push(AppAction::SendEnvelope(envelope(Payload::ResizePane {
+            pane_id: info.id,
+            rows: pty_rows,
+            cols: pty_cols,
+        })));
+        actions.push(AppAction::DrawFrame);
     }
 
     fn handle_docker_event(&mut self, event: Event, actions: &mut Vec<AppAction>) {
@@ -1999,11 +2315,12 @@ impl App {
             } => {
                 if let FleetScopeState::Available { states, .. } = &mut self.fleet.state {
                     // Gate red-toast on the *transition* into a terminal
-                    // state, not the post-state — re-emits on ProxyJump
-                    // Reconnect shouldn't silently re-toast if the
-                    // state didn't actually change. Exception: if the
-                    // reason has changed, re-toast (e.g. AuthFailed
-                    // with different reason strings across attempts).
+                    // state — duplicate HostStateChanged emits (e.g.
+                    // two ProxyJump Reconnect attempts both landing on
+                    // AuthFailed) must not re-toast the same outcome.
+                    // State-only gating is honest v1 behavior; reason-
+                    // diff retoasting can land as v1.1 polish if real-
+                    // world usage surfaces the need.
                     let prev_state = states.get(&alias).copied();
                     let should_toast =
                         state.is_terminal() && reason.is_some() && (prev_state != Some(state));
@@ -2073,13 +2390,15 @@ impl App {
             self.view.focused = self.view.layout.default_focus;
         }
 
-        let (pty_rows, pty_cols) = pty_tile_dims(&self.view.layout);
-        self.pty_parser.screen_mut().set_size(pty_rows, pty_cols);
-        actions.push(AppAction::SendEnvelope(envelope(Payload::ResizePane {
-            pane_id: self.pane,
-            rows: pty_rows,
-            cols: pty_cols,
-        })));
+        let (pty_rows, pty_cols) = pty_content_dims(&self.view.layout);
+        for entry in &mut self.pane_stack {
+            entry.parser.screen_mut().set_size(pty_rows, pty_cols);
+            actions.push(AppAction::SendEnvelope(envelope(Payload::ResizePane {
+                pane_id: entry.pane_id,
+                rows: pty_rows,
+                cols: pty_cols,
+            })));
+        }
         actions.push(AppAction::DrawFrame);
     }
 
@@ -2097,6 +2416,18 @@ fn pty_tile_dims(layout: &TileLayout) -> (u16, u16) {
         .rect_of(TileId::Pty)
         .map(|r| (r.height.max(1), r.width.max(1)))
         .unwrap_or((FALLBACK_PTY_ROWS, FALLBACK_PTY_COLS))
+}
+
+/// The pty tile's Rect hosts a 1-row tab strip (chrome) plus the vt100
+/// render area (content). The daemon-side pane and the client-side
+/// `vt100::Parser` both need the content-area size so vim/less/top
+/// render inside the box, not one row taller than it. This helper
+/// carves the strip off `pty_tile_dims`; below the chrome minimum the
+/// dims clamp to 1 row rather than zero (`vt100::Parser::new` panics
+/// on zero).
+pub(crate) fn pty_content_dims(layout: &TileLayout) -> (u16, u16) {
+    let (tile_rows, tile_cols) = pty_tile_dims(layout);
+    (tile_rows.saturating_sub(1).max(1), tile_cols)
 }
 
 fn envelope(payload: Payload) -> Envelope {
@@ -2142,6 +2473,37 @@ pub(crate) fn fleet_action_verb(kind: FleetActionKind) -> &'static str {
     }
 }
 
+/// Short pane-tab label from a shell string. Remote panes arrive as
+/// `"ssh:<alias>"` from the daemon's `remote_pane` module and are
+/// returned verbatim; local panes arrive as an absolute shell path
+/// (`"/bin/zsh"`) and are trimmed to the final component. A 20-char
+/// cap keeps the tab strip legible when aliases are long.
+pub(crate) fn pane_label_from_shell(shell: &str) -> String {
+    const MAX_LABEL_CHARS: usize = 20;
+    let raw = if shell.starts_with("ssh:") || shell.is_empty() {
+        shell.to_string()
+    } else {
+        let path = std::path::Path::new(shell);
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(shell)
+            .to_string()
+    };
+    let trimmed = if raw.is_empty() {
+        "pane".to_string()
+    } else {
+        raw
+    };
+    // Char-count, not byte-count — prevents a UTF-8 boundary panic if
+    // a future user surfaces a non-ASCII alias.
+    if trimmed.chars().count() > MAX_LABEL_CHARS {
+        let prefix: String = trimmed.chars().take(MAX_LABEL_CHARS).collect();
+        format!("{prefix}…")
+    } else {
+        trimmed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2154,7 +2516,7 @@ mod tests {
     /// Docker/Ports/Fleet in the middle row, Claude Code strip at
     /// bottom.
     fn test_app() -> App {
-        App::new(7, (40, 120))
+        App::new(7, "/bin/zsh".to_string(), (40, 120))
     }
 
     fn count<F: FnMut(&AppAction) -> bool>(actions: &[AppAction], mut pred: F) -> usize {
@@ -2218,18 +2580,18 @@ mod tests {
                     subscription_id,
                 } => {
                     assert_eq!(*pane_id, 7);
-                    assert_eq!(*subscription_id, app.pane_sub);
+                    assert_eq!(*subscription_id, app.active_pane_sub());
                 }
                 other => panic!("expected AttachPane, got {other:?}"),
             },
             other => panic!("expected SendEnvelope, got {other:?}"),
         }
 
-        // ResizePane with the pty tile's rows/cols — NOT the terminal
-        // dims. This is the C1.5 invariant: the pane sized to fit its
-        // tile, not the full terminal, so vim et al. render inside the
-        // box.
-        let (expected_pty_rows, expected_pty_cols) = pty_tile_dims(&app.view.layout);
+        // ResizePane with the pty tile's content rows (excluding the
+        // tab strip) and full width — NOT the terminal dims. The
+        // daemon-side pane is sized to the vt100 render area so vim et
+        // al. render inside the box, not one row taller than it.
+        let (expected_pty_rows, expected_pty_cols) = pty_content_dims(&app.view.layout);
         match &actions[1] {
             AppAction::SendEnvelope(env) => match &env.payload {
                 Payload::ResizePane {
@@ -2698,10 +3060,11 @@ mod tests {
     #[test]
     fn pane_output_feeds_vt100_parser_and_emits_drawframe() {
         let mut app = test_app();
+        let sub_id = app.active_pane_sub();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
-                subscription_id: app.pane_sub,
+                subscription_id: sub_id,
                 event: Event::PaneOutput {
                     data: b"hello".to_vec(),
                 },
@@ -2709,8 +3072,8 @@ mod tests {
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
         // vt100 received the bytes: first cell should now be 'h'.
-        let cell = app
-            .pty_parser
+        let cell = app.pane_stack[app.active_pane]
+            .parser
             .screen()
             .cell(0, 0)
             .expect("cell (0,0) exists");
@@ -2725,10 +3088,11 @@ mod tests {
     #[test]
     fn pane_snapshot_feeds_vt100_parser() {
         let mut app = test_app();
+        let sub_id = app.active_pane_sub();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
-                subscription_id: app.pane_sub,
+                subscription_id: sub_id,
                 event: Event::PaneSnapshot {
                     scrollback: b"replayed".to_vec(),
                     rows: 24,
@@ -2737,7 +3101,11 @@ mod tests {
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
-        let cell = app.pty_parser.screen().cell(0, 0).unwrap();
+        let cell = app.pane_stack[app.active_pane]
+            .parser
+            .screen()
+            .cell(0, 0)
+            .unwrap();
         assert_eq!(cell.contents(), "r");
         assert_eq!(count(&actions, |a| matches!(a, AppAction::DrawFrame)), 1);
     }
@@ -2745,10 +3113,11 @@ mod tests {
     #[test]
     fn pane_exit_event_emits_pane_exited_detach() {
         let mut app = test_app();
+        let sub_id = app.active_pane_sub();
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Event(EventFrame {
-                subscription_id: app.pane_sub,
+                subscription_id: sub_id,
                 event: Event::PaneExit {
                     exit_code: Some(42),
                 },
@@ -2794,9 +3163,9 @@ mod tests {
         let pty_rect = app.view.layout.rect_of(TileId::Pty).unwrap();
         assert_eq!(pty_rect.width, 160);
 
-        // ResizePane carries the NEW pty tile dims, not the terminal
-        // dims.
-        let (expected_rows, expected_cols) = pty_tile_dims(&app.view.layout);
+        // ResizePane carries the NEW pty content dims (tile rows minus
+        // the 1-row tab strip), not the terminal dims.
+        let (expected_rows, expected_cols) = pty_content_dims(&app.view.layout);
         let resize_count = count(&actions, |a| {
             matches!(
                 a,
@@ -4175,5 +4544,412 @@ mod tests {
             .count();
         assert_eq!(send_input_count, 0, "j in Ports must not become SendInput");
         assert_eq!(app.ports.ports.selection, 1);
+    }
+
+    // ────────────────── Phase 5 Slice 5d-ii — pane stack ──────────────────
+
+    /// Inject a `PaneOpened` as if the daemon replied to a client-
+    /// initiated open. Registers a `PendingOpen` first so the FIFO
+    /// correlation in `handle_pane_opened` consumes it (otherwise the
+    /// handler drops the response as "another client's open").
+    fn inject_pane_opened(app: &mut App, pane_id: PaneId, shell: &str) {
+        let alias = shell.strip_prefix("ssh:").map(str::to_string);
+        let sub_id = app.alloc_sub_id();
+        app.pending_opens.push_back(PendingOpen { sub_id, alias });
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::PaneOpened(PaneInfo {
+                id: pane_id,
+                created_at_unix_millis: 0,
+                rows: 20,
+                cols: 80,
+                shell: shell.into(),
+                alive: true,
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+    }
+
+    fn fleet_with_hosts(app: &mut App, aliases: &[&str]) {
+        use std::collections::HashMap;
+        let hosts: Vec<HostEntry> = aliases
+            .iter()
+            .map(|a| HostEntry {
+                alias: (*a).into(),
+                hostname: format!("{a}.example"),
+                user: "alice".into(),
+                port: 22,
+                identity_files: vec![],
+                proxy_jump: None,
+            })
+            .collect();
+        let mut states = HashMap::new();
+        for a in aliases {
+            states.insert((*a).to_string(), HostState::Disconnected);
+        }
+        app.fleet.state = FleetScopeState::Available {
+            hosts,
+            states,
+            source: "test".into(),
+        };
+    }
+
+    #[test]
+    fn root_pane_seeds_stack_with_local_label() {
+        let app = test_app();
+        assert_eq!(app.pane_stack.len(), 1, "starts with one root pane");
+        assert_eq!(app.active_pane, 0);
+        assert_eq!(
+            app.pane_stack[0].label, "zsh",
+            "local shell path trims to final component"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_n_cycles_next_pane_wrap() {
+        let mut app = test_app();
+        inject_pane_opened(&mut app, 100, "ssh:staging");
+        inject_pane_opened(&mut app, 101, "ssh:dev");
+        assert_eq!(app.pane_stack.len(), 3);
+        assert_eq!(app.active_pane, 2, "second open becomes active");
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02n".to_vec()));
+        assert_eq!(app.active_pane, 0, "wraps past end");
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02n".to_vec()));
+        assert_eq!(app.active_pane, 1);
+    }
+
+    #[test]
+    fn ctrl_b_p_cycles_prev_pane_wrap() {
+        let mut app = test_app();
+        inject_pane_opened(&mut app, 100, "ssh:staging");
+        inject_pane_opened(&mut app, 101, "ssh:dev");
+        // active = 2; p → 1, p → 0, p → 2 (wrap).
+        app.handle_event(AppEvent::StdinChunk(b"\x02p".to_vec()));
+        assert_eq!(app.active_pane, 1);
+        app.handle_event(AppEvent::StdinChunk(b"\x02p".to_vec()));
+        assert_eq!(app.active_pane, 0);
+        app.handle_event(AppEvent::StdinChunk(b"\x02p".to_vec()));
+        assert_eq!(app.active_pane, 2, "wraps past start");
+    }
+
+    #[test]
+    fn ctrl_b_digit_selects_pane_slot() {
+        let mut app = test_app();
+        inject_pane_opened(&mut app, 100, "ssh:staging");
+        inject_pane_opened(&mut app, 101, "ssh:dev");
+        // active = 2; Ctrl-b 1 → 0, Ctrl-b 2 → 1, Ctrl-b 3 → 2.
+        app.handle_event(AppEvent::StdinChunk(b"\x021".to_vec()));
+        assert_eq!(app.active_pane, 0);
+        app.handle_event(AppEvent::StdinChunk(b"\x022".to_vec()));
+        assert_eq!(app.active_pane, 1);
+        app.handle_event(AppEvent::StdinChunk(b"\x023".to_vec()));
+        assert_eq!(app.active_pane, 2);
+    }
+
+    #[test]
+    fn ctrl_b_digit_out_of_range_is_noop() {
+        let mut app = test_app();
+        // Stack has 1 pane; Ctrl-b 5 beyond range — stays on 0.
+        app.handle_event(AppEvent::StdinChunk(b"\x025".to_vec()));
+        assert_eq!(app.active_pane, 0);
+    }
+
+    #[test]
+    fn ctrl_b_digit_zero_selects_tenth_pane() {
+        // Ctrl-b 0 targets slot 10 (stack index 9) per tmux muscle
+        // memory. Slot 10 is keybind-only; the visual strip caps at
+        // 9 numbered slots + a `[+N]` overflow indicator.
+        let mut app = test_app();
+        for (i, alias) in ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+            .iter()
+            .enumerate()
+        {
+            inject_pane_opened(&mut app, 100 + i as u64, &format!("ssh:{alias}"));
+        }
+        assert_eq!(app.pane_stack.len(), 10);
+        app.handle_event(AppEvent::StdinChunk(b"\x021".to_vec()));
+        assert_eq!(app.active_pane, 0);
+        app.handle_event(AppEvent::StdinChunk(b"\x020".to_vec()));
+        assert_eq!(app.active_pane, 9, "Ctrl-b 0 jumps to the 10th pane");
+    }
+
+    #[test]
+    fn ctrl_b_ampersand_closes_active_pane_and_shifts_active() {
+        let mut app = test_app();
+        inject_pane_opened(&mut app, 100, "ssh:staging");
+        inject_pane_opened(&mut app, 101, "ssh:dev");
+        // active = 2 (ssh:dev). Close it; active should shift to 1
+        // (ssh:staging).
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02&".to_vec()));
+        assert_eq!(app.pane_stack.len(), 2);
+        assert_eq!(app.active_pane, 1);
+        // ClosePane envelope sent for the removed pane id.
+        let closed = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(&env.payload, Payload::ClosePane { pane_id: 101 })
+            )
+        });
+        assert!(
+            closed,
+            "ClosePane must carry the closed pane id; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_ampersand_on_last_pane_dispatches_open_local() {
+        let mut app = test_app();
+        // Stack has one local root pane. Ctrl-b & should close it AND
+        // request a fresh local root so the PTY tile never blanks.
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02&".to_vec()));
+        // Stack cleared eagerly.
+        assert!(app.pane_stack.is_empty());
+        // OpenPane Local dispatched.
+        let has_open = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::OpenPane(spec) if matches!(spec.target, PaneTarget::Local)
+                    )
+            )
+        });
+        assert!(
+            has_open,
+            "Ctrl-b & on last pane dispatches fresh local OpenPane; got {actions:?}"
+        );
+        assert_eq!(app.pending_opens.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_b_ampersand_is_noop_when_focus_is_not_pty() {
+        let mut app = test_app();
+        // Focus Docker tile so Ctrl-b & shouldn't fire the pane close.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        assert_eq!(app.view.focused, TileId::Docker);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02&".to_vec()));
+        assert_eq!(app.pane_stack.len(), 1, "stack untouched from scope focus");
+        let closed = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(&env.payload, Payload::ClosePane { .. })
+            )
+        });
+        assert!(!closed, "no ClosePane envelope when focus is off PTY");
+    }
+
+    #[test]
+    fn ctrl_b_enter_on_fleet_dispatches_open_pane_remote() {
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["staging", "dev"]);
+        // Focus Fleet tile.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // PTY → Docker
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec())); // Docker → Ports
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec())); // Ports → Fleet
+        assert_eq!(app.view.focused, TileId::Fleet);
+
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
+        let open_remote_staging = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::OpenPane(spec)
+                        if matches!(
+                            &spec.target,
+                            PaneTarget::Remote { alias }
+                            if alias == "staging"
+                        )
+                    )
+            )
+        });
+        assert!(
+            open_remote_staging,
+            "Ctrl-b Enter on Fleet dispatches OpenPane Remote for selected alias; got {actions:?}"
+        );
+        assert_eq!(app.pending_opens.len(), 1);
+        assert_eq!(
+            app.pending_opens.front().unwrap().alias.as_deref(),
+            Some("staging")
+        );
+    }
+
+    #[test]
+    fn ctrl_b_enter_on_pty_is_noop() {
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["staging"]);
+        assert_eq!(app.view.focused, TileId::Pty);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
+        let has_open = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(&env.payload, Payload::OpenPane { .. })
+            )
+        });
+        assert!(
+            !has_open,
+            "Ctrl-b Enter on PTY focus is a no-op; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn pane_opened_response_pushes_entry_and_emits_attach_and_focus() {
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["staging"]);
+        // Focus Fleet + dispatch OpenPane.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
+        let pending_sub = app.pending_opens.front().unwrap().sub_id;
+
+        // Simulate the daemon's PaneOpened response.
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::PaneOpened(PaneInfo {
+                id: 42,
+                created_at_unix_millis: 0,
+                rows: 20,
+                cols: 80,
+                shell: "ssh:staging".into(),
+                alive: true,
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+
+        assert_eq!(app.pane_stack.len(), 2, "stack grew by one");
+        assert_eq!(app.active_pane, 1);
+        assert_eq!(app.pane_stack[1].pane_id, 42);
+        assert_eq!(app.pane_stack[1].sub_id, pending_sub);
+        assert_eq!(app.pane_stack[1].label, "ssh:staging");
+        assert!(app.pending_opens.is_empty());
+
+        // AttachPane sent for the new pane + sub.
+        let attach = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::AttachPane { pane_id: 42, subscription_id }
+                        if *subscription_id == pending_sub
+                    )
+            )
+        });
+        assert!(
+            attach,
+            "AttachPane must target the new pane id + sub; got {actions:?}"
+        );
+
+        // Focus moves back to PTY.
+        assert_eq!(app.view.focused, TileId::Pty);
+        let focus_pty = actions
+            .iter()
+            .any(|a| matches!(a, AppAction::FocusTile(TileId::Pty)));
+        assert!(focus_pty, "focus moves back to PTY tile");
+    }
+
+    #[test]
+    fn pane_exit_on_single_pane_detaches() {
+        let mut app = test_app();
+        let sub = app.active_pane_sub();
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: sub,
+                event: Event::PaneExit { exit_code: Some(0) },
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        let detached = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::Detach(DetachReason::PaneExited { exit_code: Some(0) })
+            )
+        });
+        assert!(detached, "last pane exit detaches the TUI; got {actions:?}");
+    }
+
+    #[test]
+    fn pane_exit_on_non_active_pane_just_removes_it() {
+        let mut app = test_app();
+        inject_pane_opened(&mut app, 100, "ssh:staging");
+        inject_pane_opened(&mut app, 101, "ssh:dev");
+        // active = 2 (ssh:dev). PaneExit on pane 100 (index 1).
+        let sub_100 = app.pane_stack[1].sub_id;
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: sub_100,
+                event: Event::PaneExit { exit_code: None },
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert_eq!(app.pane_stack.len(), 2);
+        assert_eq!(
+            app.active_pane, 1,
+            "active (ssh:dev) shifts down to new index 1"
+        );
+        assert_eq!(app.pane_stack[1].pane_id, 101);
+        // Detach NOT emitted; stack non-empty.
+        let detached = actions.iter().any(|a| matches!(a, AppAction::Detach(_)));
+        assert!(!detached, "non-terminal pane exit stays attached");
+    }
+
+    #[test]
+    fn error_during_pending_open_attributes_failure_to_alias() {
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["staging"]);
+        // Dispatch open against Fleet.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
+        assert_eq!(app.pending_opens.len(), 1);
+
+        // Daemon replies Error instead of PaneOpened.
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Error(ErrorInfo {
+                kind: ErrorKind::Internal,
+                message: "ssh dial failed: connection refused".into(),
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert!(app.pending_opens.is_empty(), "FIFO entry consumed");
+        // Red toast references the alias + the reason verbatim.
+        let error_toast = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::ShowToast {
+                    kind: ToastKind::Error,
+                    message,
+                } if message.contains("staging") && message.contains("connection refused")
+            )
+        });
+        assert!(
+            error_toast,
+            "Error during pending open surfaces as failure toast; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn pane_label_from_shell_variants() {
+        assert_eq!(pane_label_from_shell("/bin/zsh"), "zsh");
+        assert_eq!(pane_label_from_shell("/usr/local/bin/fish"), "fish");
+        assert_eq!(pane_label_from_shell("ssh:staging"), "ssh:staging");
+        assert_eq!(pane_label_from_shell(""), "pane");
+        // Long labels truncate with an ellipsis.
+        let long = "ssh:this-is-a-really-long-alias-name-indeed";
+        let trimmed = pane_label_from_shell(long);
+        assert_eq!(trimmed.chars().count(), 21, "20-char prefix + one ellipsis");
+        assert!(trimmed.ends_with('…'));
     }
 }
