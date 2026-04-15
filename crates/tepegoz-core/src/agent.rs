@@ -385,19 +385,25 @@ pub async fn deploy_and_register_agent(
     alias: &str,
     session: &tepegoz_ssh::SshSession,
     state: &Arc<crate::state::SharedState>,
-) {
+) -> Option<Vec<String>> {
     let Some(resolver) = state.agent_resolver else {
         warn!(
             alias,
             "no agent resolver configured (run `cargo xtask build-agents`); \
              remote scopes will be unavailable"
         );
-        return;
+        return None;
     };
 
     match deploy_and_register_inner(alias, session, state, resolver).await {
-        Ok(()) => debug!(alias, "agent deployed + registered"),
-        Err(e) => warn!(alias, error = %e, "agent deploy failed; remote scopes unavailable"),
+        Ok(capabilities) => {
+            debug!(alias, "agent deployed + registered");
+            Some(capabilities)
+        }
+        Err(e) => {
+            warn!(alias, error = %e, "agent deploy failed; remote scopes unavailable");
+            None
+        }
     }
 }
 
@@ -406,7 +412,7 @@ async fn deploy_and_register_inner(
     session: &tepegoz_ssh::SshSession,
     state: &Arc<crate::state::SharedState>,
     resolver: crate::config::AgentResolver,
-) -> Result<(), tepegoz_ssh::SshError> {
+) -> Result<Vec<String>, tepegoz_ssh::SshError> {
     // Detect remote target + resolve embedded bytes.
     let target = tepegoz_ssh::deploy::detect_target(session).await?;
     let bytes =
@@ -449,7 +455,7 @@ async fn deploy_and_register_inner(
         capabilities = ?info.capabilities,
         "agent registered in pool"
     );
-    Ok(())
+    Ok(info.capabilities)
 }
 
 /// Fleet supervisor entry point: remove the agent for `alias` from

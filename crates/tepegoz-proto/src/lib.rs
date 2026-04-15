@@ -56,8 +56,18 @@ pub mod socket;
 //   added to `Subscription::{Docker, DockerLogs, DockerStats, Ports,
 //   Processes}` + `DockerActionRequest` + `DockerActionResult`.
 //   `#[default] Local` keeps pre-v11 locality implicit at
-//   construction; explicit at the wire boundary. One breakpoint
-//   services 6c (Docker routing) + 6d (Ports / Processes routing).
+//   construction; explicit at the wire boundary.
+// - v12 (Phase 6 Slice 6d-i): `Event::AgentCapabilities { alias,
+//   capabilities }` — emitted by the Fleet supervisor on successful
+//   agent register (with the real capability list from the handshake
+//   response) and on agent deregister (empty `capabilities`). Lets
+//   the TUI's host picker grey rows per the invoking tile's
+//   required capability without having to (a) infer from HostState
+//   or (b) attempt-then-fail via DockerUnavailable. Separate variant
+//   (not a field on HostStateChanged) because capability churn is
+//   semantically orthogonal to connection-state transitions — adding
+//   a capability field to HostStateChanged would force re-emits on
+//   every state change even when caps didn't move.
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
 
 /// Identifier for a pty pane owned by the daemon.
@@ -366,6 +376,27 @@ pub enum Event {
         alias: String,
         state: HostState,
         reason: Option<String>,
+    },
+    /// Phase 6 Slice 6d-i: the daemon's Fleet supervisor has just
+    /// registered (or unregistered) a remote agent for `alias`.
+    /// `capabilities` lists the capability strings the agent reports
+    /// (`"docker"` / `"ports"` / `"processes"` / future kinds) —
+    /// empty vec on deregister. Emitted once per register/deregister
+    /// event, not per state transition.
+    ///
+    /// Clients consume this to know which remote hosts can serve a
+    /// given tile's subscription before attempting to subscribe.
+    /// The TUI's host-picker modal greys rows per the invoking
+    /// tile's required capability using exactly this signal; a host
+    /// in `Connected` state but missing `"docker"` still greys.
+    ///
+    /// Orthogonal to [`Event::HostStateChanged`] — capabilities
+    /// change only on agent register / reconnect, not on every
+    /// connection-state transition, so folding them into the state
+    /// event would force noisy re-emits.
+    AgentCapabilities {
+        alias: String,
+        capabilities: Vec<String>,
     },
 }
 

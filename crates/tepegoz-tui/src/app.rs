@@ -849,19 +849,21 @@ impl HostPickerModal {
 /// One row in the host picker modal. Index 0 is always Local; indices
 /// 1..=N are Fleet hosts in discovery order.
 ///
-/// `usable` is the render signal: `true` means the host's state is
-/// `Connected` (agent presumably reachable); `false` greys the row +
-/// shows an inline explanation. In 6c-iii we treat `state ==
-/// Connected` as the best proxy for "usable" — the daemon-side
-/// capability check (`"docker"` ∈ capabilities) still gates commit
-/// via `DockerUnavailable`, so a greyed-out row is belt-and-braces,
-/// not a gate.
+/// `usable` is the authoritative "commit will work" signal — true
+/// iff the host is `Connected` AND its agent advertises the
+/// invoking tile's required capability (populated via
+/// `Event::AgentCapabilities` since Slice 6d-i). `has_capability`
+/// is surfaced separately so the annotation can distinguish
+/// "(not connected)" from "(no <cap>)" — two different
+/// remediations from the user's POV (reconnect vs. check the
+/// remote docker / ports / processes service).
 #[derive(Debug, Clone)]
 pub(crate) enum HostPickerRow {
     Local,
     Remote {
         alias: String,
         state: tepegoz_proto::HostState,
+        has_capability: bool,
         usable: bool,
     },
 }
@@ -1151,6 +1153,15 @@ pub(crate) struct App {
     /// Escape / Detach / Help dismisses + falls through; a click
     /// dismisses the modal (clicks on modal rows commit).
     pub(crate) host_picker: Option<HostPickerModal>,
+    /// Phase 6 Slice 6d-i: per-alias agent capability list, sourced
+    /// from `Event::AgentCapabilities` on the Fleet subscription.
+    /// Empty vec = "agent registered but advertises no capabilities";
+    /// missing entry = "no agent registered for this alias".
+    /// Consumed by the host picker's `usable` determination so a
+    /// Connected host that lacks the invoking tile's required
+    /// capability greys out with `(no <cap>)` — the user sees up-
+    /// front which retargets will and won't land.
+    pub(crate) host_capabilities: HashMap<String, Vec<String>>,
     /// Slice 6.0: most-recent mouse-hover tile, used by the tile
     /// renderer to draw a distinct border style on the hovered tile.
     /// `None` means the cursor is outside every tile's Rect (or no
@@ -1208,6 +1219,7 @@ impl App {
             toasts: VecDeque::new(),
             help_visible: false,
             host_picker: None,
+            host_capabilities: HashMap::new(),
             hovered_tile: None,
             last_click: None,
             input_filter: InputFilter::new(),
@@ -1734,7 +1746,16 @@ impl App {
     /// discovery order. Called by the render path + by commit /
     /// navigation key handlers that need to clamp against the row
     /// count.
-    pub(crate) fn host_picker_rows(&self) -> Vec<HostPickerRow> {
+    ///
+    /// `required_capability` is the capability string the invoking
+    /// tile requires (`"docker"` for the Docker tile; `"ports"` for
+    /// Ports; `"processes"` for Processes). It's checked against the
+    /// per-alias capability table populated from
+    /// `Event::AgentCapabilities` — a host is `usable` iff its state
+    /// is `Connected` AND its capability list contains the required
+    /// string. Greyed rows distinguish "(not connected)" from
+    /// "(no <cap>)" so the user sees which remediation applies.
+    pub(crate) fn host_picker_rows(&self, required_capability: &str) -> Vec<HostPickerRow> {
         let mut rows = vec![HostPickerRow::Local];
         if let FleetScopeState::Available { hosts, states, .. } = &self.fleet.state {
             for h in hosts {
@@ -1742,10 +1763,17 @@ impl App {
                     .get(&h.alias)
                     .copied()
                     .unwrap_or(tepegoz_proto::HostState::Disconnected);
+                let has_capability = self
+                    .host_capabilities
+                    .get(&h.alias)
+                    .map(|caps| caps.iter().any(|c| c == required_capability))
+                    .unwrap_or(false);
+                let usable = matches!(state, tepegoz_proto::HostState::Connected) && has_capability;
                 rows.push(HostPickerRow::Remote {
                     alias: h.alias.clone(),
                     state,
-                    usable: matches!(state, tepegoz_proto::HostState::Connected),
+                    has_capability,
+                    usable,
                 });
             }
         }
@@ -1777,7 +1805,7 @@ impl App {
             _ => return,
         };
 
-        let rows = self.host_picker_rows();
+        let rows = self.host_picker_rows(required_capability);
         let selected = rows
             .iter()
             .position(|r| match (r, &current_target) {
@@ -1814,7 +1842,12 @@ impl App {
     /// navigation feels consistent with the tile-focused navigation
     /// vocabulary the user already knows.
     pub(crate) fn handle_host_picker_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
-        let rows_len = self.host_picker_rows().len();
+        let required = self
+            .host_picker
+            .as_ref()
+            .map(|p| p.required_capability)
+            .unwrap_or("");
+        let rows_len = self.host_picker_rows(required).len();
         let Some(picker) = &mut self.host_picker else {
             return;
         };
@@ -1860,7 +1893,12 @@ impl App {
     /// greyed-out row (host not in Connected state) — the modal stays
     /// open so the user can pick again.
     fn commit_host_picker(&mut self, actions: &mut Vec<AppAction>) {
-        let rows = self.host_picker_rows();
+        let required = self
+            .host_picker
+            .as_ref()
+            .map(|p| p.required_capability)
+            .unwrap_or("");
+        let rows = self.host_picker_rows(required);
         let Some(picker) = self.host_picker.as_ref() else {
             return;
         };
@@ -3028,6 +3066,21 @@ impl App {
                 }
                 // Arriving before HostList — ignore; the supervisor
                 // will re-emit once the tile transitions to Available.
+            }
+            Event::AgentCapabilities {
+                alias,
+                capabilities,
+            } => {
+                // Phase 6 Slice 6d-i: track per-alias agent
+                // capabilities. Empty vec on agent disconnect — we
+                // still insert (rather than remove) so a row that
+                // briefly had a capability and lost it greys with
+                // `(no <cap>)` instead of disappearing into a
+                // missing-entry default. The map size is bounded by
+                // the Fleet host count, so insertion-only is safe
+                // memory-wise.
+                self.host_capabilities.insert(alias, capabilities);
+                actions.push(AppAction::DrawFrame);
             }
             _ => {}
         }
@@ -6156,6 +6209,22 @@ mod tests {
             };
             app.handle_event(AppEvent::DaemonEnvelope(env));
         }
+
+        // 6d-i: alpha is the Connected host that should be usable
+        // for retarget — give it `"docker"` capability so the picker
+        // greys it green. Bravo (Disconnected) doesn't need a cap
+        // entry — its row greys based on state.
+        let caps_env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::AgentCapabilities {
+                    alias: "alpha".into(),
+                    capabilities: vec!["docker".into()],
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(caps_env));
     }
 
     #[test]
@@ -6461,6 +6530,206 @@ mod tests {
         assert!(
             unsub_ids.contains(&app.docker.sub_id),
             "retarget must unsubscribe the list sub"
+        );
+    }
+
+    // ---- Phase 6 Slice 6d-i: AgentCapabilities event handling ----
+
+    #[test]
+    fn agent_capabilities_event_populates_host_capabilities_map() {
+        let mut app = test_app();
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::AgentCapabilities {
+                    alias: "demo".into(),
+                    capabilities: vec!["docker".into(), "ports".into()],
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert_eq!(
+            app.host_capabilities.get("demo"),
+            Some(&vec!["docker".to_string(), "ports".into()]),
+            "AgentCapabilities event must populate the per-alias map"
+        );
+    }
+
+    #[test]
+    fn agent_capabilities_with_empty_vec_clears_capabilities() {
+        let mut app = test_app();
+        // Seed populated.
+        let seed = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::AgentCapabilities {
+                    alias: "host".into(),
+                    capabilities: vec!["docker".into()],
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(seed));
+        // Disconnect re-emits with empty caps.
+        let teardown = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::AgentCapabilities {
+                    alias: "host".into(),
+                    capabilities: vec![],
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(teardown));
+        assert_eq!(
+            app.host_capabilities.get("host"),
+            Some(&Vec::<String>::new()),
+            "empty capabilities vec must overwrite (not delete) the entry — \
+             a Connected host with no caps still needs a `(no docker)` row"
+        );
+    }
+
+    #[test]
+    fn picker_greys_connected_host_without_required_capability() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+
+        // alpha is Connected and has "docker" (set in
+        // populate_fleet_with_two_hosts). Add a third host that's
+        // Connected but advertises no capabilities.
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::HostList {
+                    hosts: vec![
+                        tepegoz_proto::HostEntry {
+                            alias: "alpha".into(),
+                            hostname: "alpha.example".into(),
+                            user: "test".into(),
+                            port: 22,
+                            identity_files: vec![],
+                            proxy_jump: None,
+                        },
+                        tepegoz_proto::HostEntry {
+                            alias: "noprobe".into(),
+                            hostname: "noprobe.example".into(),
+                            user: "test".into(),
+                            port: 22,
+                            identity_files: vec![],
+                            proxy_jump: None,
+                        },
+                    ],
+                    source: "test".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+        let connected_no_caps = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::HostStateChanged {
+                    alias: "noprobe".into(),
+                    state: tepegoz_proto::HostState::Connected,
+                    reason: None,
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(connected_no_caps));
+        let empty_caps = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::AgentCapabilities {
+                    alias: "noprobe".into(),
+                    capabilities: vec![],
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(empty_caps));
+
+        // Both alpha and noprobe are Connected. Picker rows for
+        // "docker" should mark alpha usable, noprobe NOT usable.
+        let rows = app.host_picker_rows("docker");
+        let alpha_row = rows
+            .iter()
+            .find(|r| matches!(r, HostPickerRow::Remote { alias, .. } if alias == "alpha"))
+            .expect("alpha row");
+        let noprobe_row = rows
+            .iter()
+            .find(|r| matches!(r, HostPickerRow::Remote { alias, .. } if alias == "noprobe"))
+            .expect("noprobe row");
+
+        match alpha_row {
+            HostPickerRow::Remote {
+                usable,
+                has_capability,
+                ..
+            } => {
+                assert!(*usable, "alpha (Connected + has docker) must be usable");
+                assert!(*has_capability);
+            }
+            _ => unreachable!(),
+        }
+        match noprobe_row {
+            HostPickerRow::Remote {
+                usable,
+                has_capability,
+                ..
+            } => {
+                assert!(
+                    !*usable,
+                    "noprobe (Connected but missing docker cap) must NOT be usable"
+                );
+                assert!(!*has_capability);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn enter_on_connected_no_cap_host_is_noop_picker_stays_open() {
+        // 6d-i: capability greying is the gate — Enter on a Connected
+        // host that lacks the required cap must NOT commit a retarget.
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        // Replace alpha's capabilities with empty.
+        let empty_caps = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::AgentCapabilities {
+                    alias: "alpha".into(),
+                    capabilities: vec![],
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(empty_caps));
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec())); // open picker
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec())); // → alpha (now greyed)
+
+        let prev_target = app.docker.target.clone();
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
+        assert!(
+            app.host_picker.is_some(),
+            "Enter on Connected-no-cap row leaves picker open"
+        );
+        assert_eq!(
+            app.docker.target, prev_target,
+            "Enter on Connected-no-cap row must not commit a retarget"
+        );
+        let wire_actions = actions
+            .iter()
+            .filter(|a| matches!(a, AppAction::SendEnvelope(_)))
+            .count();
+        assert_eq!(
+            wire_actions, 0,
+            "Connected-no-cap commit sends no envelopes"
         );
     }
 }

@@ -52,6 +52,7 @@ fn payload_variant(p: &Payload) -> &'static str {
             Event::ProcessesUnavailable { .. } => "Event::ProcessesUnavailable",
             Event::HostList { .. } => "Event::HostList",
             Event::HostStateChanged { .. } => "Event::HostStateChanged",
+            Event::AgentCapabilities { .. } => "Event::AgentCapabilities",
         },
         Payload::PaneOpened(_) => "PaneOpened",
         Payload::PaneList { .. } => "PaneList",
@@ -833,6 +834,52 @@ mod tests {
                     assert_eq!(reason.is_some(), state.is_terminal());
                 }
                 other => panic!("expected Event(HostStateChanged), got {other:?}"),
+            }
+        }
+    }
+
+    /// Phase 6 Slice 6d-i roundtrip. Covers the register case
+    /// (`capabilities = ["docker", "ports", "processes"]`) and the
+    /// deregister case (empty vec) — both shapes pass through rkyv
+    /// without truncation or element loss, and the alias round-trips
+    /// verbatim.
+    #[tokio::test]
+    async fn agent_capabilities_event_roundtrip() {
+        for (alias, caps) in [
+            (
+                "staging",
+                vec!["docker".to_string(), "ports".into(), "processes".into()],
+            ),
+            ("dev-box", vec!["docker".to_string()]),
+            ("ghost-host", Vec::new()),
+        ] {
+            let (mut a, mut b) = tokio::io::duplex(1024);
+            let original = Envelope {
+                version: PROTOCOL_VERSION,
+                payload: Payload::Event(EventFrame {
+                    subscription_id: 77,
+                    event: Event::AgentCapabilities {
+                        alias: alias.into(),
+                        capabilities: caps.clone(),
+                    },
+                }),
+            };
+            write_envelope(&mut a, &original).await.unwrap();
+            let decoded = read_envelope(&mut b).await.unwrap();
+            match decoded.payload {
+                Payload::Event(EventFrame {
+                    subscription_id,
+                    event:
+                        Event::AgentCapabilities {
+                            alias: decoded_alias,
+                            capabilities,
+                        },
+                }) => {
+                    assert_eq!(subscription_id, 77);
+                    assert_eq!(decoded_alias, alias);
+                    assert_eq!(capabilities, caps);
+                }
+                other => panic!("expected Event(AgentCapabilities), got {other:?}"),
             }
         }
     }

@@ -53,7 +53,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     };
 
     let area = frame.area();
-    let rows = app.host_picker_rows();
+    let rows = app.host_picker_rows(picker.required_capability);
     // Desired height: one row per entry plus chrome, capped at frame
     // height. Minimum keeps Local + first fleet host visible when
     // the frame is squeezed.
@@ -98,13 +98,17 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len() + 2);
     lines.push(Line::from(""));
     for (idx, row) in rows.iter().enumerate() {
-        lines.push(format_row(row, idx == picker.selected));
+        lines.push(format_row(
+            row,
+            idx == picker.selected,
+            picker.required_capability,
+        ));
     }
     lines.push(Line::from(""));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn format_row(row: &HostPickerRow, selected: bool) -> Line<'static> {
+fn format_row(row: &HostPickerRow, selected: bool, required_capability: &str) -> Line<'static> {
     let marker_style = if selected {
         Style::default()
             .fg(Color::Cyan)
@@ -131,6 +135,7 @@ fn format_row(row: &HostPickerRow, selected: bool) -> Line<'static> {
         HostPickerRow::Remote {
             alias,
             state,
+            has_capability,
             usable,
         } => {
             let alias_span = if *usable {
@@ -147,8 +152,8 @@ fn format_row(row: &HostPickerRow, selected: bool) -> Line<'static> {
             };
             let (glyph, glyph_color) = state_glyph(*state);
             let glyph_span = Span::styled(glyph, Style::default().fg(glyph_color));
-            let annotation = annotation_for(*state, *usable);
-            let annotation_span = Span::styled(format!(" {annotation}"), dim_style);
+            let annotation = annotation_for(*state, *usable, *has_capability, required_capability);
+            let annotation_span = Span::styled(annotation, dim_style);
             Line::from(vec![
                 Span::styled(marker, marker_style),
                 alias_span,
@@ -180,11 +185,24 @@ fn state_glyph(state: HostState) -> (&'static str, Color) {
 /// state label ("connected"); unusable rows get a parenthesized
 /// explanation so the user sees *why* a host can't serve the current
 /// retarget, without having to reach for the Fleet tile.
-fn annotation_for(state: HostState, usable: bool) -> &'static str {
+///
+/// Slice 6d-i amendment: when state is `Connected` but the agent
+/// lacks the required capability, the annotation reads
+/// `(no <required_capability>)` — distinguishing "host unreachable"
+/// from "agent runs but probe failed" so the user knows which
+/// remediation applies.
+fn annotation_for(
+    state: HostState,
+    usable: bool,
+    has_capability: bool,
+    required_capability: &str,
+) -> String {
     if usable {
-        "connected"
+        " connected".to_string()
+    } else if matches!(state, HostState::Connected) && !has_capability {
+        format!(" (no {required_capability})")
     } else {
-        match state {
+        let label = match state {
             HostState::Disconnected => "(not connected)",
             HostState::Connecting => "(connecting)",
             HostState::Connected => "connected", // defensive — shouldn't hit
@@ -193,7 +211,8 @@ fn annotation_for(state: HostState, usable: bool) -> &'static str {
             HostState::HostKeyMismatch => "(host-key mismatch)",
             HostState::AgentNotDeployed => "(agent not deployed)",
             HostState::AgentVersionMismatch => "(agent version mismatch)",
-        }
+        };
+        format!(" {label}")
     }
 }
 
@@ -206,9 +225,30 @@ mod tests {
     use crate::app::{App, HostPickerModal, HostPickerTargetTile};
     use tepegoz_proto::{HostEntry, HostState};
 
+    /// Build an App with a populated Fleet + auto-populated
+    /// capabilities — every Connected host gets `["docker"]` so
+    /// 6c-iii-style "Connected = usable" assertions still hold.
+    /// Tests that need a Connected-but-no-cap row use [`test_app_caps`]
+    /// instead.
     fn test_app(fleet_hosts: Vec<(&str, HostState)>) -> App {
+        let caps: Vec<(&str, Vec<&str>)> = fleet_hosts
+            .iter()
+            .map(|(alias, state)| {
+                if matches!(state, HostState::Connected) {
+                    (*alias, vec!["docker"])
+                } else {
+                    (*alias, vec![])
+                }
+            })
+            .collect();
+        test_app_caps(fleet_hosts, caps)
+    }
+
+    fn test_app_caps(
+        fleet_hosts: Vec<(&str, HostState)>,
+        capabilities: Vec<(&str, Vec<&str>)>,
+    ) -> App {
         let mut app = App::new(1, "/bin/sh".into(), (40, 160));
-        // Seed fleet with provided hosts + states.
         let entries: Vec<HostEntry> = fleet_hosts
             .iter()
             .map(|(alias, _)| HostEntry {
@@ -229,6 +269,12 @@ mod tests {
             states,
             source: "test".into(),
         };
+        for (alias, caps) in capabilities {
+            app.host_capabilities.insert(
+                alias.to_string(),
+                caps.into_iter().map(String::from).collect(),
+            );
+        }
         app
     }
 
@@ -313,6 +359,28 @@ mod tests {
         assert!(
             joined.contains("▶"),
             "selected row must carry the ▶ marker: {joined}"
+        );
+    }
+
+    #[test]
+    fn connected_host_without_required_capability_shows_no_cap_annotation() {
+        // 6d-i acceptance: host is Connected but its agent doesn't
+        // advertise "docker" — picker greys the row with `(no docker)`,
+        // not `(not connected)`.
+        let mut app = test_app_caps(
+            vec![("noprobe", HostState::Connected)],
+            vec![("noprobe", vec![])],
+        );
+        app.host_picker = Some(HostPickerModal {
+            target_tile: HostPickerTargetTile::Docker,
+            required_capability: "docker",
+            selected: 0,
+        });
+        let rows = render_frame(&app, 100, 20);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("(no docker)"),
+            "Connected-but-no-cap row must annotate `(no docker)`: {joined}"
         );
     }
 

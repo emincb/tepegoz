@@ -1888,7 +1888,22 @@ async fn host_supervisor(
                 // failure we log + continue without pool entry —
                 // remote subs surface DockerUnavailable, heartbeat
                 // still runs normally.
-                crate::agent::deploy_and_register_agent(&alias, &session, &state).await;
+                //
+                // 6d-i: emit `Event::AgentCapabilities` immediately
+                // after successful register so clients know which
+                // capabilities the newly-connected agent serves
+                // (TUI picker uses this to grey rows per tile's
+                // required capability). Empty vec on deploy failure
+                // — surfaces as "no capabilities" in the UI, which
+                // is the truth when deploy didn't land.
+                let capabilities =
+                    crate::agent::deploy_and_register_agent(&alias, &session, &state).await;
+                emit_agent_capabilities(
+                    &event_tx,
+                    subscription_id,
+                    &alias,
+                    capabilities.unwrap_or_default(),
+                );
                 let ended = run_connected_session(
                     &alias,
                     subscription_id,
@@ -1903,6 +1918,10 @@ async fn host_supervisor(
                 // DockerUnavailable, and registered subs get notified
                 // of the disconnect.
                 crate::agent::remove_and_shutdown_agent(&alias, &state).await;
+                // 6d-i: emit empty capabilities so clients know the
+                // agent is gone (no longer serves anything). Picker
+                // rows for this alias flip back to greyed-out.
+                emit_agent_capabilities(&event_tx, subscription_id, &alias, Vec::new());
                 match ended {
                     ConnectedOutcome::HeartbeatFailed => {
                         if connect_start.elapsed() >= SSH_RECONNECT_RESET_THRESHOLD {
@@ -2216,4 +2235,28 @@ fn host_list_envelope(
             event: Event::HostList { hosts, source },
         }),
     }
+}
+
+/// Phase 6 Slice 6d-i: emit `Event::AgentCapabilities` on a Fleet
+/// subscription. Called by the host supervisor after a successful
+/// agent register (with the real capability list from the handshake
+/// response) and after any teardown of the connection (with an empty
+/// vec so clients flip their picker's row for this alias back to
+/// greyed-out).
+fn emit_agent_capabilities(
+    event_tx: &mpsc::UnboundedSender<Envelope>,
+    subscription_id: u64,
+    alias: &str,
+    capabilities: Vec<String>,
+) {
+    let _ = event_tx.send(Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::AgentCapabilities {
+                alias: alias.to_string(),
+                capabilities,
+            },
+        }),
+    });
 }
