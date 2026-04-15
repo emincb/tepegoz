@@ -121,26 +121,6 @@ channel. Panes become cheap (one `OpenPane` wire frame each), and
 the "how many connections am I opening?" question disappears from
 the user's mental model.
 
-### Tab never reaches the pty shell (Slice 6.0 trade-off)
-
-Slice 6.0 assigned `Tab` / `Shift-Tab` to tile-focus cycling
-unconditionally — including when the PTY tile is focused. Consequence:
-shell tab-completion and any pty app that uses `Tab` as input (vim's
-`Ctrl-I`, Claude Code's command palette) is unreachable via the Tab
-key while PTY is focused. The user must use arrow keys, shell-native
-alternatives (`Ctrl-n`/`Ctrl-p` for history), or work inside a pane
-that doesn't rely on Tab.
-
-**Rationale**. The Decision #7 amendment explicitly pins Tab as
-"tile cycle in a fixed order regardless of which tile is focused"
-— a deliberate UX simplification over a per-tile-context keybind
-(where Tab-in-PTY → shell, Tab-in-scope → tile-cycle). The amended
-wording makes the trade explicit so future contributors don't
-reflexively re-plumb it. If real-world usage surfaces this as
-too painful, the fix is a PTY-specific carve-out (Tab-in-PTY
-forwards to pty, everywhere else cycles focus), which the amendment
-can accommodate without a wire bump.
-
 ### Panes past slot 9 are not reachable today (Slice 6.0 regression)
 
 Slice 6.0 removed `Ctrl-b 0..9`, `Ctrl-b n`, `Ctrl-b p` in favor of
@@ -214,6 +194,9 @@ Error handler becomes dead code to delete.
 ---
 
 ## Resolved
+
+### ✅ Tab never reaches the pty shell — Slice 6.0.1 carve-out
+Closed 2026-04-15 by the Slice 6.0.1 commit. `App::handle_tab` forwards `\t` / `\x1b[Z` to the active pane's SendInput when the PTY tile is focused; elsewhere Tab / Shift-Tab still cycle tile focus. Decision #7's Input / interaction amendment carries the carve-out wording. Pinned by `tab_on_pty_focus_forwards_tab_byte_to_pty_not_cycle` + `shift_tab_on_pty_focus_forwards_csi_z_to_pty_not_cycle` in `tepegoz-tui::app::tests`.
 
 ### ✅ Vim-preservation across Scope→Pane re-attach — moot after Decision #7
 Closed 2026-04-14. The synthetic re-attach pattern was removed in C1.5b when the `View::{Pane, Scope}` mode model gave way to the tiled god view: vim lives in the always-on pty tile and its `AttachPane` subscription never tears down. The automated vt100 reconstruction test (`crates/tepegoz-core/tests/vim_preservation.rs`) was kept and repurposed as the per-CI pin for "bytes flowing into the pty tile render correctly through the vt100 parser." C1.5c's real-terminal run on 2026-04-14 confirmed vim renders + survives focus movement + detach/reattach with no visible corruption. The two fallback mitigations (resize-after-attach, keep-sub-alive-with-drop) are no longer applicable since there is no mode switch to interfere with.

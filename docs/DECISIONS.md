@@ -78,17 +78,23 @@ widget within the tile's Rect. Raw passthrough is gone. The Slice
 render area inside the same Rect; this is interior tile layout, not a
 Decision #7 amendment.
 
-**Input / interaction (amended 2026-04-15, Slice 6.0).** Focus moves
-between tiles via mouse click OR keyboard `Tab` / `Shift-Tab`.
-**Tab always cycles tiles in a fixed order** (PTY → Docker → Ports
-→ Fleet → ClaudeCode → PTY); it never cycles within a tile's
-contents regardless of which tile is focused. Within a focused tile,
-keyboard navigation is tile-specific (`j` / `k` / arrow keys for row
-nav, `/` to filter, etc.). Mouse click on an interactive element
-(tile, row, pane-strip tab) selects or acts per the tile's contract
-— every visually-interactive element must respond to click, and
-hover states (border highlight, color shift, pointer cursor on
-supporting terminals via OSC 22) indicate click-ability.
+**Input / interaction (amended 2026-04-15, Slice 6.0; Tab-in-PTY
+carve-out 2026-04-15, Slice 6.0.1).** Focus moves between tiles
+via mouse click OR keyboard `Tab` / `Shift-Tab`. **Tab cycles
+tiles in a fixed order** (PTY → Docker → Ports → Fleet →
+ClaudeCode → PTY) **except when the PTY tile is focused, where
+Tab / Shift-Tab forward to the pty byte stream** (as `\t` and
+`\x1b[Z` respectively) so shell tab-completion and any pty app
+that consumes Tab see the keystrokes they expect on a non-tepegoz
+terminal. On non-PTY tiles Tab / Shift-Tab never cycle within the
+tile's contents regardless of which tile is focused. Within a
+focused tile, keyboard navigation is tile-specific (`j` / `k` /
+arrow keys for row nav, `/` to filter, etc.). Mouse click on an
+interactive element (tile, row, pane-strip tab) selects or acts
+per the tile's contract — every visually-interactive element must
+respond to click, and hover states (border highlight, color shift,
+pointer cursor on supporting terminals via OSC 22) indicate
+click-ability.
 
 Documented keyboard surface — the five bindings help and docs teach:
 `Tab` / `Shift-Tab` (tile focus), arrow keys / `j` / `k` (row nav),

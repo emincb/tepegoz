@@ -69,7 +69,7 @@ pub(crate) fn render(frame: &mut Frame<'_>) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(" tile focus", heading_style)),
-        Line::from("   Tab · Shift-Tab     cycle tile focus"),
+        Line::from("   Tab · Shift-Tab     cycle tile focus (PTY → shell)"),
         Line::from("   mouse click         focus tile · select row"),
         Line::from(""),
         Line::from(Span::styled(" inside a focused scope tile", heading_style)),
@@ -128,6 +128,10 @@ mod tests {
         assert!(
             joined.contains("Ctrl-b ?"),
             "Ctrl-b ? (toggle self) must appear"
+        );
+        assert!(
+            joined.contains("PTY → shell"),
+            "Slice 6.0.1 carve-out (Tab forwards to shell on PTY focus) must be documented: {joined}"
         );
     }
 

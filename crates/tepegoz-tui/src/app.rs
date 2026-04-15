@@ -1470,8 +1470,8 @@ impl App {
                     return;
                 }
                 InputAction::FocusDirection(dir) => self.handle_focus_direction(dir, actions),
-                InputAction::FocusNext => self.handle_focus_cycle(true, actions),
-                InputAction::FocusPrev => self.handle_focus_cycle(false, actions),
+                InputAction::FocusNext => self.handle_tab(true, actions),
+                InputAction::FocusPrev => self.handle_tab(false, actions),
                 InputAction::Help => self.handle_help_toggle(actions),
                 InputAction::PaneClose => {
                     if self.view.layout.routes_to_pty(self.view.focused) {
@@ -1529,6 +1529,30 @@ impl App {
         if let Some(next) = self.view.layout.cycle_focus(self.view.focused, forward) {
             self.move_focus_to(next, actions);
         }
+    }
+
+    /// Slice 6.0.1 Tab-in-PTY carve-out. `Tab` / `Shift-Tab` cycle
+    /// tile focus except when the PTY tile is focused, in which case
+    /// the keystroke forwards to the pty byte stream so shell tab-
+    /// completion (and any pty app that consumes Tab) works. PTY-
+    /// focused Shift-Tab forwards the CSI Z sequence (`ESC [ Z`) —
+    /// the same byte shape xterm sends on Shift-Tab — so readline /
+    /// vim see what they'd see on a non-tepegoz terminal.
+    fn handle_tab(&mut self, forward_cycle: bool, actions: &mut Vec<AppAction>) {
+        if self.view.layout.routes_to_pty(self.view.focused) {
+            let pane_id = self.active_pane_id();
+            let data: Vec<u8> = if forward_cycle {
+                vec![b'\t']
+            } else {
+                b"\x1b[Z".to_vec()
+            };
+            actions.push(AppAction::SendEnvelope(envelope(Payload::SendInput {
+                pane_id,
+                data,
+            })));
+            return;
+        }
+        self.handle_focus_cycle(forward_cycle, actions);
     }
 
     /// Shared focus-transition path used by directional, cycle, and
@@ -4902,9 +4926,12 @@ mod tests {
 
     #[test]
     fn tab_cycles_forward_through_fixed_tile_order() {
+        // Slice 6.0.1 carve-out: Tab on PTY forwards to pty, so to
+        // exercise the cycle we start from a non-PTY focus. Ctrl-b j
+        // (undocumented spatial-focus alias) hops off PTY without
+        // relying on Tab itself.
         let mut app = test_app();
-        assert_eq!(app.view.focused, TileId::Pty);
-        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
         assert_eq!(app.view.focused, TileId::Docker);
         app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
         assert_eq!(app.view.focused, TileId::Ports);
@@ -4918,18 +4945,80 @@ mod tests {
 
     #[test]
     fn shift_tab_cycles_backward_through_fixed_tile_order() {
+        // As above — start from a non-PTY focus so Shift-Tab hits the
+        // cycle branch (rather than the 6.0.1 PTY carve-out).
+        let mut app = test_app();
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        assert_eq!(app.view.focused, TileId::Docker);
+        app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
+        assert_eq!(app.view.focused, TileId::Pty);
+        // Bouncing back through PTY — Shift-Tab on PTY forwards to
+        // pty now, so use Ctrl-b j to return to Docker before the
+        // next cycle step.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        assert_eq!(app.view.focused, TileId::Docker);
+        // And continue cycling backward from Docker.
+        app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
+        assert_eq!(app.view.focused, TileId::Pty, "Docker ← Shift-Tab → Pty");
+    }
+
+    #[test]
+    fn tab_on_pty_focus_forwards_tab_byte_to_pty_not_cycle() {
+        // Slice 6.0.1 carve-out: shell tab-completion (or any pty app
+        // that consumes Tab) must see the Tab byte while the PTY
+        // tile owns focus. The tile stays focused; no cycle.
         let mut app = test_app();
         assert_eq!(app.view.focused, TileId::Pty);
-        app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
         assert_eq!(
             app.view.focused,
-            TileId::ClaudeCode,
-            "Shift-Tab from PTY wraps to ClaudeCode"
+            TileId::Pty,
+            "Tab on PTY focus must not cycle tiles"
         );
-        app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
-        assert_eq!(app.view.focused, TileId::Fleet);
-        app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
-        assert_eq!(app.view.focused, TileId::Ports);
+        let sent_tab = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::SendInput { data, .. } if data == b"\t"
+                    )
+            )
+        });
+        assert!(
+            sent_tab,
+            "PTY-focused Tab must forward \\t as SendInput; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn shift_tab_on_pty_focus_forwards_csi_z_to_pty_not_cycle() {
+        // Symmetric carve-out for Shift-Tab. Xterm sends `\x1b[Z` on
+        // Shift-Tab; readline uses it for reverse menu-complete, vim
+        // uses it for reverse tab-navigation in some plugins — we
+        // hand that same byte shape to the pty so those paths work.
+        let mut app = test_app();
+        assert_eq!(app.view.focused, TileId::Pty);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
+        assert_eq!(
+            app.view.focused,
+            TileId::Pty,
+            "Shift-Tab on PTY focus must not cycle tiles"
+        );
+        let sent_csi_z = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::SendInput { data, .. } if data == b"\x1b[Z"
+                    )
+            )
+        });
+        assert!(
+            sent_csi_z,
+            "PTY-focused Shift-Tab must forward \\x1b[Z as SendInput; got {actions:?}"
+        );
     }
 
     #[test]
@@ -5027,10 +5116,13 @@ mod tests {
         // Decision #7. Pre-6.0 the keybind was Ctrl-b Enter.
         let mut app = test_app();
         fleet_with_hosts(&mut app, &["staging", "dev"]);
-        // Focus Fleet tile via Tab cycling (PTY → Docker → Ports → Fleet).
-        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
-        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
-        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        // Focus Fleet tile. Slice 6.0.1 carved Tab out of PTY focus,
+        // so we use Ctrl-b j → l → l (undocumented spatial-focus
+        // aliases) to hop PTY → Docker → Ports → Fleet without the
+        // first Tab getting forwarded to the pty.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
         assert_eq!(app.view.focused, TileId::Fleet);
 
         let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
@@ -5100,10 +5192,12 @@ mod tests {
     fn pane_opened_response_pushes_entry_and_emits_attach_and_focus() {
         let mut app = test_app();
         fleet_with_hosts(&mut app, &["staging"]);
-        // Focus Fleet via Tab cycling + plain-Enter dispatch OpenPane.
-        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
-        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
-        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        // Focus Fleet (via undocumented Ctrl-b spatial aliases so the
+        // 6.0.1 Tab-in-PTY carve-out doesn't swallow the first step)
+        // + plain-Enter dispatch OpenPane.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
         app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
         let pending_sub = app.pending_opens.front().unwrap().sub_id;
 
