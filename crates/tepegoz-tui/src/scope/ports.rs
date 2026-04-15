@@ -24,17 +24,14 @@ use crate::app::{
 
 /// Entry point. Draws the Ports tile into `area`, matching the scope
 /// rendering contract in `docs/ARCHITECTURE.md` §9.
-pub(crate) fn render(scope: &PortsScope, frame: &mut Frame<'_>, area: Rect, focused: bool) {
-    let border_color = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let border_modifier = if focused {
-        Modifier::empty()
-    } else {
-        Modifier::DIM
-    };
+pub(crate) fn render(
+    scope: &PortsScope,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    focused: bool,
+    hovered: bool,
+) {
+    let (border_color, border_modifier) = crate::scope::border_style(focused, hovered);
     let title = match scope.active {
         PortsActiveView::Ports => "ports".to_string(),
         PortsActiveView::Processes => "processes".to_string(),
@@ -513,7 +510,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(scope, frame, Rect::new(0, 0, width, height), true))
+            .draw(|frame| render(scope, frame, Rect::new(0, 0, width, height), true, false))
             .unwrap();
         let buf = terminal.backend().buffer();
         let w = buf.area.width as usize;

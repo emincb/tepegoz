@@ -20,7 +20,9 @@ use std::path::PathBuf;
 
 mod app;
 mod config;
+mod help;
 mod input;
+mod mouse;
 mod pty_tile;
 mod scope;
 mod session;

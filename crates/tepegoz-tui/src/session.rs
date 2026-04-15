@@ -37,6 +37,8 @@ use tepegoz_proto::{
 };
 
 use crate::app::{App, AppAction, AppEvent, DetachReason, ScopeKind, ToastKind};
+use crate::help;
+use crate::mouse::MouseParser;
 use crate::pty_tile;
 use crate::scope;
 use crate::terminal;
@@ -204,6 +206,11 @@ struct AppRuntime {
     inbox_rx: mpsc::UnboundedReceiver<Result<Envelope, anyhow::Error>>,
     reader_handle: tokio::task::JoinHandle<()>,
     terminal: ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
+    /// Slice 6.0: strips SGR mouse sequences out of the stdin byte
+    /// stream before `InputFilter` sees it. Mouse events dispatch
+    /// through `AppEvent::MouseClick` / `MouseHover`; the remaining
+    /// bytes become the `StdinChunk` payload.
+    mouse_parser: MouseParser,
 }
 
 #[derive(Debug)]
@@ -247,6 +254,7 @@ impl AppRuntime {
             inbox_rx,
             reader_handle,
             terminal,
+            mouse_parser: MouseParser::new(),
         })
     }
 
@@ -266,10 +274,24 @@ impl AppRuntime {
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
-            let event = tokio::select! {
+            let events = tokio::select! {
                 n = stdin.read(&mut stdin_buf) => match n {
                     Ok(0) => return ExitReason::StdinClosed,
-                    Ok(n) => AppEvent::StdinChunk(stdin_buf[..n].to_vec()),
+                    Ok(n) => {
+                        // Slice 6.0: split the chunk into mouse events
+                        // and non-mouse bytes. Mouse events dispatch
+                        // first (ordering doesn't matter for state
+                        // because mouse handlers don't touch
+                        // `input_filter`), then the remainder flows as
+                        // a StdinChunk for InputFilter to parse.
+                        let (text_bytes, mouse_events) =
+                            self.mouse_parser.parse(&stdin_buf[..n]);
+                        let mut evs = mouse_events;
+                        if !text_bytes.is_empty() {
+                            evs.push(AppEvent::StdinChunk(text_bytes));
+                        }
+                        evs
+                    },
                     Err(e) => return ExitReason::StdinError(e.to_string()),
                 },
                 // mpsc::Receiver::recv IS cancellation-safe: if the
@@ -280,20 +302,22 @@ impl AppRuntime {
                 // documented NOT cancellation-safe, which was the
                 // Phase 4 4d desync.
                 inbox = self.inbox_rx.recv() => match inbox {
-                    Some(Ok(e)) => AppEvent::DaemonEnvelope(e),
+                    Some(Ok(e)) => vec![AppEvent::DaemonEnvelope(e)],
                     Some(Err(e)) => return ExitReason::DaemonClosed(e.to_string()),
                     None => return ExitReason::DaemonClosed("reader task ended".into()),
                 },
                 _ = winch.recv() => {
                     let (cols, rows) = terminal_size_fallback();
-                    AppEvent::Resize { rows, cols }
+                    vec![AppEvent::Resize { rows, cols }]
                 },
-                _ = tick.tick() => AppEvent::Tick,
+                _ = tick.tick() => vec![AppEvent::Tick],
             };
 
-            let actions = self.app.handle_event(event);
-            if let Err(reason) = self.dispatch(actions) {
-                return reason;
+            for event in events {
+                let actions = self.app.handle_event(event);
+                if let Err(reason) = self.dispatch(actions) {
+                    return reason;
+                }
             }
         }
     }
@@ -369,21 +393,33 @@ fn render_tiles(app: &App, frame: &mut Frame<'_>) {
     let tiles: Vec<TileDef> = app.view.layout.tiles.clone();
     for tile in tiles {
         let focused = tile.id == app.view.focused;
+        // Slice 6.0: hovered-but-unfocused tiles get a third border
+        // style that sits between focused-bright-cyan and
+        // idle-dim-gray, signaling "click here to focus." When the
+        // hovered tile is already focused, the focus style wins.
+        let hovered = !focused && app.hovered_tile == Some(tile.id);
         match &tile.kind {
             TileKind::Pty => {
-                pty_tile::render(&app.pane_stack, app.active_pane, frame, tile.rect, focused);
+                pty_tile::render(
+                    &app.pane_stack,
+                    app.active_pane,
+                    frame,
+                    tile.rect,
+                    focused,
+                    hovered,
+                );
             }
             TileKind::Scope(ScopeKind::Docker) => {
-                scope::docker::render(&app.docker, frame, tile.rect, focused);
+                scope::docker::render(&app.docker, frame, tile.rect, focused, hovered);
             }
             TileKind::Scope(ScopeKind::Ports) => {
-                scope::ports::render(&app.ports, frame, tile.rect, focused);
+                scope::ports::render(&app.ports, frame, tile.rect, focused, hovered);
             }
             TileKind::Scope(ScopeKind::Fleet) => {
-                scope::fleet::render(&app.fleet, frame, tile.rect, focused);
+                scope::fleet::render(&app.fleet, frame, tile.rect, focused, hovered);
             }
             TileKind::Placeholder { label, eta_phase } => {
-                scope::placeholder::render(label, *eta_phase, frame, tile.rect, focused);
+                scope::placeholder::render(label, *eta_phase, frame, tile.rect, focused, hovered);
             }
             TileKind::TooSmall => {
                 // Shouldn't appear outside the fallback layout; guard
@@ -395,6 +431,10 @@ fn render_tiles(app: &App, frame: &mut Frame<'_>) {
 
     let toasts: Vec<_> = app.toasts.iter().cloned().collect();
     toast::render(&toasts, &app.view.layout, frame);
+
+    if app.help_visible {
+        help::render(frame);
+    }
 }
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect) {

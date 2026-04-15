@@ -33,12 +33,30 @@ use tepegoz_proto::{
 use vt100::Parser;
 
 use crate::input::{InputAction, InputFilter};
-use crate::tile::{FocusDir, TileId, TileLayout};
+use crate::pty_tile;
+use crate::tile::{FocusDir, TileId, TileKind, TileLayout};
 
 /// Max visible toasts at once. A fourth arrival drops the oldest
 /// silently (per C3 UX clarification: never block a keystroke on a
 /// toast).
 pub(crate) const MAX_TOASTS: usize = 3;
+
+/// Slice 6.0: max delta between two row clicks that count as a
+/// double-click. Tuned a touch snappier than the usual 500 ms OS
+/// default — TUI users click with intent more often than not, and
+/// a quicker threshold feels more responsive.
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// Slice 6.0: inset a tile's `Rect` by one cell on every side (the
+/// border the block renders). Returns `None` when the tile is too
+/// small to have an interior area — the caller treats that as
+/// "click absorbed as focus-only, nothing to hit-test inside."
+fn inset_rect(r: Rect) -> Option<Rect> {
+    if r.width < 2 || r.height < 2 {
+        return None;
+    }
+    Some(Rect::new(r.x + 1, r.y + 1, r.width - 2, r.height - 2))
+}
 
 /// Auto-dismiss cadence per toast kind. Error toasts hang around longer
 /// because the user needs time to read the engine's reason text.
@@ -129,6 +147,17 @@ pub(crate) enum AppEvent {
     /// API. Exercised in tests via direct construction.
     #[allow(dead_code)]
     PendingActionTimeout(u64),
+    /// Slice 6.0: left-mouse-button press at 0-indexed terminal cell
+    /// (x, y). The runtime extracts these from SGR mouse sequences
+    /// on stdin via [`mouse::MouseParser`] before dispatch; tests
+    /// can inject events directly. Right/middle/wheel presses are
+    /// dropped at the parser — the clickable surface is left-only.
+    MouseClick { x: u16, y: u16 },
+    /// Slice 6.0: mouse pointer moved to cell (x, y). Emitted for
+    /// both motion-only (hover) and drag; Slice 6.0 treats them
+    /// identically, using the coordinate to light up tile border
+    /// hover styling. 0-indexed.
+    MouseHover { x: u16, y: u16 },
 }
 
 /// Side effects emitted by [`App::handle_event`]. The runtime executes
@@ -1033,6 +1062,21 @@ pub(crate) struct App {
     /// Current toast overlay (newest at the back). Bounded to
     /// [`MAX_TOASTS`]; a fourth arrival drops the oldest silently.
     pub(crate) toasts: VecDeque<Toast>,
+    /// Slice 6.0: `Ctrl-b ?` toggles the help overlay on; `Esc`
+    /// (or a second `Ctrl-b ?`) dismisses it. When visible the
+    /// overlay absorbs key input and blocks scope/pty routing.
+    pub(crate) help_visible: bool,
+    /// Slice 6.0: most-recent mouse-hover tile, used by the tile
+    /// renderer to draw a distinct border style on the hovered tile.
+    /// `None` means the cursor is outside every tile's Rect (or no
+    /// hover event has been received yet).
+    pub(crate) hovered_tile: Option<TileId>,
+    /// Slice 6.0: most-recent scope-row left-click (tile, row index,
+    /// instant) for double-click detection. Only scope row clicks
+    /// update it — PTY tab clicks are single-click actions so they
+    /// don't need dedup. A click whose (tile, row) + window match
+    /// the stored state upgrades to a primary-action dispatch.
+    pub(crate) last_click: Option<(TileId, usize, Instant)>,
     input_filter: InputFilter,
     scope_key_parser: ScopeKeyParser,
 }
@@ -1077,6 +1121,9 @@ impl App {
             next_sub_id,
             pending_actions: HashMap::new(),
             toasts: VecDeque::new(),
+            help_visible: false,
+            hovered_tile: None,
+            last_click: None,
             input_filter: InputFilter::new(),
             scope_key_parser: ScopeKeyParser::default(),
         }
@@ -1149,12 +1196,273 @@ impl App {
             AppEvent::PendingActionTimeout(id) => {
                 self.expire_pending_action(id, &mut actions);
             }
+            AppEvent::MouseClick { x, y } => self.handle_mouse_click(x, y, &mut actions),
+            AppEvent::MouseHover { x, y } => self.handle_mouse_hover(x, y, &mut actions),
         }
         actions
     }
 
+    /// Left-mouse-button press at cell (x, y). Finds the tile
+    /// containing the cell, focuses it, then dispatches tile-specific
+    /// hit-testing:
+    /// - PTY tile → tab-strip click switches the active pane;
+    ///   `[×]` affordance closes it.
+    /// - Scope tile → body-row click selects the row. A second click
+    ///   on the same row within `DOUBLE_CLICK_WINDOW` fires the
+    ///   tile's primary action (Fleet → open remote pane; Docker /
+    ///   Ports have no primary action today).
+    /// - Placeholder / TooSmall / border clicks → focus only.
+    ///
+    /// When the help overlay is visible, any click dismisses it and
+    /// suppresses the underlying tile interaction — clicking "out of"
+    /// the modal is the natural dismissal gesture.
+    fn handle_mouse_click(&mut self, x: u16, y: u16, actions: &mut Vec<AppAction>) {
+        self.handle_mouse_click_at(x, y, Instant::now(), actions);
+    }
+
+    /// Test-friendly variant: explicit `now` so unit tests can drive
+    /// the double-click detection deterministically. Production path
+    /// goes through [`App::handle_mouse_click`] which calls this with
+    /// `Instant::now()`.
+    pub(crate) fn handle_mouse_click_at(
+        &mut self,
+        x: u16,
+        y: u16,
+        now: Instant,
+        actions: &mut Vec<AppAction>,
+    ) {
+        if self.help_visible {
+            self.help_visible = false;
+            actions.push(AppAction::DrawFrame);
+            return;
+        }
+
+        let pos = ratatui::layout::Position::new(x, y);
+        let Some(tile) = self.view.layout.tiles.iter().find(|t| t.rect.contains(pos)) else {
+            return;
+        };
+        let tile_id = tile.id;
+        let rect = tile.rect;
+        let kind = tile.kind.clone();
+
+        self.move_focus_to(tile_id, actions);
+
+        match kind {
+            TileKind::Pty => self.dispatch_pty_click(rect, x, y, actions),
+            TileKind::Scope(scope_kind) => {
+                self.dispatch_scope_click(tile_id, scope_kind, rect, x, y, now, actions);
+            }
+            TileKind::Placeholder { .. } | TileKind::TooSmall => {
+                // Focus already handled.
+            }
+        }
+    }
+
+    /// Tab-strip + close-affordance hit-testing for a click inside the
+    /// PTY tile's rect. Non-strip clicks (border, vt100 content) are
+    /// absorbed as focus-only.
+    fn dispatch_pty_click(&mut self, rect: Rect, x: u16, y: u16, actions: &mut Vec<AppAction>) {
+        let Some(inner) = inset_rect(rect) else {
+            return;
+        };
+        // Tab strip is the top row of the inner area, height 1 when
+        // `inner.height >= 2` (matches `pty_tile::render`). A zero-row
+        // strip means the tile is too small to show tabs — treat the
+        // click as focus-only.
+        if inner.height < 2 || y != inner.y {
+            return;
+        }
+        let strip = Rect::new(inner.x, inner.y, inner.width, 1);
+        let Some(hit) = pty_tile::hit_test_tab_strip(&self.pane_stack, self.active_pane, strip, x)
+        else {
+            return;
+        };
+        match hit {
+            pty_tile::TabStripHit::Tab(idx) => {
+                if idx < self.pane_stack.len() && idx != self.active_pane {
+                    self.active_pane = idx;
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            pty_tile::TabStripHit::CloseActive => {
+                self.close_active_pane(actions);
+            }
+        }
+    }
+
+    /// Scope-tile row-click dispatch + double-click primary-action
+    /// detection. The body Y range sits between the status-bar row and
+    /// the help-bar row, with an optional filter bar eating one more
+    /// row at the top when the scope has an active or non-empty
+    /// filter. Docker / Ports render a header row inside the body;
+    /// Fleet does not — both branches are explicit below.
+    fn dispatch_scope_click(
+        &mut self,
+        tile_id: TileId,
+        kind: ScopeKind,
+        rect: Rect,
+        _x: u16,
+        y: u16,
+        now: Instant,
+        actions: &mut Vec<AppAction>,
+    ) {
+        let Some(inner) = inset_rect(rect) else {
+            return;
+        };
+        let filter_visible = self.scope_filter_visible(kind);
+        let filter_offset: u16 = if filter_visible { 1 } else { 0 };
+
+        // body_y_start (inclusive): first row after status bar (+
+        // optional filter bar).
+        let body_y_start = inner.y.saturating_add(1).saturating_add(filter_offset);
+        // body_y_end (exclusive): help bar row.
+        let body_y_end = inner.y.saturating_add(inner.height).saturating_sub(1);
+
+        if y < body_y_start || y >= body_y_end {
+            return; // status / filter / help-bar click: focus only.
+        }
+
+        let row_idx = match kind {
+            ScopeKind::Docker | ScopeKind::Ports => {
+                // Header row at body_y_start; data rows start at
+                // body_y_start + 1.
+                if y <= body_y_start {
+                    return;
+                }
+                (y - body_y_start - 1) as usize
+            }
+            ScopeKind::Fleet => {
+                // No header row.
+                (y - body_y_start) as usize
+            }
+        };
+
+        let visible = match kind {
+            ScopeKind::Docker => self.docker.visible_count(),
+            ScopeKind::Ports => match self.ports.active {
+                PortsActiveView::Ports => self.ports.ports.visible_count(),
+                PortsActiveView::Processes => self.ports.processes.visible_count(),
+            },
+            ScopeKind::Fleet => self.fleet.visible_count(),
+        };
+        if row_idx >= visible {
+            return;
+        }
+
+        // Apply the selection change.
+        let prev_selection = self.scope_selection(kind);
+        self.scope_set_selection(kind, row_idx);
+        if self.scope_selection(kind) != prev_selection {
+            actions.push(AppAction::DrawFrame);
+        }
+
+        // Double-click detection — same tile + same row + within the
+        // Slice 6.0 double-click window. The window is 400 ms, tuned
+        // slightly snappier than the usual 500 ms OS default because
+        // TUI users click with intent more often than not.
+        let is_double = matches!(
+            self.last_click,
+            Some((prev_tile, prev_row, prev_time))
+                if prev_tile == tile_id
+                    && prev_row == row_idx
+                    && now.duration_since(prev_time) < DOUBLE_CLICK_WINDOW
+        );
+        self.last_click = Some((tile_id, row_idx, now));
+        if is_double {
+            match kind {
+                ScopeKind::Fleet => self.dispatch_open_remote_pane(actions),
+                // Docker / Ports have no row-level primary action
+                // today; single-click + keyboard keybinds handle
+                // their actions.
+                ScopeKind::Docker | ScopeKind::Ports => {}
+            }
+        }
+    }
+
+    /// Returns true when the scope is currently rendering its filter
+    /// bar — either it's actively being typed into, or a previously-
+    /// committed filter string is still narrowing the list.
+    fn scope_filter_visible(&self, kind: ScopeKind) -> bool {
+        match kind {
+            ScopeKind::Docker => self.docker.filter_active || !self.docker.filter.is_empty(),
+            ScopeKind::Ports => match self.ports.active {
+                PortsActiveView::Ports => {
+                    self.ports.ports.filter_active || !self.ports.ports.filter.is_empty()
+                }
+                PortsActiveView::Processes => {
+                    self.ports.processes.filter_active || !self.ports.processes.filter.is_empty()
+                }
+            },
+            ScopeKind::Fleet => self.fleet.filter_active || !self.fleet.filter.is_empty(),
+        }
+    }
+
+    fn scope_selection(&self, kind: ScopeKind) -> usize {
+        match kind {
+            ScopeKind::Docker => self.docker.selection,
+            ScopeKind::Ports => match self.ports.active {
+                PortsActiveView::Ports => self.ports.ports.selection,
+                PortsActiveView::Processes => self.ports.processes.selection,
+            },
+            ScopeKind::Fleet => self.fleet.selection,
+        }
+    }
+
+    fn scope_set_selection(&mut self, kind: ScopeKind, idx: usize) {
+        match kind {
+            ScopeKind::Docker => self.docker.selection = idx,
+            ScopeKind::Ports => match self.ports.active {
+                PortsActiveView::Ports => self.ports.ports.selection = idx,
+                PortsActiveView::Processes => self.ports.processes.selection = idx,
+            },
+            ScopeKind::Fleet => self.fleet.selection = idx,
+        }
+    }
+
+    /// Mouse motion at cell (x, y). Tracks which tile contains the
+    /// pointer so the tile renderer can draw a distinct border style
+    /// on hover. No-op when the coordinate falls outside every tile
+    /// (e.g. the 1-column gutters that layout splits may create).
+    fn handle_mouse_hover(&mut self, x: u16, y: u16, actions: &mut Vec<AppAction>) {
+        let pos = ratatui::layout::Position::new(x, y);
+        let hovered = self
+            .view
+            .layout
+            .tiles
+            .iter()
+            .find(|t| t.rect.contains(pos))
+            .map(|t| t.id);
+        if hovered != self.hovered_tile {
+            self.hovered_tile = hovered;
+            actions.push(AppAction::DrawFrame);
+        }
+    }
+
     fn handle_stdin(&mut self, bytes: &[u8], actions: &mut Vec<AppAction>) {
         for input_action in self.input_filter.process(bytes) {
+            // Slice 6.0: when the help overlay is visible, it absorbs
+            // input as a modal — any keystroke (or any click, handled
+            // in `handle_mouse_click`) dismisses it without reaching
+            // the underlying tile. `Ctrl-b d` is preserved as an
+            // escape hatch so the user can still detach from the
+            // overlay; `Ctrl-b ?` is preserved as "toggle self."
+            if self.help_visible {
+                match input_action {
+                    InputAction::Detach => {
+                        actions.push(AppAction::Detach(DetachReason::User));
+                        return;
+                    }
+                    InputAction::Help => {
+                        self.handle_help_toggle(actions);
+                    }
+                    _ => {
+                        self.help_visible = false;
+                        actions.push(AppAction::DrawFrame);
+                    }
+                }
+                continue;
+            }
+
             match input_action {
                 InputAction::Forward(b) => self.handle_forward_bytes(b, actions),
                 InputAction::Detach => {
@@ -1162,43 +1470,12 @@ impl App {
                     return;
                 }
                 InputAction::FocusDirection(dir) => self.handle_focus_direction(dir, actions),
-                InputAction::Help => {
-                    // C3 implements the help overlay. C1.5 keeps
-                    // Ctrl-b ? as a no-op so C3 can wire the overlay
-                    // without renaming anything.
-                }
-                InputAction::PaneNext => {
-                    if self.view.layout.routes_to_pty(self.view.focused) {
-                        self.pane_next(actions);
-                    }
-                }
-                InputAction::PanePrev => {
-                    if self.view.layout.routes_to_pty(self.view.focused) {
-                        self.pane_prev(actions);
-                    }
-                }
-                InputAction::PaneDigit(d) => {
-                    if self.view.layout.routes_to_pty(self.view.focused) {
-                        self.pane_select_digit(d, actions);
-                    }
-                }
+                InputAction::FocusNext => self.handle_focus_cycle(true, actions),
+                InputAction::FocusPrev => self.handle_focus_cycle(false, actions),
+                InputAction::Help => self.handle_help_toggle(actions),
                 InputAction::PaneClose => {
                     if self.view.layout.routes_to_pty(self.view.focused) {
                         self.close_active_pane(actions);
-                    }
-                }
-                InputAction::OpenPaneAtSelection => {
-                    // Per the Slice 5d-ii contract, Ctrl-b Enter on
-                    // the focused Fleet tile opens a remote pane for
-                    // the selected host. On any other focus (PTY,
-                    // Docker, Ports, Placeholder) the action is a
-                    // no-op — the Fleet tile is the only source of
-                    // aliases today.
-                    if matches!(
-                        self.view.layout.routes_to_scope(self.view.focused),
-                        Some(ScopeKind::Fleet)
-                    ) {
-                        self.dispatch_open_remote_pane(actions);
                     }
                 }
             }
@@ -1240,17 +1517,42 @@ impl App {
 
     fn handle_focus_direction(&mut self, dir: FocusDir, actions: &mut Vec<AppAction>) {
         if let Some(next) = self.view.layout.next_focus(self.view.focused, dir) {
-            if next != self.view.focused {
-                // Per C3a UX clarification #3: focus moving away from
-                // the Docker tile cancels any pending confirm.
-                if self.view.focused == TileId::Docker {
-                    self.docker.pending_confirm = None;
-                }
-                self.view.focused = next;
-                actions.push(AppAction::FocusTile(next));
-                actions.push(AppAction::DrawFrame);
-            }
+            self.move_focus_to(next, actions);
         }
+    }
+
+    /// `Tab` / `Shift-Tab` cycle focus through the fixed tile reading
+    /// order. Scope-oblivious: the current focus is irrelevant except
+    /// as the starting point. See `TileLayout::cycle_focus` for the
+    /// order contract.
+    fn handle_focus_cycle(&mut self, forward: bool, actions: &mut Vec<AppAction>) {
+        if let Some(next) = self.view.layout.cycle_focus(self.view.focused, forward) {
+            self.move_focus_to(next, actions);
+        }
+    }
+
+    /// Shared focus-transition path used by directional, cycle, and
+    /// click-based focus moves. Preserves the C3a UX clarification
+    /// #3 invariant (focus-away from Docker cancels any pending
+    /// confirm) and only emits frame updates on an actual change.
+    fn move_focus_to(&mut self, next: TileId, actions: &mut Vec<AppAction>) {
+        if next == self.view.focused {
+            return;
+        }
+        if self.view.focused == TileId::Docker {
+            self.docker.pending_confirm = None;
+        }
+        self.view.focused = next;
+        actions.push(AppAction::FocusTile(next));
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// `Ctrl-b ?` toggles the help overlay. Task E wires the actual
+    /// overlay rendering + Esc dismissal; this stub keeps the input
+    /// surface complete so the dispatch compiles.
+    fn handle_help_toggle(&mut self, actions: &mut Vec<AppAction>) {
+        self.help_visible = !self.help_visible;
+        actions.push(AppAction::DrawFrame);
     }
 
     fn handle_scope_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
@@ -1485,12 +1787,18 @@ impl App {
             // capital-discipline rule — reconnecting is safe / non-
             // destructive. Uppercase `R` is explicitly a no-op.
             ScopeKey::Char(b'r') => self.dispatch_fleet_reconnect(actions),
+            // Slice 6.0: plain `Enter` on a focused Fleet tile is the
+            // "primary action on the selected row" per the amended
+            // Decision #7 — opens a remote pane for the selected
+            // host. Supersedes the pre-6.0 `Ctrl-b Enter` keybind.
+            ScopeKey::Enter => self.dispatch_open_remote_pane(actions),
             _ => {}
         }
     }
 
     /// Open a fresh remote pane for the Fleet tile's selected row.
-    /// Called by `Ctrl-b Enter` on the focused Fleet tile. Allocates
+    /// Called by plain `Enter` on the focused Fleet tile (or a
+    /// double-click on the row in Slice 6.0+). Allocates
     /// a sub id, pushes a `PendingOpen` to correlate the response,
     /// and sends `OpenPane { target: Remote { alias } }`. The
     /// follow-up `AttachPane` + stack insertion happens when
@@ -1520,40 +1828,6 @@ impl App {
             },
         ))));
         self.push_toast(ToastKind::Info, format!("opening ssh:{alias}…"), actions);
-    }
-
-    /// Cycle to the next pane (wrap at the end). No-op if there's only
-    /// one pane.
-    fn pane_next(&mut self, actions: &mut Vec<AppAction>) {
-        if self.pane_stack.len() < 2 {
-            return;
-        }
-        self.active_pane = (self.active_pane + 1) % self.pane_stack.len();
-        actions.push(AppAction::DrawFrame);
-    }
-
-    /// Cycle to the previous pane (wrap at the start).
-    fn pane_prev(&mut self, actions: &mut Vec<AppAction>) {
-        if self.pane_stack.len() < 2 {
-            return;
-        }
-        self.active_pane = if self.active_pane == 0 {
-            self.pane_stack.len() - 1
-        } else {
-            self.active_pane - 1
-        };
-        actions.push(AppAction::DrawFrame);
-    }
-
-    /// Jump to pane by 1-indexed tab number (`Ctrl-b 1` = pane 0,
-    /// `Ctrl-b 0` = pane 9 per tmux muscle memory). Clamps silently
-    /// if the slot is beyond the current stack length.
-    fn pane_select_digit(&mut self, digit: u8, actions: &mut Vec<AppAction>) {
-        let idx = if digit == 0 { 9 } else { (digit - 1) as usize };
-        if idx < self.pane_stack.len() && idx != self.active_pane {
-            self.active_pane = idx;
-            actions.push(AppAction::DrawFrame);
-        }
     }
 
     /// Close the active pane. Sends `ClosePane` to the daemon,
@@ -2747,12 +3021,21 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_question_is_help_noop() {
-        // Help is a C3 overlay; C1.5 pins Ctrl-b ? as a no-op so C3
-        // can wire the overlay without renaming.
+    fn ctrl_b_question_toggles_help_overlay() {
+        // Slice 6.0: Ctrl-b ? now toggles the help overlay state and
+        // requests a redraw. Esc dismisses (covered by the help-
+        // overlay Esc test below).
         let mut app = test_app();
+        assert!(!app.help_visible);
         let actions = app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
-        assert!(actions.is_empty());
+        assert!(app.help_visible);
+        assert!(
+            actions.iter().any(|a| matches!(a, AppAction::DrawFrame)),
+            "toggling the help overlay must trigger a redraw"
+        );
+        // Second press closes it.
+        let _ = app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
+        assert!(!app.help_visible);
     }
 
     #[test]
@@ -4618,73 +4901,55 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_n_cycles_next_pane_wrap() {
+    fn tab_cycles_forward_through_fixed_tile_order() {
         let mut app = test_app();
-        inject_pane_opened(&mut app, 100, "ssh:staging");
-        inject_pane_opened(&mut app, 101, "ssh:dev");
-        assert_eq!(app.pane_stack.len(), 3);
-        assert_eq!(app.active_pane, 2, "second open becomes active");
-
-        app.handle_event(AppEvent::StdinChunk(b"\x02n".to_vec()));
-        assert_eq!(app.active_pane, 0, "wraps past end");
-
-        app.handle_event(AppEvent::StdinChunk(b"\x02n".to_vec()));
-        assert_eq!(app.active_pane, 1);
+        assert_eq!(app.view.focused, TileId::Pty);
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        assert_eq!(app.view.focused, TileId::Docker);
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        assert_eq!(app.view.focused, TileId::Ports);
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        assert_eq!(app.view.focused, TileId::Fleet);
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        assert_eq!(app.view.focused, TileId::ClaudeCode);
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        assert_eq!(app.view.focused, TileId::Pty, "Tab wraps back to PTY");
     }
 
     #[test]
-    fn ctrl_b_p_cycles_prev_pane_wrap() {
+    fn shift_tab_cycles_backward_through_fixed_tile_order() {
         let mut app = test_app();
-        inject_pane_opened(&mut app, 100, "ssh:staging");
-        inject_pane_opened(&mut app, 101, "ssh:dev");
-        // active = 2; p → 1, p → 0, p → 2 (wrap).
-        app.handle_event(AppEvent::StdinChunk(b"\x02p".to_vec()));
-        assert_eq!(app.active_pane, 1);
-        app.handle_event(AppEvent::StdinChunk(b"\x02p".to_vec()));
-        assert_eq!(app.active_pane, 0);
-        app.handle_event(AppEvent::StdinChunk(b"\x02p".to_vec()));
-        assert_eq!(app.active_pane, 2, "wraps past start");
+        assert_eq!(app.view.focused, TileId::Pty);
+        app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
+        assert_eq!(
+            app.view.focused,
+            TileId::ClaudeCode,
+            "Shift-Tab from PTY wraps to ClaudeCode"
+        );
+        app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
+        assert_eq!(app.view.focused, TileId::Fleet);
+        app.handle_event(AppEvent::StdinChunk(b"\x1b[Z".to_vec()));
+        assert_eq!(app.view.focused, TileId::Ports);
     }
 
     #[test]
-    fn ctrl_b_digit_selects_pane_slot() {
+    fn tab_cycle_off_docker_tile_cancels_pending_confirm() {
+        // Tab-cycling from Docker must preserve the C3a UX invariant
+        // that focus-away cancels a pending confirm modal (same path
+        // as Ctrl-b l directional focus).
         let mut app = test_app();
-        inject_pane_opened(&mut app, 100, "ssh:staging");
-        inject_pane_opened(&mut app, 101, "ssh:dev");
-        // active = 2; Ctrl-b 1 → 0, Ctrl-b 2 → 1, Ctrl-b 3 → 2.
-        app.handle_event(AppEvent::StdinChunk(b"\x021".to_vec()));
-        assert_eq!(app.active_pane, 0);
-        app.handle_event(AppEvent::StdinChunk(b"\x022".to_vec()));
-        assert_eq!(app.active_pane, 1);
-        app.handle_event(AppEvent::StdinChunk(b"\x023".to_vec()));
-        assert_eq!(app.active_pane, 2);
-    }
+        populate_docker_and_focus(&mut app, vec![make_container("a", "a", "running")]);
+        assert_eq!(app.view.focused, TileId::Docker);
+        // Enter Kill-pending confirm.
+        app.handle_event(AppEvent::StdinChunk(b"K".to_vec()));
+        assert!(app.docker.pending_confirm.is_some());
 
-    #[test]
-    fn ctrl_b_digit_out_of_range_is_noop() {
-        let mut app = test_app();
-        // Stack has 1 pane; Ctrl-b 5 beyond range — stays on 0.
-        app.handle_event(AppEvent::StdinChunk(b"\x025".to_vec()));
-        assert_eq!(app.active_pane, 0);
-    }
-
-    #[test]
-    fn ctrl_b_digit_zero_selects_tenth_pane() {
-        // Ctrl-b 0 targets slot 10 (stack index 9) per tmux muscle
-        // memory. Slot 10 is keybind-only; the visual strip caps at
-        // 9 numbered slots + a `[+N]` overflow indicator.
-        let mut app = test_app();
-        for (i, alias) in ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
-            .iter()
-            .enumerate()
-        {
-            inject_pane_opened(&mut app, 100 + i as u64, &format!("ssh:{alias}"));
-        }
-        assert_eq!(app.pane_stack.len(), 10);
-        app.handle_event(AppEvent::StdinChunk(b"\x021".to_vec()));
-        assert_eq!(app.active_pane, 0);
-        app.handle_event(AppEvent::StdinChunk(b"\x020".to_vec()));
-        assert_eq!(app.active_pane, 9, "Ctrl-b 0 jumps to the 10th pane");
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        assert_eq!(app.view.focused, TileId::Ports);
+        assert!(
+            app.docker.pending_confirm.is_none(),
+            "Tab-cycle off Docker must cancel pending confirm"
+        );
     }
 
     #[test]
@@ -4756,16 +5021,19 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_enter_on_fleet_dispatches_open_pane_remote() {
+    fn plain_enter_on_fleet_dispatches_open_pane_remote() {
+        // Slice 6.0: plain Enter on a focused Fleet tile is the
+        // "primary action on the selected row" per the amended
+        // Decision #7. Pre-6.0 the keybind was Ctrl-b Enter.
         let mut app = test_app();
         fleet_with_hosts(&mut app, &["staging", "dev"]);
-        // Focus Fleet tile.
-        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // PTY → Docker
-        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec())); // Docker → Ports
-        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec())); // Ports → Fleet
+        // Focus Fleet tile via Tab cycling (PTY → Docker → Ports → Fleet).
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
         assert_eq!(app.view.focused, TileId::Fleet);
 
-        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
         let open_remote_staging = actions.iter().any(|a| {
             matches!(
                 a,
@@ -4783,7 +5051,7 @@ mod tests {
         });
         assert!(
             open_remote_staging,
-            "Ctrl-b Enter on Fleet dispatches OpenPane Remote for selected alias; got {actions:?}"
+            "plain Enter on Fleet dispatches OpenPane Remote for selected alias; got {actions:?}"
         );
         assert_eq!(app.pending_opens.len(), 1);
         assert_eq!(
@@ -4793,11 +5061,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_enter_on_pty_is_noop() {
+    fn plain_enter_on_pty_sends_send_input_not_open_pane() {
+        // Slice 6.0: plain Enter on PTY flows through to the shell
+        // as SendInput (`\r`) — the "primary action" unification
+        // applies to scope tiles only; PTY keystrokes still forward.
         let mut app = test_app();
         fleet_with_hosts(&mut app, &["staging"]);
         assert_eq!(app.view.focused, TileId::Pty);
-        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
         let has_open = actions.iter().any(|a| {
             matches!(
                 a,
@@ -4807,7 +5078,21 @@ mod tests {
         });
         assert!(
             !has_open,
-            "Ctrl-b Enter on PTY focus is a no-op; got {actions:?}"
+            "plain Enter on PTY must not dispatch OpenPane; got {actions:?}"
+        );
+        let has_send_input = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::SendInput { data, .. } if data == b"\r"
+                    )
+            )
+        });
+        assert!(
+            has_send_input,
+            "plain Enter on PTY forwards as SendInput \\r; got {actions:?}"
         );
     }
 
@@ -4815,11 +5100,11 @@ mod tests {
     fn pane_opened_response_pushes_entry_and_emits_attach_and_focus() {
         let mut app = test_app();
         fleet_with_hosts(&mut app, &["staging"]);
-        // Focus Fleet + dispatch OpenPane.
-        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
-        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
-        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
-        app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
+        // Focus Fleet via Tab cycling + plain-Enter dispatch OpenPane.
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\t".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
         let pending_sub = app.pending_opens.front().unwrap().sub_id;
 
         // Simulate the daemon's PaneOpened response.
@@ -5011,5 +5296,348 @@ mod tests {
         let trimmed = pane_label_from_shell(long);
         assert_eq!(trimmed.chars().count(), 21, "20-char prefix + one ellipsis");
         assert!(trimmed.ends_with('…'));
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 6.0: mouse + help-overlay state-machine tests.
+    // ------------------------------------------------------------------
+
+    /// Helper — returns the centre coordinate of the tile in the
+    /// default 120×40 layout. Used to synthesize clicks without
+    /// hardcoding coordinates that would break if the layout tweaks.
+    fn tile_center(app: &App, id: TileId) -> (u16, u16) {
+        let rect = app.view.layout.rect_of(id).expect("tile present");
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    }
+
+    #[test]
+    fn mouse_click_on_docker_tile_focuses_docker() {
+        let mut app = test_app();
+        assert_eq!(app.view.focused, TileId::Pty);
+        let (x, y) = tile_center(&app, TileId::Docker);
+        let actions = app.handle_event(AppEvent::MouseClick { x, y });
+        assert_eq!(app.view.focused, TileId::Docker);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, AppAction::FocusTile(TileId::Docker))),
+            "click on Docker tile emits FocusTile(Docker); got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_click_outside_any_tile_is_ignored() {
+        let mut app = test_app();
+        assert_eq!(app.view.focused, TileId::Pty);
+        // (9999, 9999) is well outside the 120×40 default layout.
+        let actions = app.handle_event(AppEvent::MouseClick { x: 9999, y: 9999 });
+        assert_eq!(app.view.focused, TileId::Pty, "focus untouched");
+        assert!(
+            actions.is_empty(),
+            "clicks with no tile hit produce no actions; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_click_on_fleet_row_selects_that_row() {
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["a", "b", "c"]);
+        // Fleet has no header row + no filter.
+        let rect = app.view.layout.rect_of(TileId::Fleet).unwrap();
+        let y = rect.y + 1 + 1 + 2; // border + status + third row
+        let x = rect.x + 2;
+        let _ = app.handle_event(AppEvent::MouseClick { x, y });
+        assert_eq!(app.view.focused, TileId::Fleet);
+        assert_eq!(app.fleet.selection, 2, "third row (idx 2) selected");
+    }
+
+    #[test]
+    fn double_click_on_fleet_row_within_window_dispatches_open_pane_remote() {
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["primary", "secondary"]);
+        let rect = app.view.layout.rect_of(TileId::Fleet).unwrap();
+        let y = rect.y + 1 + 1; // first data row
+        let x = rect.x + 2;
+        let t0 = Instant::now();
+        let mut actions = Vec::new();
+        app.handle_mouse_click_at(x, y, t0, &mut actions);
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(&env.payload, Payload::OpenPane(_))
+            )),
+            "single click must not open a pane; got {actions:?}"
+        );
+
+        let mut actions2 = Vec::new();
+        app.handle_mouse_click_at(x, y, t0 + Duration::from_millis(200), &mut actions2);
+        let opened = actions2.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::OpenPane(spec)
+                        if matches!(
+                            &spec.target,
+                            PaneTarget::Remote { alias } if alias == "primary"
+                        )
+                    )
+            )
+        });
+        assert!(
+            opened,
+            "double-click on first Fleet row opens OpenPane Remote primary; got {actions2:?}"
+        );
+    }
+
+    #[test]
+    fn double_click_outside_window_is_treated_as_single_clicks() {
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["a"]);
+        let rect = app.view.layout.rect_of(TileId::Fleet).unwrap();
+        let y = rect.y + 1 + 1;
+        let x = rect.x + 2;
+        let t0 = Instant::now();
+        let mut actions = Vec::new();
+        app.handle_mouse_click_at(x, y, t0, &mut actions);
+        let mut actions2 = Vec::new();
+        // 500 ms later — beyond the 400 ms window.
+        app.handle_mouse_click_at(x, y, t0 + Duration::from_millis(500), &mut actions2);
+        assert!(
+            !actions2.iter().any(|a| matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(&env.payload, Payload::OpenPane(_))
+            )),
+            "clicks 500 ms apart must not fire primary action; got {actions2:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_click_on_docker_header_row_selects_no_row() {
+        let mut app = test_app();
+        populate_docker_and_focus(
+            &mut app,
+            vec![
+                make_container("a", "a", "running"),
+                make_container("b", "b", "running"),
+            ],
+        );
+        let rect = app.view.layout.rect_of(TileId::Docker).unwrap();
+        // Header row sits at rect.y + 1 (border) + 1 (status) = rect.y + 2.
+        // No filter active.
+        let header_y = rect.y + 2;
+        app.docker.selection = 0;
+        let _ = app.handle_event(AppEvent::MouseClick {
+            x: rect.x + 4,
+            y: header_y,
+        });
+        assert_eq!(
+            app.docker.selection, 0,
+            "header click must not shift selection"
+        );
+    }
+
+    #[test]
+    fn mouse_click_on_pty_tab_strip_switches_active_pane() {
+        let mut app = test_app();
+        inject_pane_opened(&mut app, 100, "ssh:staging");
+        inject_pane_opened(&mut app, 101, "ssh:dev");
+        assert_eq!(app.active_pane, 2);
+        // Tab strip row at rect.y + 1 (inside the border).
+        // Tab 1 (`[1 …]`) starts at rect.x + 1, then comes tab 2, tab 3.
+        // `[1 zsh]` (4 + label_len) = `[1 zsh]` label "zsh" = 7 cells.
+        // Click on col rect.x + 1 hits tab 1.
+        let rect = app.view.layout.rect_of(TileId::Pty).unwrap();
+        let _ = app.handle_event(AppEvent::MouseClick {
+            x: rect.x + 1,
+            y: rect.y + 1,
+        });
+        assert_eq!(
+            app.active_pane, 0,
+            "click on first tab switches active pane to 0"
+        );
+    }
+
+    #[test]
+    fn mouse_click_on_pty_close_affordance_closes_active_pane() {
+        let mut app = test_app();
+        inject_pane_opened(&mut app, 100, "ssh:staging");
+        assert_eq!(app.pane_stack.len(), 2);
+        // Compute close-button position: after tab 1 + space + tab 2
+        // + space. `[1 zsh]` (4+3=7 cells), space, `[2 ssh:staging*]`
+        // (label len 11 + active chrome 5 = 16 cells), space, `[×]`.
+        // The test doesn't assume exact column — find it by walking
+        // tile_center instead: click near the far right of the strip.
+        let rect = app.view.layout.rect_of(TileId::Pty).unwrap();
+        let strip_y = rect.y + 1;
+        // The full-width PTY tile is 118 cells wide at 120×40; close
+        // affordance `[×]` sits past the tabs, before the right edge.
+        // Find it by direct hit-test rather than hardcoding.
+        let strip_rect = Rect::new(rect.x + 1, strip_y, rect.width - 2, 1);
+        let mut close_x = None;
+        for x in rect.x + 1..rect.x + rect.width - 1 {
+            if let Some(pty_tile::TabStripHit::CloseActive) =
+                pty_tile::hit_test_tab_strip(&app.pane_stack, app.active_pane, strip_rect, x)
+            {
+                close_x = Some(x);
+                break;
+            }
+        }
+        let close_x = close_x.expect("close affordance must be hit-testable somewhere");
+
+        let actions = app.handle_event(AppEvent::MouseClick {
+            x: close_x,
+            y: strip_y,
+        });
+        assert_eq!(app.pane_stack.len(), 1, "close affordance closed one pane");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(&env.payload, Payload::ClosePane { .. })
+            )),
+            "close affordance dispatches ClosePane; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_hover_tracks_hovered_tile() {
+        let mut app = test_app();
+        assert_eq!(app.hovered_tile, None);
+        let (x, y) = tile_center(&app, TileId::Docker);
+        let actions = app.handle_event(AppEvent::MouseHover { x, y });
+        assert_eq!(app.hovered_tile, Some(TileId::Docker));
+        assert!(
+            actions.iter().any(|a| matches!(a, AppAction::DrawFrame)),
+            "hover change triggers a redraw"
+        );
+    }
+
+    #[test]
+    fn mouse_hover_to_same_tile_is_idempotent() {
+        let mut app = test_app();
+        let (x, y) = tile_center(&app, TileId::Ports);
+        app.handle_event(AppEvent::MouseHover { x, y });
+        let actions = app.handle_event(AppEvent::MouseHover { x: x + 1, y });
+        // Same tile — no DrawFrame.
+        assert!(
+            !actions.iter().any(|a| matches!(a, AppAction::DrawFrame)),
+            "hover within same tile skips the redraw; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_hover_off_all_tiles_clears_hovered_tile() {
+        let mut app = test_app();
+        let (x, y) = tile_center(&app, TileId::Fleet);
+        app.handle_event(AppEvent::MouseHover { x, y });
+        assert_eq!(app.hovered_tile, Some(TileId::Fleet));
+        app.handle_event(AppEvent::MouseHover { x: 9999, y: 9999 });
+        assert_eq!(app.hovered_tile, None);
+    }
+
+    #[test]
+    fn help_overlay_starts_hidden() {
+        let app = test_app();
+        assert!(!app.help_visible);
+    }
+
+    #[test]
+    fn esc_while_help_visible_dismisses_without_reaching_pty() {
+        let mut app = test_app();
+        // Open help via Ctrl-b ?.
+        app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
+        assert!(app.help_visible);
+
+        // Press bare Esc — should close the overlay and NOT forward
+        // `\x1b` to the pty as SendInput.
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x1b".to_vec()));
+        assert!(!app.help_visible);
+        let forwarded_esc = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::SendEnvelope(env)
+                    if matches!(
+                        &env.payload,
+                        Payload::SendInput { data, .. } if data == b"\x1b"
+                    )
+            )
+        });
+        assert!(
+            !forwarded_esc,
+            "help-visible Esc must not reach the pty; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_d_while_help_visible_still_detaches() {
+        // Escape hatch: even while the overlay absorbs input, the
+        // user's explicit detach keybind must work.
+        let mut app = test_app();
+        app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
+        assert!(app.help_visible);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02d".to_vec()));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, AppAction::Detach(DetachReason::User))),
+            "Ctrl-b d must detach even with overlay visible; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_click_while_help_visible_dismisses_overlay() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
+        assert!(app.help_visible);
+        let (x, y) = tile_center(&app, TileId::Docker);
+        let _ = app.handle_event(AppEvent::MouseClick { x, y });
+        assert!(!app.help_visible, "click dismissed overlay");
+        // Focus should NOT have moved to Docker — the click is absorbed
+        // by the overlay dismissal, not forwarded to tile focus.
+        assert_eq!(app.view.focused, TileId::Pty);
+    }
+
+    #[test]
+    fn ctrl_b_question_while_help_visible_toggles_off() {
+        // Ctrl-b ? must round-trip the overlay — a second press
+        // closes it rather than being absorbed as dismissal input.
+        let mut app = test_app();
+        app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
+        assert!(app.help_visible);
+        app.handle_event(AppEvent::StdinChunk(b"\x02?".to_vec()));
+        assert!(!app.help_visible);
+    }
+
+    /// End-to-end: feed SGR mouse bytes through MouseParser →
+    /// synthesize AppEvent → drive App state machine. Ensures the
+    /// production byte-flow path hooks up correctly without the
+    /// session-level I/O scaffolding.
+    #[test]
+    fn sgr_stdin_bytes_drive_app_through_mouse_parser() {
+        use crate::mouse::MouseParser;
+
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["primary"]);
+
+        // SGR mouse click at the Fleet tile's first data row. Compute
+        // the 1-indexed SGR coords from the layout.
+        let rect = app.view.layout.rect_of(TileId::Fleet).unwrap();
+        let x = rect.x + 2;
+        let y = rect.y + 1 + 1; // border + status → first row
+        let bytes = format!("\x1b[<0;{};{}M", x + 1, y + 1);
+
+        let mut parser = MouseParser::new();
+        let (remaining, events) = parser.parse(bytes.as_bytes());
+        assert!(remaining.is_empty());
+        assert_eq!(events.len(), 1);
+        for event in events {
+            app.handle_event(event);
+        }
+        assert_eq!(app.view.focused, TileId::Fleet);
+        assert_eq!(app.fleet.selection, 0);
     }
 }

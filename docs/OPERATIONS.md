@@ -36,9 +36,20 @@ Terminal 2 (TUI, from any directory — shell will spawn with that as cwd):
 ```sh
 ./target/debug/tepegoz tui
 # lands in a shell in the daemon's pty
-# detach with Ctrl-b d (or Ctrl-b q)
+# detach with Ctrl-b d
 # reattach with another `./target/debug/tepegoz tui` — scrollback replays
 ```
+
+The TUI keyboard surface (Slice 6.0) is five bindings plus mouse:
+- `Tab` / `Shift-Tab` — cycle tile focus
+- arrow keys / `j` / `k` — navigate rows inside the focused scope
+- `Enter` — primary action on the selected row (Fleet → open remote pane)
+- `Esc` — cancel / back (clears filter, exits logs view, dismisses help)
+- `Ctrl-b d` — detach
+- `Ctrl-b ?` — toggle the in-TUI help overlay (authoritative reference)
+- mouse — click to focus tile + select row; click a tab to switch panes;
+  click the `[×]` affordance next to the tab strip to close the active pane;
+  double-click a Fleet row to open a remote pane
 
 Useful flags:
 - `--socket /path/to/sock` — override daemon's socket path; TUI must match
@@ -60,7 +71,7 @@ tail -f ~/.cache/tepegoz/tui.log
 
 ## Slice C1.5c manual demo prep (Phase 3)
 
-The TUI god view is the part where eyeball-confirmation has historically diverged from test-passes (Phase 2 immediate-detach was exactly this). C1.5c acceptance is a manual demo against a standing fixture container. The gating checks per CTO direction: god-view layout renders on first launch with no config; focus navigation (`Ctrl-b h/j/k/l` + arrows) feels natural; vim in the pty tile renders correctly and survives focus movement; Docker tile populates within ~2 s; placeholder tiles are clearly labeled and non-interactive; detach/reattach preserves state; engine-unavailable-mid-session recovers cleanly.
+The TUI god view is the part where eyeball-confirmation has historically diverged from test-passes (Phase 2 immediate-detach was exactly this). C1.5c acceptance is a manual demo against a standing fixture container. The gating checks per CTO direction: god-view layout renders on first launch with no config; focus navigation (`Tab` / `Shift-Tab` documented, `Ctrl-b h/j/k/l` + arrows as undocumented aliases per Slice 6.0) feels natural; vim in the pty tile renders correctly and survives focus movement; Docker tile populates within ~2 s; placeholder tiles are clearly labeled and non-interactive; detach/reattach preserves state; engine-unavailable-mid-session recovers cleanly.
 
 Prior to C1.5 this section documented a Scope→Pane mode-switch demo with Ctrl-b s / Ctrl-b a. Those keys no longer exist — the tiled layout shows pty + scopes simultaneously. The victim-container prep below carries over unchanged from the earlier C2c3 version.
 
@@ -101,13 +112,19 @@ Run `./target/debug/tepegoz tui` in terminal 2.
 **Step 2 — focus navigation.**
 
 ```
-Ctrl-b j              # PTY → Docker tile (border becomes bright on Docker)
-Ctrl-b l              # Docker → Ports (placeholder; focused dim-cyan,
-                      #   "Phase 4 — not yet implemented" hint appears below
-                      #   the label)
-Ctrl-b k              # Ports → PTY (same column, one row up — bright on PTY)
-Ctrl-b <Down arrow>   # same as Ctrl-b j — arrow equivalents
-Ctrl-b <Up arrow>     # back to PTY
+Tab                   # PTY → Docker (border becomes bright on Docker)
+Tab                   # Docker → Ports
+Tab                   # Ports → Fleet
+Tab                   # Fleet → ClaudeCode (placeholder)
+Tab                   # ClaudeCode → PTY (wraps)
+Shift-Tab             # reverse cycle
+
+# Mouse equivalent — click any tile to focus it; hover reveals a
+# cyan-dimmed border on the tile under the pointer.
+
+# Undocumented aliases for muscle memory:
+Ctrl-b j              # PTY → Docker (directional; same spatial behavior as before)
+Ctrl-b l              # Docker → Ports (horizontal neighbor)
 
 # → expect: movement feels natural; focused tile is visually distinct;
 #   unfocused tiles keep rendering (Docker table ticks through live,
@@ -130,8 +147,8 @@ vim /tmp/tepegoz-demo.txt
 # Status line should read: "/tmp/tepegoz-demo.txt" [New File]
 # Move cursor with h/l/j/k to a non-trivial position.
 
-Ctrl-b j              # focus Docker; vim stays on-screen in the pty tile
-Ctrl-b k              # focus PTY again
+Tab                   # focus Docker; vim stays on-screen in the pty tile
+Shift-Tab             # focus PTY again (or Tab through the remaining tiles)
 # → expect: vim's screen intact (text, cursor, status line). The tile
 #   border changed cyan/gray but the vim buffer did not scramble.
 
@@ -153,7 +170,7 @@ Ctrl-b d              # detach
 **Step 4 — docker tile navigation + filter.**
 
 ```
-Ctrl-b j              # focus Docker tile
+Tab                   # focus Docker tile (from PTY)
 j, k, or ↑/↓          # move selection (▶ marker tracks)
 g / G                 # jump to top / bottom
 / tepegoz             # open filter input, type "tepegoz"; list narrows
@@ -161,8 +178,9 @@ g / G                 # jump to top / bottom
 <Esc>                 # clear filter entirely
 
 # → expect: while Docker is focused, plain j/k/g/G act on the list (not
-#   focus). Ctrl-b j/k/etc. continue to move focus between tiles.
-#   The PTY tile keeps rendering in the background.
+#   focus). Tab / Shift-Tab (or undocumented Ctrl-b h/j/k/l) continue
+#   to move focus between tiles. The PTY tile keeps rendering in the
+#   background.
 ```
 
 **Step 5 — engine-unavailable-mid-session recovery** (CTO §7).
@@ -599,39 +617,39 @@ The TUI launches with the god view; the PTY tile's tab strip shows a single `[1 
 
 → Pass: `connect staging` opens, runs a real remote command, detaches with `Ctrl-b d`. Tab strip shows exactly one `ssh:staging` entry (no local root pane).
 
-**Step 2 — `tepegoz tui` + `Ctrl-b Enter` on Fleet opens a second remote pane.**
+**Step 2 — `tepegoz tui` + plain `Enter` on Fleet opens a second remote pane.**
 
 ```sh
 ./target/debug/tepegoz tui
 ```
 
-The TUI launches with a single local pane: tab strip shows `[1 zsh*]` (or `bash`/`fish` per `$SHELL`). Navigate to the Fleet tile (`Ctrl-b j` to Docker → `Ctrl-b l` to Ports → `Ctrl-b l` to Fleet); border highlights bright cyan when focused. The `staging` row is highlighted via `▶` selection marker. Press `Ctrl-b Enter`: an Info toast `opening ssh:staging…` flashes; within 1-3 s the tab strip updates to `[1 zsh] [2 ssh:staging*]`, focus jumps back to the PTY tile, and the remote shell prompt appears.
+The TUI launches with a single local pane: tab strip shows `[1 zsh*]` (or `bash`/`fish` per `$SHELL`). Press `Tab` three times to cycle through to the Fleet tile (PTY → Docker → Ports → Fleet). The border highlights bright cyan when focused. The `staging` row is highlighted via `▶` selection marker. Press `Enter`: an Info toast `opening ssh:staging…` flashes; within 1-3 s the tab strip updates to `[1 zsh] [2 ssh:staging*] [×]`, focus jumps back to the PTY tile, and the remote shell prompt appears. Double-clicking the row works identically.
 
-→ Pass: tab strip shows both entries with `*` on the new remote pane; focus returned to PTY automatically; remote shell responds to `uname -a`.
+→ Pass: tab strip shows both entries with `*` on the new remote pane + the `[×]` close affordance at the tail; focus returned to PTY automatically; remote shell responds to `uname -a`.
 
-**Step 3 — `Ctrl-b 1` / `Ctrl-b 2` / `Ctrl-b n` / `Ctrl-b p` switch between panes without losing scrollback.**
+**Step 3 — clicking a tab switches panes without losing scrollback; `[×]` closes the active pane.**
 
-In the local pane (tab 1), run `seq 1 30` so there's distinguishable scrollback. Press `Ctrl-b 2`: tab strip flips `*` to slot 2, the remote pane's last screen reappears (NOT a refresh of the local one). Press `Ctrl-b 1`: back to the local pane with `seq 1 30` output still visible. Press `Ctrl-b n`: cycles to the next pane (slot 2). Press `Ctrl-b p`: cycles back. Press `Ctrl-b p` again: wraps to the last pane (slot 2 in this two-pane case).
+In the local pane (tab 1), run `seq 1 30` so there's distinguishable scrollback. Click the `[2 ssh:staging]` tab: active marker shifts, the remote pane's last screen reappears (NOT a refresh of the local one). Click `[1 zsh]`: back to the local pane with `seq 1 30` output still visible. Click the `[×]` affordance: the currently-active pane closes (the other tab becomes active; if the stack would empty, a fresh local root spawns). Note: `Ctrl-b &` still closes as an undocumented keyboard alias.
 
-→ Pass: switching tabs preserves each pane's vt100 screen content; `n` / `p` wrap correctly.
+→ Pass: switching tabs preserves each pane's vt100 screen content; `[×]` closes the active tab and promotes the sibling.
 
 **Step 4 — `Ctrl-b d` + reattach: pane stack is session-local, expect a single pane on reattach (NOT a regression).**
 
-From the two-pane state above, press `Ctrl-b d`. TUI exits; outer shell returns. Re-launch:
+Re-open a second remote pane if Step 3 left you with one tab. From the two-pane state, press `Ctrl-b d`. TUI exits; outer shell returns. Re-launch:
 
 ```sh
 ./target/debug/tepegoz tui
 ```
 
-The tab strip now shows ONE entry — whichever pane the daemon's `ListPanes` returns first. This is the session-local stack policy (`docs/ISSUES.md#pane-stack-is-session-local`): the TUI doesn't persist tab order across detach. Both daemon-side panes are still alive (one of them is what you're attached to); to verify, press `Ctrl-b &` to close the visible pane — the other one becomes visible in slot 1 (or, if both are gone, a fresh local root spawns).
+The tab strip now shows ONE entry — whichever pane the daemon's `ListPanes` returns first. This is the session-local stack policy (`docs/ISSUES.md#pane-stack-is-session-local`): the TUI doesn't persist tab order across detach. Both daemon-side panes are still alive (one of them is what you're attached to); to verify, click `[×]` to close the visible pane — the other one becomes visible in slot 1 (or, if both are gone, a fresh local root spawns).
 
 → Pass: reattach shows one pane; closing it surfaces the other (proves both daemon-side panes survived the detach); user understands the session-local policy.
 
-Detach (`Ctrl-b d`) and clean up the daemon-side panes by reconnecting + `Ctrl-b &` until you're back to a single local pane (or kill the daemon and restart it for Step 5).
+Detach (`Ctrl-b d`) and clean up the daemon-side panes by reconnecting + `[×]` clicks until you're back to a single local pane (or kill the daemon and restart it for Step 5).
 
 **Step 5 — SSH server drop mid-session: remote pane terminates cleanly with a toast.**
 
-Re-launch the TUI, then `Ctrl-b j → l → l → Enter` on the `staging` row to open a remote pane. Confirm the prompt is responsive. From a third terminal:
+Re-launch the TUI, then `Tab` three times to focus the Fleet tile (or `Ctrl-b j → l → l` via the undocumented aliases), select the `staging` row, and press plain `Enter` to open the remote pane. Confirm the prompt is responsive. From a third terminal:
 
 ```sh
 docker stop tepegoz-demo-phase-5-sshd
@@ -641,9 +659,9 @@ Within seconds, the active remote pane gets an Info toast like `pane ssh:staging
 
 → Pass: SSH drop surfaces as a per-pane Info toast (NOT a TUI crash); tab strip updates; Fleet row glyph turns gray within the heartbeat window; restart restores the host to discoverable state.
 
-**Step 6 — `Ctrl-b r` on Fleet row dispatches a reconnect with an Info "dispatched" toast.**
+**Step 6 — `r` on Fleet row dispatches a reconnect with an Info "dispatched" toast.**
 
-With the container restarted (per Step 5 cleanup), focus the Fleet tile; the `staging` row should be at `○` (Disconnected) initially, transitioning to `◐` → `●` if the supervisor is auto-reconnecting. To force the demo: focus Fleet (`Ctrl-b j → l → l`), select the `staging` row, press `r`. An Info toast `reconnect staging — dispatched` appears; the row glyph transitions through `◐` to `●` within a few seconds.
+With the container restarted (per Step 5 cleanup), focus the Fleet tile; the `staging` row should be at `○` (Disconnected) initially, transitioning to `◐` → `●` if the supervisor is auto-reconnecting. To force the demo: Tab to the Fleet tile, select the `staging` row, press `r`. An Info toast `reconnect staging — dispatched` appears; the row glyph transitions through `◐` to `●` within a few seconds.
 
 → Pass: `r` produces the Info "dispatched" toast (NOT a state-change toast; that comes seconds later via `HostStateChanged`); the row glyph reaches `●` within the connect window.
 
@@ -665,7 +683,7 @@ sed -i.bak "s|identity_file = .*|identity_file = \"$DEMO_ROOT/id_ed25519\"|" \
   "$DEMO_ROOT/tepegoz-config/config.toml"
 ```
 
-Press `Ctrl-b r` again on the row — should succeed this time (or the next supervisor retry will succeed within the backoff window).
+Press `r` again on the row — should succeed this time (or the next supervisor retry will succeed within the backoff window).
 
 → Pass: red `⚠` glyph + verbatim russh-reasoned red toast; restoring the correct key + retrying recovers cleanly.
 
@@ -678,7 +696,7 @@ docker exec tepegoz-demo-phase-5-sshd rm -f /config/ssh_host_keys/*
 docker restart tepegoz-demo-phase-5-sshd
 ```
 
-Re-attach (or `Ctrl-b r` if still attached): the row glyph transitions to `⚠` (red); a red toast surfaces `staging: host key rejected — <reason from russh, includes path:line of the stored entry>` (the entry lives in `$DEMO_ROOT/tepegoz-data/known_hosts`). Recover via:
+Re-attach (or press `r` on the Fleet row if still attached): the row glyph transitions to `⚠` (red); a red toast surfaces `staging: host key rejected — <reason from russh, includes path:line of the stored entry>` (the entry lives in `$DEMO_ROOT/tepegoz-data/known_hosts`). Recover via:
 
 ```sh
 TEPEGOZ_CONFIG_DIR="$DEMO_ROOT/tepegoz-config" \
@@ -687,7 +705,7 @@ TEPEGOZ_DATA_DIR="$DEMO_ROOT/tepegoz-data" \
 # Expect: removed N entry(ies) for 127.0.0.1:<port> ... — next connection ... will re-TOFU
 ```
 
-Re-attach the TUI + press `Ctrl-b r` on `staging`. The supervisor re-TOFUs the new host key and connects cleanly: glyph back to `●`.
+Re-attach the TUI + press `r` on the `staging` row in the Fleet tile. The supervisor re-TOFUs the new host key and connects cleanly: glyph back to `●`.
 
 → Pass: mismatch surfaces with file:line in the toast; `--ssh-forget` removes the stale entry; subsequent connect succeeds via re-TOFU.
 
@@ -696,11 +714,11 @@ Re-attach the TUI + press `Ctrl-b r` on `staging`. The supervisor re-TOFUs the n
 | # | Scenario | Pass |
 |---|---|---|
 | 1 | `tepegoz connect staging` opens, runs a remote command, `Ctrl-b d` detaches cleanly | ☐ |
-| 2 | `Ctrl-b Enter` on Fleet from `tepegoz tui` opens a 2nd pane; tab strip shows both with `*` on new | ☐ |
-| 3 | `Ctrl-b 1/2/n/p` swaps active pane; each pane preserves its own scrollback across switches | ☐ |
+| 2 | Plain `Enter` on the selected Fleet row from `tepegoz tui` opens a 2nd pane; tab strip shows both with `*` on new + `[×]` close affordance at tail | ☐ |
+| 3 | Clicking a tab swaps active pane; each pane preserves its own scrollback across switches; clicking `[×]` closes the active pane | ☐ |
 | 4 | `Ctrl-b d` + reattach → 1 pane (session-local stack); closing it surfaces the other surviving pane | ☐ |
 | 5 | `docker stop` mid-session → per-pane Info toast; tab strip drops entry; Fleet row → `○` within heartbeat window | ☐ |
-| 6 | `Ctrl-b r` on Fleet row → Info "dispatched" toast; row glyph reaches `●` within connect window | ☐ |
+| 6 | `r` on Fleet row → Info "dispatched" toast; row glyph reaches `●` within connect window | ☐ |
 | 7 | Wrong IdentityFile → `⚠` red glyph + red toast with russh attempts list; restoring correct key + retry recovers | ☐ |
 | 8 | Container key regen → red `⚠` glyph + red toast `host key rejected — <reason>`; `doctor --ssh-forget` removes; re-TOFU connects cleanly | ☐ |
 

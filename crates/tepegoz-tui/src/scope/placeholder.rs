@@ -11,12 +11,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-pub(crate) fn render(label: &str, eta_phase: u8, frame: &mut Frame<'_>, area: Rect, focused: bool) {
-    let (border_color, border_modifier) = if focused {
-        (Color::Cyan, Modifier::empty())
-    } else {
-        (Color::DarkGray, Modifier::DIM)
-    };
+pub(crate) fn render(
+    label: &str,
+    eta_phase: u8,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    focused: bool,
+    hovered: bool,
+) {
+    let (border_color, border_modifier) = crate::scope::border_style(focused, hovered);
 
     let block = Block::default().borders(Borders::ALL).border_style(
         Style::default()
@@ -68,7 +71,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(label, eta_phase, f, area, focused))
+            .draw(|f| render(label, eta_phase, f, area, focused, false))
             .unwrap();
         terminal
             .backend()

@@ -73,11 +73,43 @@ change.
 
 **vt100 emulation.** The pty tile is rendered via the `vt100` crate: pty
 bytes feed the parser; the parser's screen buffer renders as a ratatui
-widget within the tile's Rect. Raw passthrough is gone.
+widget within the tile's Rect. Raw passthrough is gone. The Slice
+5d-ii tab strip (1 row of clickable pane labels) sits above the vt100
+render area inside the same Rect; this is interior tile layout, not a
+Decision #7 amendment.
 
-**Focus.** `Ctrl-b` followed by `h`/`j`/`k`/`l` or arrow keys moves focus
-between adjacent tiles. The focused tile owns the keystroke stream.
-`Ctrl-b d` / `Ctrl-b q` still detach from any focus.
+**Input / interaction (amended 2026-04-15, Slice 6.0).** Focus moves
+between tiles via mouse click OR keyboard `Tab` / `Shift-Tab`.
+**Tab always cycles tiles in a fixed order** (PTY → Docker → Ports
+→ Fleet → ClaudeCode → PTY); it never cycles within a tile's
+contents regardless of which tile is focused. Within a focused tile,
+keyboard navigation is tile-specific (`j` / `k` / arrow keys for row
+nav, `/` to filter, etc.). Mouse click on an interactive element
+(tile, row, pane-strip tab) selects or acts per the tile's contract
+— every visually-interactive element must respond to click, and
+hover states (border highlight, color shift, pointer cursor on
+supporting terminals via OSC 22) indicate click-ability.
+
+Documented keyboard surface — the five bindings help and docs teach:
+`Tab` / `Shift-Tab` (tile focus), arrow keys / `j` / `k` (row nav),
+`Enter` (primary action on selected row), `Esc` (cancel / back),
+`Ctrl-b d` (detach).
+
+Kept as undocumented power-user aliases (muscle-memory continuity,
+not taught to new users): `Ctrl-b h` / `j` / `k` / `l` for
+directional tile focus (faster than Tab when crossing the 5-tile
+spatial layout), `Ctrl-b &` for close-active-pane.
+
+Removed entirely (obsoleted by clickable tab strip + the unified
+Enter/Esc keybinds): `Ctrl-b 1..9`, `Ctrl-b n`, `Ctrl-b p`,
+`Ctrl-b w`, `Ctrl-b q`.
+
+**Mouse bus.** `AppEvent::MouseClick { x, y }` and
+`AppEvent::MouseHover { x, y }` flow through the existing AppEvent
+bus. Each tile's renderer owns hit-testing within its `Rect` —
+converts coordinates into the appropriate row / tab / element and
+emits the matching `AppAction`. Crossterm mouse capture is enabled
+in `terminal::enter_raw` and disabled on detach.
 
 **Configuration.** Zero. The user does not choose a layout, does not
 enable tiles, does not opt in. `tepegoz tui` → god view. User

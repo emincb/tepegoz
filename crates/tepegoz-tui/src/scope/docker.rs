@@ -26,18 +26,16 @@ use tepegoz_proto::{DockerActionKind, DockerContainer, LogStream};
 use crate::app::{
     DockerScope, DockerScopeState, DockerView, LogsView, PendingConfirm, action_verb,
 };
+use crate::scope::border_style;
 
-pub(crate) fn render(scope: &DockerScope, frame: &mut Frame<'_>, area: Rect, focused: bool) {
-    let border_color = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let border_modifier = if focused {
-        Modifier::empty()
-    } else {
-        Modifier::DIM
-    };
+pub(crate) fn render(
+    scope: &DockerScope,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    focused: bool,
+    hovered: bool,
+) {
+    let (border_color, border_modifier) = border_style(focused, hovered);
     let title = match &scope.view {
         DockerView::List => "docker".to_string(),
         DockerView::Logs(logs) => format!("docker · logs · {}", logs.container_name),
@@ -550,7 +548,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(scope, frame, Rect::new(0, 0, width, height), true))
+            .draw(|frame| render(scope, frame, Rect::new(0, 0, width, height), true, false))
             .unwrap();
         let buf = terminal.backend().buffer();
         let w = buf.area.width as usize;
@@ -967,7 +965,7 @@ mod tests {
         let backend = TestBackend::new(60, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(&scope, frame, Rect::new(0, 0, 60, 15), false))
+            .draw(|frame| render(&scope, frame, Rect::new(0, 0, 60, 15), false, false))
             .unwrap();
         let buf = terminal.backend().buffer();
         let w = buf.area.width as usize;

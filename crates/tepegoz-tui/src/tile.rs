@@ -237,6 +237,49 @@ impl TileLayout {
             _ => None,
         }
     }
+
+    /// Cycle focus forward (`Tab`) or backward (`Shift-Tab`) through a
+    /// fixed tile order: PTY → Docker → Ports → Fleet → ClaudeCode →
+    /// PTY. The order matches the Decision #7 god-view reading flow
+    /// (top-left to bottom-right) and is stable regardless of which
+    /// tiles are currently populated vs. placeholders. Tiles not
+    /// present in the current layout (e.g. when the terminal is small
+    /// enough to collapse to `TooSmall`) are skipped; if no populated
+    /// tile is found the function returns `None`.
+    pub fn cycle_focus(&self, from: TileId, forward: bool) -> Option<TileId> {
+        // Fixed cycle order — matches the Decision #7 layout's visual
+        // reading flow. Not derived from `self.tiles` order because
+        // the tiles vector is laid out spatially (PTY is first, then
+        // the three scope tiles left-to-right, then ClaudeCode), but
+        // we want a deterministic user-facing order regardless of
+        // layout variants.
+        const CYCLE_ORDER: [TileId; 5] = [
+            TileId::Pty,
+            TileId::Docker,
+            TileId::Ports,
+            TileId::Fleet,
+            TileId::ClaudeCode,
+        ];
+
+        if from == TileId::TooSmall {
+            return None;
+        }
+
+        let n = CYCLE_ORDER.len();
+        let start = CYCLE_ORDER.iter().position(|id| *id == from)?;
+        for step in 1..=n {
+            let idx = if forward {
+                (start + step) % n
+            } else {
+                (start + n - step) % n
+            };
+            let candidate = CYCLE_ORDER[idx];
+            if self.tile(candidate).is_some() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -400,6 +443,56 @@ mod tests {
         assert!(layout.routes_to_pty(TileId::Pty));
         assert!(!layout.routes_to_pty(TileId::Docker));
         assert!(!layout.routes_to_pty(TileId::Ports));
+    }
+
+    #[test]
+    fn cycle_focus_forward_walks_the_fixed_reading_order() {
+        let layout = TileLayout::default_for(Rect::new(0, 0, 120, 40));
+        assert_eq!(layout.cycle_focus(TileId::Pty, true), Some(TileId::Docker));
+        assert_eq!(
+            layout.cycle_focus(TileId::Docker, true),
+            Some(TileId::Ports)
+        );
+        assert_eq!(layout.cycle_focus(TileId::Ports, true), Some(TileId::Fleet));
+        assert_eq!(
+            layout.cycle_focus(TileId::Fleet, true),
+            Some(TileId::ClaudeCode)
+        );
+        assert_eq!(
+            layout.cycle_focus(TileId::ClaudeCode, true),
+            Some(TileId::Pty),
+            "Tab wraps around to PTY"
+        );
+    }
+
+    #[test]
+    fn cycle_focus_backward_walks_the_reverse_reading_order() {
+        let layout = TileLayout::default_for(Rect::new(0, 0, 120, 40));
+        assert_eq!(
+            layout.cycle_focus(TileId::Pty, false),
+            Some(TileId::ClaudeCode),
+            "Shift-Tab from PTY wraps to the last tile"
+        );
+        assert_eq!(
+            layout.cycle_focus(TileId::ClaudeCode, false),
+            Some(TileId::Fleet)
+        );
+        assert_eq!(
+            layout.cycle_focus(TileId::Fleet, false),
+            Some(TileId::Ports)
+        );
+        assert_eq!(
+            layout.cycle_focus(TileId::Ports, false),
+            Some(TileId::Docker)
+        );
+        assert_eq!(layout.cycle_focus(TileId::Docker, false), Some(TileId::Pty));
+    }
+
+    #[test]
+    fn cycle_focus_from_too_small_is_none() {
+        let layout = TileLayout::default_for(Rect::new(0, 0, 60, 20));
+        assert_eq!(layout.cycle_focus(TileId::TooSmall, true), None);
+        assert_eq!(layout.cycle_focus(TileId::TooSmall, false), None);
     }
 
     #[test]

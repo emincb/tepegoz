@@ -47,17 +47,14 @@ const STATUS_BAR_NON_SOURCE_TRUNCATE: usize = 30;
 /// empty source field.
 const SOURCE_MIN_CHARS: usize = 8;
 
-pub(crate) fn render(scope: &FleetScope, frame: &mut Frame<'_>, area: Rect, focused: bool) {
-    let border_color = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let border_modifier = if focused {
-        Modifier::empty()
-    } else {
-        Modifier::DIM
-    };
+pub(crate) fn render(
+    scope: &FleetScope,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    focused: bool,
+    hovered: bool,
+) {
+    let (border_color, border_modifier) = crate::scope::border_style(focused, hovered);
     let block = Block::default()
         .borders(Borders::ALL)
         .title("fleet")
@@ -262,10 +259,14 @@ fn render_host_table(
 }
 
 fn render_help_bar(filter_active: bool, frame: &mut Frame<'_>, area: Rect) {
+    // Slice 6.0: tile-focus keybinds (Tab / Shift-Tab) are meta-level
+    // — the help overlay (Ctrl-b ?) documents them. The inline bar
+    // keeps only per-tile-scoped hints + the Fleet primary action
+    // (Enter → open remote pane).
     let text = if filter_active {
         "[Enter] apply · [Esc] clear · [Backspace] delete"
     } else {
-        "[j/k] nav · [/] filter · Ctrl-b h/j/k/l focus"
+        "[j/k] nav · [/] filter · [Enter] open · [r] reconnect"
     };
     let p = Paragraph::new(Line::from(Span::styled(
         text,
@@ -301,7 +302,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, 60, 16);
-                render(scope, f, area, focused);
+                render(scope, f, area, focused, false);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -432,13 +433,21 @@ mod tests {
     }
 
     #[test]
-    fn footer_help_bar_shows_nav_and_filter_hints() {
+    fn footer_help_bar_shows_nav_and_filter_and_primary_action_hints() {
+        // Slice 6.0: the inline bar documents Enter as the primary
+        // action (open remote pane). Tab / Shift-Tab are meta-level
+        // and live in the help overlay, not here.
         let mut states = HashMap::new();
         states.insert("h".into(), HostState::Disconnected);
         let scope = scope_with(vec![host("h")], states, "ssh_config");
         let out = render_to_string(&scope, true);
         assert!(out.contains("[j/k] nav"));
         assert!(out.contains("[/] filter"));
+        assert!(out.contains("[Enter] open"));
+        assert!(
+            !out.contains("Ctrl-b h/j/k/l"),
+            "Slice 6.0 removed the Ctrl-b h/j/k/l hint — it's an undocumented alias; got {out}"
+        );
     }
 
     #[test]

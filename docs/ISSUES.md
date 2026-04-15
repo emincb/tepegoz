@@ -121,18 +121,57 @@ channel. Panes become cheap (one `OpenPane` wire frame each), and
 the "how many connections am I opening?" question disappears from
 the user's mental model.
 
-### `Ctrl-b w` pane-list overlay deferred to v1.1
+### Tab never reaches the pty shell (Slice 6.0 trade-off)
 
-5d-ii landed the pane-stack with `Ctrl-b 0..9` jump + `Ctrl-b n`/`p`
-cycle + a tab strip capped at 9 numbered slots + a `[+N]` overflow
-indicator when the stack grows past 9. The list-view overlay for
-enumerating the full stack (including panes past slot 9, which are
-reachable via keybind but invisibly) is deferred to v1.1 — `Ctrl-b w`
-is explicitly swallowed in the input filter today so accidental
-presses don't leak `w` to the pty. Users with >9 concurrent panes can
-still navigate via cycling; jump-by-number covers the 10th via
-`Ctrl-b 0` and otherwise wraps at 9. Not a bug, but flag if real-world
-usage surfaces >9 concurrent panes as a routine case.
+Slice 6.0 assigned `Tab` / `Shift-Tab` to tile-focus cycling
+unconditionally — including when the PTY tile is focused. Consequence:
+shell tab-completion and any pty app that uses `Tab` as input (vim's
+`Ctrl-I`, Claude Code's command palette) is unreachable via the Tab
+key while PTY is focused. The user must use arrow keys, shell-native
+alternatives (`Ctrl-n`/`Ctrl-p` for history), or work inside a pane
+that doesn't rely on Tab.
+
+**Rationale**. The Decision #7 amendment explicitly pins Tab as
+"tile cycle in a fixed order regardless of which tile is focused"
+— a deliberate UX simplification over a per-tile-context keybind
+(where Tab-in-PTY → shell, Tab-in-scope → tile-cycle). The amended
+wording makes the trade explicit so future contributors don't
+reflexively re-plumb it. If real-world usage surfaces this as
+too painful, the fix is a PTY-specific carve-out (Tab-in-PTY
+forwards to pty, everywhere else cycles focus), which the amendment
+can accommodate without a wire bump.
+
+### Panes past slot 9 are not reachable today (Slice 6.0 regression)
+
+Slice 6.0 removed `Ctrl-b 0..9`, `Ctrl-b n`, `Ctrl-b p` in favor of
+click-to-switch on the mouse-driven tab strip. The strip still caps
+at 9 numbered slots + a `[+N]` overflow indicator; the `[+N]` glyph
+is NOT clickable, and no keybind survives to reach the 10th+ pane.
+Consequence: if a user stacks 10+ remote panes in a session, tabs
+10 and beyond are unreachable until one of the first 9 is closed
+(which shifts the stack). Was `Ctrl-b 0` → slot 10 pre-6.0;
+removed as part of the keybind-simplification pass.
+
+Workarounds today: close a visible pane via the `[×]` affordance
+(or `Ctrl-b &`) to shift a hidden one into view; or use the
+documented `tepegoz connect <alias>` CLI to drop directly into a
+remote shell without going through the stack.
+
+**Phase 6 upgrade path**. The agent-based multiplex (one SSH
+connection per host, many panes over it) makes >9-pane workloads
+much more likely, so Phase 6 revisits the overflow overlay — either
+a clickable pane-list modal off the `[+N]` glyph, or an infinite-
+scroll horizontal tab strip. The right design question will surface
+concretely once the agent pipeline is in place; deferring until
+then avoids locking in an overlay the agent UX might obsolete.
+
+### `Ctrl-b w` pane-list overlay deferred to v1.1 *(superseded by Slice 6.0)*
+
+5d-ii originally reserved `Ctrl-b w` for a pane-list overlay to
+enumerate panes past slot 9. Slice 6.0 removed `Ctrl-b w` entirely
+along with the other pane-nav keybinds; the overlay concept is
+re-scoped under "Panes past slot 9 are not reachable today" above,
+with the Phase 6 revisit owning the final design decision.
 
 ### Pane stack is session-local (5d-ii → Phase 6 agent consolidation)
 

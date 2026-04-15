@@ -38,20 +38,13 @@ pub(crate) fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     focused: bool,
+    hovered: bool,
 ) {
     // Border. Title is fixed ("pty"); Phase 3's OSC 0 behavior (title
     // per attached pane) is orthogonal — that's the *terminal window*
-    // title, not this tile's border title.
-    let border_color = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let border_modifier = if focused {
-        Modifier::empty()
-    } else {
-        Modifier::DIM
-    };
+    // title, not this tile's border title. Slice 6.0 adds the hovered
+    // non-focused border style via the shared `scope::border_style`.
+    let (border_color, border_modifier) = crate::scope::border_style(focused, hovered);
     let block = Block::default()
         .borders(Borders::ALL)
         .title("pty")
@@ -129,11 +122,24 @@ pub(crate) fn render(
     }
 }
 
+/// Visible-cell width of the `×` close glyph in a monospace cell grid.
+/// `×` (U+00D7) is a single-cell character; used by both renderer and
+/// hit-tester. The surrounding brackets add 2 more cells for a total
+/// of 3 (`CLOSE_AFFORDANCE_WIDTH`).
+const CLOSE_AFFORDANCE_WIDTH: u16 = 3;
+
+/// Extra cells for the non-label ornamentation of each tab span in
+/// `render_tab_strip`. Inactive tabs are `[N L]` — 4 non-label cells
+/// (brackets, digit, leading space). Active tabs are `[N L*]` — 5
+/// non-label cells (brackets, digit, leading space, trailing star).
+const TAB_CHROME_INACTIVE: u16 = 4;
+const TAB_CHROME_ACTIVE: u16 = 5;
+
 fn render_tab_strip(panes: &[PaneEntry], active: usize, frame: &mut Frame<'_>, area: Rect) {
     let visible_slots = panes.len().min(MAX_TAB_DIGIT_SLOTS);
     let overflow = panes.len().saturating_sub(MAX_TAB_DIGIT_SLOTS);
 
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(visible_slots * 2 + 2);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(visible_slots * 2 + 4);
     for (i, entry) in panes.iter().take(visible_slots).enumerate() {
         let is_active = i == active;
         // 1-indexed — the 10th slot is keybind-only via `Ctrl-b 0`
@@ -162,8 +168,85 @@ fn render_tab_strip(panes: &[PaneEntry], active: usize, frame: &mut Frame<'_>, a
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ));
+        spans.push(Span::raw(" "));
+    }
+    // Slice 6.0: close-active-pane affordance. Always tail of the
+    // strip — clicking it closes whichever pane is currently active.
+    // Dim gray so it doesn't compete with tab labels; the hit-test
+    // in `hit_test_tab_strip` claims this span.
+    if !panes.is_empty() {
+        spans.push(Span::styled(
+            "[×]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Slice 6.0: mouse-click target within the tab strip. Returned by
+/// [`hit_test_tab_strip`] when a click lands on one of the interactive
+/// spans; `None` means the click missed (strip too narrow, or the
+/// click fell in the padding between spans).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabStripHit {
+    /// User clicked on a labeled tab at this 0-based pane-stack index.
+    /// Might be the currently-active tab — the handler can no-op in
+    /// that case (the click still focuses the PTY tile).
+    Tab(usize),
+    /// User clicked on the `[×]` close affordance at the tail of the
+    /// strip. Closes whichever pane is currently active.
+    CloseActive,
+}
+
+/// Hit-test the tab strip for a click at column `x` (absolute cell
+/// coordinate). Returns `None` if the strip is zero-height, `x` is
+/// outside the strip's horizontal extent, or the click landed in a
+/// separator space. Mirrors the layout in `render_tab_strip` — any
+/// changes to that function must mirror here, and vice versa; the
+/// `TAB_CHROME_*` / `CLOSE_AFFORDANCE_WIDTH` constants are the
+/// shared source of truth for cell widths.
+pub(crate) fn hit_test_tab_strip(
+    panes: &[PaneEntry],
+    active: usize,
+    strip_rect: Rect,
+    x: u16,
+) -> Option<TabStripHit> {
+    if strip_rect.height == 0 || strip_rect.width == 0 {
+        return None;
+    }
+    let strip_end = strip_rect.x.saturating_add(strip_rect.width);
+    let mut col = strip_rect.x;
+    let visible_slots = panes.len().min(MAX_TAB_DIGIT_SLOTS);
+    for (i, entry) in panes.iter().take(visible_slots).enumerate() {
+        let is_active = i == active;
+        let label_cells = entry.label.chars().count() as u16;
+        let chrome = if is_active {
+            TAB_CHROME_ACTIVE
+        } else {
+            TAB_CHROME_INACTIVE
+        };
+        let tab_width = label_cells.saturating_add(chrome);
+        let tab_end = col.saturating_add(tab_width);
+        if x >= col && x < tab_end && tab_end <= strip_end {
+            return Some(TabStripHit::Tab(i));
+        }
+        col = tab_end.saturating_add(1); // separator space
+    }
+    let overflow = panes.len().saturating_sub(MAX_TAB_DIGIT_SLOTS);
+    if overflow > 0 {
+        // `[+N]` indicator width is 3 + digit count; conservatively
+        // measure it the same way the renderer does.
+        let overflow_chars = format!("[+{overflow}]").chars().count() as u16;
+        col = col.saturating_add(overflow_chars).saturating_add(1);
+    }
+    // Close affordance.
+    let close_end = col.saturating_add(CLOSE_AFFORDANCE_WIDTH);
+    if !panes.is_empty() && x >= col && x < close_end && close_end <= strip_end {
+        return Some(TabStripHit::CloseActive);
+    }
+    None
 }
 
 /// Write one vt100 cell's contents + style into a ratatui cell.
@@ -235,7 +318,16 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(panes, active, f, Rect::new(0, 0, width, height), focused))
+            .draw(|f| {
+                render(
+                    panes,
+                    active,
+                    f,
+                    Rect::new(0, 0, width, height),
+                    focused,
+                    false,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         buffer
@@ -272,7 +364,7 @@ mod tests {
         let backend = TestBackend::new(50, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(&panes, 0, f, Rect::new(0, 0, 50, 12), true))
+            .draw(|f| render(&panes, 0, f, Rect::new(0, 0, 50, 12), true, false))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -296,7 +388,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         // Shouldn't panic on an untouched parser.
         terminal
-            .draw(|f| render(&panes, 0, f, Rect::new(0, 0, 50, 12), false))
+            .draw(|f| render(&panes, 0, f, Rect::new(0, 0, 50, 12), false, false))
             .unwrap();
     }
 
@@ -384,5 +476,107 @@ mod tests {
             "digit 0 is keybind-only; got: {}",
             rows[1]
         );
+    }
+
+    #[test]
+    fn tab_strip_renders_close_affordance_after_last_tab() {
+        // Slice 6.0: `[×]` always sits at the strip tail; clicking it
+        // closes whichever pane is currently active.
+        let panes = vec![pane("zsh", Parser::new(9, 48, 100))];
+        let rows = render_to_rows(&panes, 0, true);
+        assert!(
+            rows[1].contains("[×]"),
+            "close affordance must render after the tab list; got: {}",
+            rows[1]
+        );
+    }
+
+    #[test]
+    fn hit_test_tab_strip_maps_click_to_tab_index() {
+        // Layout: [1 a] [2 b*] [3 c] [×]
+        //         0     6      13    19
+        // With spaces at cols 5, 12, 18.
+        let panes = vec![
+            pane("a", Parser::new(9, 48, 100)),
+            pane("b", Parser::new(9, 48, 100)),
+            pane("c", Parser::new(9, 48, 100)),
+        ];
+        let strip = Rect::new(0, 0, 50, 1);
+        assert_eq!(
+            hit_test_tab_strip(&panes, 1, strip, 0),
+            Some(TabStripHit::Tab(0)),
+            "click at col 0 hits [1 a]"
+        );
+        assert_eq!(
+            hit_test_tab_strip(&panes, 1, strip, 4),
+            Some(TabStripHit::Tab(0)),
+            "click at col 4 still inside [1 a] (closing bracket)"
+        );
+        assert_eq!(
+            hit_test_tab_strip(&panes, 1, strip, 5),
+            None,
+            "col 5 is separator space between tabs 1 and 2"
+        );
+        assert_eq!(
+            hit_test_tab_strip(&panes, 1, strip, 6),
+            Some(TabStripHit::Tab(1)),
+            "click at col 6 hits the active [2 b*]"
+        );
+        assert_eq!(
+            hit_test_tab_strip(&panes, 1, strip, 13),
+            Some(TabStripHit::Tab(2)),
+            "click at col 13 hits [3 c]"
+        );
+    }
+
+    #[test]
+    fn hit_test_tab_strip_maps_close_button() {
+        let panes = vec![pane("a", Parser::new(9, 48, 100))];
+        // Active tab `[1 a*]` is 6 cells (0..=5), separator at col 6,
+        // close `[×]` at cols 7..=9.
+        let strip = Rect::new(0, 0, 20, 1);
+        assert_eq!(
+            hit_test_tab_strip(&panes, 0, strip, 6),
+            None,
+            "col 6 is separator space between tab and close"
+        );
+        assert_eq!(
+            hit_test_tab_strip(&panes, 0, strip, 7),
+            Some(TabStripHit::CloseActive)
+        );
+        assert_eq!(
+            hit_test_tab_strip(&panes, 0, strip, 9),
+            Some(TabStripHit::CloseActive)
+        );
+        assert_eq!(
+            hit_test_tab_strip(&panes, 0, strip, 10),
+            None,
+            "col 10 is outside the close button"
+        );
+    }
+
+    #[test]
+    fn hit_test_tab_strip_returns_none_on_empty_or_tiny_strip() {
+        let panes = vec![pane("a", Parser::new(9, 48, 100))];
+        assert_eq!(
+            hit_test_tab_strip(&panes, 0, Rect::new(0, 0, 50, 0), 0),
+            None,
+            "zero-height strip returns None"
+        );
+        assert_eq!(
+            hit_test_tab_strip(&[], 0, Rect::new(0, 0, 50, 1), 0),
+            None,
+            "empty pane list returns None"
+        );
+    }
+
+    #[test]
+    fn hit_test_tab_strip_ignores_clicks_past_end_of_visible_strip() {
+        // Narrow strip — the close affordance wouldn't render.
+        let panes = vec![pane("looooong-label", Parser::new(9, 48, 100))];
+        let strip = Rect::new(0, 0, 8, 1); // can't fit tab + close
+        // Tab "[1 looooong-label]" is 18 cells, strip is only 8 — tab
+        // runs past end_x, so hit_test rejects it.
+        assert_eq!(hit_test_tab_strip(&panes, 0, strip, 0), None);
     }
 }
