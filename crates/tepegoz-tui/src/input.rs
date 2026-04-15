@@ -37,6 +37,10 @@ const FOCUS_K: u8 = b'k';
 const FOCUS_L: u8 = b'l';
 const HELP: u8 = b'?';
 const PANE_CLOSE: u8 = b'&';
+/// Phase 6 Slice 6c-iii: `Ctrl-b t` opens the host picker modal on a
+/// target-capable tile (Docker in 6c-iii; Ports + Processes in 6d).
+/// No-op on non-target-capable tiles — documented in the help overlay.
+const TARGET_PICKER: u8 = b't';
 const TAB: u8 = 0x09;
 const ESC: u8 = 0x1b;
 const CSI_OPEN: u8 = b'[';
@@ -81,6 +85,11 @@ pub(crate) enum InputAction {
     /// after Slice 6.0; the documented path is a click on the tab
     /// strip's close affordance.
     PaneClose,
+    /// Phase 6 Slice 6c-iii: user pressed `Ctrl-b t` — open the host
+    /// picker modal on a target-capable tile (Docker in 6c-iii; Ports
+    /// / Processes in 6d). Silent no-op when the focused tile isn't
+    /// target-capable.
+    OpenHostPicker,
 }
 
 #[derive(Debug, Default)]
@@ -155,6 +164,7 @@ impl InputFilter {
                         FOCUS_L => Some(InputAction::FocusDirection(FocusDir::Right)),
                         HELP => Some(InputAction::Help),
                         PANE_CLOSE => Some(InputAction::PaneClose),
+                        TARGET_PICKER => Some(InputAction::OpenHostPicker),
                         _ => None,
                     };
                     if let Some(action) = control {

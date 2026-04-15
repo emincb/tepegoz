@@ -38,6 +38,7 @@ use tepegoz_proto::{
 
 use crate::app::{App, AppAction, AppEvent, DetachReason, ScopeKind, ToastKind};
 use crate::help;
+use crate::host_picker;
 use crate::mouse::MouseParser;
 use crate::pty_tile;
 use crate::scope;
@@ -434,6 +435,14 @@ fn render_tiles(app: &App, frame: &mut Frame<'_>) {
 
     if app.help_visible {
         help::render(frame);
+    }
+
+    // Phase 6 Slice 6c-iii: host picker renders after help so if both
+    // were ever visible (they're mutually exclusive by handler logic)
+    // the picker wins — it's the one the user is actively
+    // interacting with.
+    if app.host_picker.is_some() {
+        host_picker::render(app, frame);
     }
 }
 

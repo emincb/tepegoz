@@ -28,6 +28,17 @@ use crate::app::{
 };
 use crate::scope::border_style;
 
+/// Phase 6 Slice 6c-iii: render the tile title's target suffix — the
+/// user-visible signal of which host the Docker subscription is
+/// currently routed to. `Ctrl-b t` (or a click on the title bar) opens
+/// the host picker modal to retarget.
+fn target_suffix_for(target: &tepegoz_proto::ScopeTarget) -> String {
+    match target {
+        tepegoz_proto::ScopeTarget::Local => "local".to_string(),
+        tepegoz_proto::ScopeTarget::Remote { alias } => alias.clone(),
+    }
+}
+
 pub(crate) fn render(
     scope: &DockerScope,
     frame: &mut Frame<'_>,
@@ -36,9 +47,12 @@ pub(crate) fn render(
     hovered: bool,
 ) {
     let (border_color, border_modifier) = border_style(focused, hovered);
+    let target_suffix = target_suffix_for(&scope.target);
     let title = match &scope.view {
-        DockerView::List => "docker".to_string(),
-        DockerView::Logs(logs) => format!("docker · logs · {}", logs.container_name),
+        DockerView::List => format!("docker · {target_suffix}"),
+        DockerView::Logs(logs) => {
+            format!("docker · logs · {} · {target_suffix}", logs.container_name)
+        }
     };
     let block = Block::default()
         .borders(Borders::ALL)

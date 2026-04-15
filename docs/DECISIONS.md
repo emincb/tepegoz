@@ -96,10 +96,18 @@ respond to click, and hover states (border highlight, color shift,
 pointer cursor on supporting terminals via OSC 22) indicate
 click-ability.
 
-Documented keyboard surface — the five bindings help and docs teach:
+Documented keyboard surface — the six bindings help and docs teach:
 `Tab` / `Shift-Tab` (tile focus), arrow keys / `j` / `k` (row nav),
 `Enter` (primary action on selected row), `Esc` (cancel / back),
-`Ctrl-b d` (detach).
+`Ctrl-b d` (detach), `Ctrl-b t` (retarget host on target-capable tiles
+— Docker in 6c-iii; Ports + Processes in 6d).
+
+The 2026-04-15 narrow amendment (Slice 6c-iii) added `Ctrl-b t`: a
+mouse-only-to-retarget flow would strand keyboard-only users every
+time they need to pick a remote host for a retargetable tile, which
+is a first-order operation in a fleet workflow. Same rationale as
+the 6.0.1 Tab-in-PTY carve-out: breaking a first-order user action
+is not a v1 acceptable trade-off.
 
 Kept as undocumented power-user aliases (muscle-memory continuity,
 not taught to new users): `Ctrl-b h` / `j` / `k` / `l` for

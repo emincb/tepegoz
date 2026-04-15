@@ -36,3 +36,9 @@ tokio = { workspace = true }
 # signal handling cleanly, so this is the minimum new dependency
 # needed to gracefully tear the demo fixture down on Ctrl-C.
 ctrlc = { version = "3", features = ["termination"] }
+# Phase 6 Slice 6c-iii: demo-phase-6 --remote drives a live
+# Subscribe(Docker) against the handshaked agent. The codec's
+# write path wants AsyncWrite which russh::Channel doesn't impl,
+# so we inline the rkyv serialize + length-prefix the same way
+# tepegoz-ssh::deploy::handshake_agent does.
+rkyv = "0.8"

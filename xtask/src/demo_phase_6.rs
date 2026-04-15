@@ -264,17 +264,126 @@ async fn drive_remote_deploy(paths: &RemotePaths, port: u16, agent_bin: &Path) -
     println!("    os:           {}", info.os);
     println!("    arch:         {}", info.arch);
     if info.capabilities.is_empty() {
-        println!("    capabilities: (none — 6a/6b ship empty; 6c/d populate)");
+        println!("    capabilities: (none — agent couldn't reach a docker socket)");
     } else {
         println!("    capabilities: {}", info.capabilities.join(", "));
     }
     println!();
 
+    // Phase 6 Slice 6c-iii: subscribe the remote agent to Docker +
+    // wait for the first event. Exercises the agent's new
+    // subscription-capable server path end-to-end over SSH. Emits
+    // `ContainerList` iff the agent has a reachable docker socket
+    // (e.g. host's /var/run/docker.sock bind-mounted), otherwise
+    // `DockerUnavailable` — either path proves the round-trip.
+    drive_remote_docker_subscribe(&mut channel).await?;
+
     let _ = session.disconnect().await;
-    println!("[demo-phase-6] remote deploy + handshake complete.");
+    println!("[demo-phase-6] remote deploy + handshake + Docker sub complete.");
     println!(
         "[demo-phase-6] fixture left running; tear down with `cargo xtask demo-phase-6 down --remote`."
     );
+    Ok(())
+}
+
+/// Drive a one-shot `Subscribe(Docker)` against an already-
+/// handshaked agent channel + print the first Event that arrives.
+/// Slice 6c-iii extension to the 6b demo: the visual proof that
+/// remote Docker subscriptions actually round-trip.
+async fn drive_remote_docker_subscribe(channel: &mut tepegoz_ssh::SshChannel) -> Result<()> {
+    use tepegoz_proto::{
+        Envelope, Event, EventFrame, PROTOCOL_VERSION, Payload, ScopeTarget, Subscription,
+        codec::read_envelope,
+    };
+
+    // Serialize + write a Subscribe(Docker) envelope, same inline
+    // serialize pattern `handshake_agent` uses (russh::Channel lacks
+    // an AsyncWrite impl, so the codec's write path doesn't apply).
+    let sub_id: u64 = 424242;
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Subscribe(Subscription::Docker {
+            id: sub_id,
+            target: ScopeTarget::Local,
+        }),
+    };
+    let body = rkyv::to_bytes::<rkyv::rancor::Error>(&env)
+        .map_err(|e| anyhow::anyhow!("serialize Subscribe(Docker): {e}"))?;
+    let len = u32::try_from(body.len())
+        .map_err(|_| anyhow::anyhow!("Subscribe envelope too large: {}", body.len()))?;
+
+    let inner = channel.channel_mut();
+    inner
+        .data(len.to_be_bytes().to_vec().as_slice())
+        .await
+        .map_err(|e| anyhow::anyhow!("write length prefix: {e}"))?;
+    inner
+        .data(body.as_ref())
+        .await
+        .map_err(|e| anyhow::anyhow!("write body: {e}"))?;
+
+    println!("[demo-phase-6] subscribed Docker on the agent; awaiting first event…");
+    let mut reader = inner.make_reader();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_envelope(&mut reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("agent didn't respond to Subscribe(Docker) within 10s"))?
+    .map_err(|e| anyhow::anyhow!("read Event: {e}"))?;
+
+    match response.payload {
+        Payload::Event(EventFrame {
+            subscription_id,
+            event,
+        }) => {
+            assert_eq!(
+                subscription_id, sub_id,
+                "agent must echo the subscription id"
+            );
+            match event {
+                Event::ContainerList {
+                    containers,
+                    engine_source,
+                } => {
+                    println!();
+                    println!("  remote Docker subscribe ✓");
+                    println!("    event:       ContainerList");
+                    println!("    containers:  {}", containers.len());
+                    println!("    source:      {engine_source}");
+                    for c in containers.iter().take(3) {
+                        let name = c
+                            .names
+                            .first()
+                            .map(|n| n.trim_start_matches('/'))
+                            .unwrap_or("(no name)");
+                        println!("      - {name}  ({})", c.image);
+                    }
+                    if containers.len() > 3 {
+                        println!("      … (+{} more)", containers.len() - 3);
+                    }
+                    println!();
+                }
+                Event::DockerUnavailable { reason } => {
+                    println!();
+                    println!("  remote Docker subscribe ✓ (DockerUnavailable path)");
+                    println!("    event:       DockerUnavailable");
+                    println!("    reason:      {reason}");
+                    println!(
+                        "    note:        bind-mount /var/run/docker.sock into the sshd \
+                         container (and add tepegoz to the docker group) for a ContainerList."
+                    );
+                    println!();
+                }
+                other => {
+                    anyhow::bail!("expected ContainerList or DockerUnavailable, got {other:?}");
+                }
+            }
+        }
+        other => {
+            anyhow::bail!("expected Event envelope, got {other:?}");
+        }
+    }
     Ok(())
 }
 

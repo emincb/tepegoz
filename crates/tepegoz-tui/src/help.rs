@@ -77,6 +77,7 @@ pub(crate) fn render(frame: &mut Frame<'_>) {
         Line::from("   Enter               primary action on selected row"),
         Line::from("   /                   start filter"),
         Line::from("   Esc                 cancel / back"),
+        Line::from("   Ctrl-b t            retarget host (Docker tile)"),
         Line::from(""),
         Line::from(Span::styled(" session", heading_style)),
         Line::from("   Ctrl-b d            detach"),

@@ -802,6 +802,70 @@ pub(crate) enum FleetScopeState {
     },
 }
 
+/// Phase 6 Slice 6c-iii: state for the host picker modal. Opens on
+/// `Ctrl-b t` or a click on a target-capable tile's title bar.
+///
+/// `target_tile` names which scope owns the retarget — the modal
+/// renders + commits against that tile's subscription. `selected` is
+/// an index into [`App::host_picker_rows`] (index 0 = Local).
+///
+/// `required_capability` is the capability string the modal uses to
+/// annotate unusable hosts (`"docker"` in 6c-iii; `"ports"` /
+/// `"processes"` in 6d when those tiles gain retarget UX). In
+/// 6c-iii the daemon → TUI wire doesn't carry per-agent capabilities
+/// yet, so "usable" degrades to "host state is Connected" — a
+/// Connected host without docker would still render as selectable and
+/// fail gracefully on commit (DockerUnavailable renders in the tile).
+#[derive(Debug, Clone)]
+pub(crate) struct HostPickerModal {
+    pub(crate) target_tile: HostPickerTargetTile,
+    /// Forward-looking: stored per-picker so 6d's Ports / Processes
+    /// tiles reuse the same modal with a different capability string.
+    /// In 6c-iii we don't yet have a per-agent capability table in
+    /// the TUI (the daemon has it; the wire doesn't propagate it), so
+    /// this string is a render hint only — grey-out is driven by
+    /// host state. 6d will consult it against a populated capability
+    /// table.
+    #[allow(dead_code)]
+    pub(crate) required_capability: &'static str,
+    pub(crate) selected: usize,
+}
+
+/// Which tile owns the retarget dispatch. 6c-iii only supports Docker;
+/// 6d extends to Ports + Processes reusing this modal unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostPickerTargetTile {
+    Docker,
+}
+
+impl HostPickerModal {
+    pub(crate) fn target_tile_label(&self) -> &'static str {
+        match self.target_tile {
+            HostPickerTargetTile::Docker => "docker",
+        }
+    }
+}
+
+/// One row in the host picker modal. Index 0 is always Local; indices
+/// 1..=N are Fleet hosts in discovery order.
+///
+/// `usable` is the render signal: `true` means the host's state is
+/// `Connected` (agent presumably reachable); `false` greys the row +
+/// shows an inline explanation. In 6c-iii we treat `state ==
+/// Connected` as the best proxy for "usable" — the daemon-side
+/// capability check (`"docker"` ∈ capabilities) still gates commit
+/// via `DockerUnavailable`, so a greyed-out row is belt-and-braces,
+/// not a gate.
+#[derive(Debug, Clone)]
+pub(crate) enum HostPickerRow {
+    Local,
+    Remote {
+        alias: String,
+        state: tepegoz_proto::HostState,
+        usable: bool,
+    },
+}
+
 /// Stable identity for Fleet selection — the alias is unique per host
 /// list so a single String suffices. Re-anchors across refreshes the
 /// same way Ports/Processes do.
@@ -1079,6 +1143,14 @@ pub(crate) struct App {
     /// (or a second `Ctrl-b ?`) dismisses it. When visible the
     /// overlay absorbs key input and blocks scope/pty routing.
     pub(crate) help_visible: bool,
+    /// Phase 6 Slice 6c-iii: centered host picker modal. `Some`
+    /// when `Ctrl-b t` (or a click on the Docker tile's title bar)
+    /// opened the modal; `None` otherwise. While `Some`, the
+    /// modal absorbs key input and mouse clicks the same way the
+    /// help overlay does: any key other than navigation / Enter /
+    /// Escape / Detach / Help dismisses + falls through; a click
+    /// dismisses the modal (clicks on modal rows commit).
+    pub(crate) host_picker: Option<HostPickerModal>,
     /// Slice 6.0: most-recent mouse-hover tile, used by the tile
     /// renderer to draw a distinct border style on the hovered tile.
     /// `None` means the cursor is outside every tile's Rect (or no
@@ -1135,6 +1207,7 @@ impl App {
             pending_actions: HashMap::new(),
             toasts: VecDeque::new(),
             help_visible: false,
+            host_picker: None,
             hovered_tile: None,
             last_click: None,
             input_filter: InputFilter::new(),
@@ -1253,6 +1326,17 @@ impl App {
             return;
         }
 
+        // Phase 6 Slice 6c-iii: host picker absorbs clicks the same
+        // way the help overlay does. A click anywhere dismisses —
+        // commit is keyboard-driven (Enter). Click-to-commit-row
+        // would require laying out + hit-testing modal rows; the
+        // simpler "click = dismiss, keyboard = navigate/commit"
+        // contract matches 6.0's help overlay precedent.
+        if self.host_picker.is_some() {
+            self.dismiss_host_picker(actions);
+            return;
+        }
+
         let pos = ratatui::layout::Position::new(x, y);
         let Some(tile) = self.view.layout.tiles.iter().find(|t| t.rect.contains(pos)) else {
             return;
@@ -1333,6 +1417,17 @@ impl App {
         let body_y_start = inner.y.saturating_add(1).saturating_add(filter_offset);
         // body_y_end (exclusive): help bar row.
         let body_y_end = inner.y.saturating_add(inner.height).saturating_sub(1);
+
+        // Phase 6 Slice 6c-iii: click on the tile's title bar
+        // (y == rect.y, the border row) opens the host picker on
+        // target-capable tiles (Docker in 6c-iii; 6d extends to
+        // Ports + Processes). The border row is the tile's topmost
+        // row, one row above `inner.y`. Click there on Docker →
+        // open picker. Other tiles / other Y positions fall through.
+        if y == rect.y && matches!(kind, ScopeKind::Docker) {
+            self.open_host_picker(actions);
+            return;
+        }
 
         if y < body_y_start || y >= body_y_end {
             return; // status / filter / help-bar click: focus only.
@@ -1479,6 +1574,44 @@ impl App {
                 continue;
             }
 
+            // Phase 6 Slice 6c-iii: host picker absorbs input while
+            // open. Navigation (arrows / j / k / Home / End) moves
+            // selection; Enter commits; Esc / Ctrl-b t dismisses;
+            // Ctrl-b d always detaches (escape hatch matching the
+            // help overlay contract).
+            if self.host_picker.is_some() {
+                match input_action {
+                    InputAction::Detach => {
+                        actions.push(AppAction::Detach(DetachReason::User));
+                        return;
+                    }
+                    InputAction::OpenHostPicker => {
+                        self.dismiss_host_picker(actions);
+                    }
+                    InputAction::Help => {
+                        // Help trumps picker — close picker + open help.
+                        self.dismiss_host_picker(actions);
+                        self.handle_help_toggle(actions);
+                    }
+                    InputAction::Forward(b) => {
+                        for key in self.scope_key_parser.parse(&b) {
+                            self.handle_host_picker_key(key, actions);
+                            if self.host_picker.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Focus cycle / direction / PaneClose dismiss
+                        // the modal without also triggering the
+                        // underlying action — same logic as help's
+                        // absorption. Keeps the modal predictable.
+                        self.dismiss_host_picker(actions);
+                    }
+                }
+                continue;
+            }
+
             match input_action {
                 InputAction::Forward(b) => self.handle_forward_bytes(b, actions),
                 InputAction::Detach => {
@@ -1489,6 +1622,7 @@ impl App {
                 InputAction::FocusNext => self.handle_tab(true, actions),
                 InputAction::FocusPrev => self.handle_tab(false, actions),
                 InputAction::Help => self.handle_help_toggle(actions),
+                InputAction::OpenHostPicker => self.open_host_picker(actions),
                 InputAction::PaneClose => {
                     if self.view.layout.routes_to_pty(self.view.focused) {
                         self.close_active_pane(actions);
@@ -1592,6 +1726,216 @@ impl App {
     /// surface complete so the dispatch compiles.
     fn handle_help_toggle(&mut self, actions: &mut Vec<AppAction>) {
         self.help_visible = !self.help_visible;
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Build the picker's row list from the current Fleet state. Index
+    /// 0 is always Local; indices 1..=N are each Fleet host in
+    /// discovery order. Called by the render path + by commit /
+    /// navigation key handlers that need to clamp against the row
+    /// count.
+    pub(crate) fn host_picker_rows(&self) -> Vec<HostPickerRow> {
+        let mut rows = vec![HostPickerRow::Local];
+        if let FleetScopeState::Available { hosts, states, .. } = &self.fleet.state {
+            for h in hosts {
+                let state = states
+                    .get(&h.alias)
+                    .copied()
+                    .unwrap_or(tepegoz_proto::HostState::Disconnected);
+                rows.push(HostPickerRow::Remote {
+                    alias: h.alias.clone(),
+                    state,
+                    usable: matches!(state, tepegoz_proto::HostState::Connected),
+                });
+            }
+        }
+        rows
+    }
+
+    /// `Ctrl-b t` (or a click on the target-capable tile's title bar)
+    /// opens the host picker modal. No-op if the focused tile isn't
+    /// target-capable (6c-iii: only Docker); 6d extends to Ports +
+    /// Processes.
+    ///
+    /// Pre-selects the row matching the tile's current target so the
+    /// modal opens with `▶` on "what's active" — the user can
+    /// immediately press Enter to no-op-commit-to-same-target, which
+    /// is sometimes the fastest way to reset the subscription.
+    pub(crate) fn open_host_picker(&mut self, actions: &mut Vec<AppAction>) {
+        let Some(scope) = self.view.layout.routes_to_scope(self.view.focused) else {
+            return;
+        };
+        let (target_tile, required_capability, current_target) = match scope {
+            ScopeKind::Docker => (
+                HostPickerTargetTile::Docker,
+                "docker",
+                self.docker.target.clone(),
+            ),
+            // 6d: add Ports / Processes branches here. Until then
+            // `Ctrl-b t` on the Ports / Fleet / placeholder tiles is
+            // a silent no-op (documented in the help overlay).
+            _ => return,
+        };
+
+        let rows = self.host_picker_rows();
+        let selected = rows
+            .iter()
+            .position(|r| match (r, &current_target) {
+                (HostPickerRow::Local, tepegoz_proto::ScopeTarget::Local) => true,
+                (
+                    HostPickerRow::Remote { alias, .. },
+                    tepegoz_proto::ScopeTarget::Remote { alias: t },
+                ) => alias == t,
+                _ => false,
+            })
+            .unwrap_or(0);
+
+        self.host_picker = Some(HostPickerModal {
+            target_tile,
+            required_capability,
+            selected,
+        });
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Esc / click-outside / Ctrl-b t while open dismisses the picker.
+    pub(crate) fn dismiss_host_picker(&mut self, actions: &mut Vec<AppAction>) {
+        if self.host_picker.take().is_some() {
+            actions.push(AppAction::DrawFrame);
+        }
+    }
+
+    /// Navigation + Enter + Esc dispatch for an open picker. No-op if
+    /// no picker is visible — caller checks beforehand and we return
+    /// rather than panic on stale state.
+    ///
+    /// Mirrors the per-scope `Char(b'j')/Char(b'k') → Down/Up`
+    /// translation the Docker / Ports / Fleet handlers do, so modal
+    /// navigation feels consistent with the tile-focused navigation
+    /// vocabulary the user already knows.
+    pub(crate) fn handle_host_picker_key(&mut self, key: ScopeKey, actions: &mut Vec<AppAction>) {
+        let rows_len = self.host_picker_rows().len();
+        let Some(picker) = &mut self.host_picker else {
+            return;
+        };
+        match key {
+            ScopeKey::Up | ScopeKey::Char(b'k') => {
+                if picker.selected > 0 {
+                    picker.selected -= 1;
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::Down | ScopeKey::Char(b'j') => {
+                if picker.selected + 1 < rows_len {
+                    picker.selected += 1;
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::Home | ScopeKey::Top | ScopeKey::Char(b'g') => {
+                if picker.selected != 0 {
+                    picker.selected = 0;
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::End | ScopeKey::Bottom | ScopeKey::Char(b'G') => {
+                if rows_len > 0 && picker.selected != rows_len - 1 {
+                    picker.selected = rows_len - 1;
+                    actions.push(AppAction::DrawFrame);
+                }
+            }
+            ScopeKey::Enter => {
+                self.commit_host_picker(actions);
+            }
+            ScopeKey::Escape => {
+                self.dismiss_host_picker(actions);
+            }
+            _ => {
+                // Absorb silently — typed letters, etc.
+            }
+        }
+    }
+
+    /// Commit the currently-selected picker row: dispatch a retarget
+    /// against the picker's tile, then close the modal. No-op on a
+    /// greyed-out row (host not in Connected state) — the modal stays
+    /// open so the user can pick again.
+    fn commit_host_picker(&mut self, actions: &mut Vec<AppAction>) {
+        let rows = self.host_picker_rows();
+        let Some(picker) = self.host_picker.as_ref() else {
+            return;
+        };
+        let Some(row) = rows.get(picker.selected) else {
+            self.host_picker = None;
+            actions.push(AppAction::DrawFrame);
+            return;
+        };
+        let target_tile = picker.target_tile;
+        let new_target = match row {
+            HostPickerRow::Local => tepegoz_proto::ScopeTarget::Local,
+            HostPickerRow::Remote {
+                alias,
+                usable: true,
+                ..
+            } => tepegoz_proto::ScopeTarget::Remote {
+                alias: alias.clone(),
+            },
+            HostPickerRow::Remote { usable: false, .. } => {
+                // Greyed-out row — don't commit. Leave the modal open
+                // so the user can pick a different row.
+                return;
+            }
+        };
+        self.host_picker = None;
+        match target_tile {
+            HostPickerTargetTile::Docker => self.retarget_docker(new_target, actions),
+        }
+    }
+
+    /// Apply a new target to the Docker tile: unsubscribe any active
+    /// logs sub, unsubscribe the list sub, reset the view + state to
+    /// Connecting, resubscribe with the new target. No-op if the
+    /// target hasn't changed.
+    ///
+    /// We reset `selection` + `pending_confirm` on retarget because
+    /// they're indexed into a container-list snapshot that's about to
+    /// be replaced from a different host — preserving them across
+    /// retarget would mean "row 3 of old host" stuck on "row 3 of new
+    /// host" with no semantic continuity.
+    fn retarget_docker(
+        &mut self,
+        new_target: tepegoz_proto::ScopeTarget,
+        actions: &mut Vec<AppAction>,
+    ) {
+        if self.docker.target == new_target {
+            actions.push(AppAction::DrawFrame);
+            return;
+        }
+
+        // If in logs view, exit it + unsubscribe the logs sub before
+        // retargeting the list. Otherwise the logs sub lingers bound
+        // to the old target's container id.
+        if let DockerView::Logs(logs) = &self.docker.view {
+            actions.push(AppAction::SendEnvelope(envelope(Payload::Unsubscribe {
+                id: logs.sub_id,
+            })));
+            self.docker.view = DockerView::List;
+        }
+
+        actions.push(AppAction::SendEnvelope(envelope(Payload::Unsubscribe {
+            id: self.docker.sub_id,
+        })));
+
+        self.docker.state = DockerScopeState::Connecting;
+        self.docker.selection = 0;
+        self.docker.pending_confirm = None;
+        self.docker.target = new_target.clone();
+
+        actions.push(AppAction::SendEnvelope(envelope(Payload::Subscribe(
+            Subscription::Docker {
+                id: self.docker.sub_id,
+                target: new_target,
+            },
+        ))));
         actions.push(AppAction::DrawFrame);
     }
 
@@ -5761,5 +6105,362 @@ mod tests {
         }
         assert_eq!(app.view.focused, TileId::Fleet);
         assert_eq!(app.fleet.selection, 0);
+    }
+
+    // ---- Phase 6 Slice 6c-iii: host picker modal + Docker retarget ----
+
+    fn populate_fleet_with_two_hosts(app: &mut App) {
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::HostList {
+                    hosts: vec![
+                        tepegoz_proto::HostEntry {
+                            alias: "alpha".into(),
+                            hostname: "alpha.example".into(),
+                            user: "test".into(),
+                            port: 22,
+                            identity_files: vec![],
+                            proxy_jump: None,
+                        },
+                        tepegoz_proto::HostEntry {
+                            alias: "bravo".into(),
+                            hostname: "bravo.example".into(),
+                            user: "test".into(),
+                            port: 22,
+                            identity_files: vec![],
+                            proxy_jump: None,
+                        },
+                    ],
+                    source: "test".into(),
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+
+        for (alias, state) in [
+            ("alpha", tepegoz_proto::HostState::Connected),
+            ("bravo", tepegoz_proto::HostState::Disconnected),
+        ] {
+            let env = Envelope {
+                version: PROTOCOL_VERSION,
+                payload: Payload::Event(EventFrame {
+                    subscription_id: app.fleet.sub_id,
+                    event: Event::HostStateChanged {
+                        alias: alias.into(),
+                        state,
+                        reason: None,
+                    },
+                }),
+            };
+            app.handle_event(AppEvent::DaemonEnvelope(env));
+        }
+    }
+
+    #[test]
+    fn ctrl_b_t_on_docker_tile_opens_picker_preselected_to_local() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        // Focus Docker.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        assert_eq!(app.view.focused, TileId::Docker);
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        assert!(app.host_picker.is_some(), "Ctrl-b t opens picker");
+        let picker = app.host_picker.as_ref().unwrap();
+        assert_eq!(
+            picker.target_tile,
+            HostPickerTargetTile::Docker,
+            "picker targets Docker tile (current focus)"
+        );
+        assert_eq!(
+            picker.selected, 0,
+            "picker pre-selects current target (Local → row 0)"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_t_with_non_target_tile_focused_is_silent_noop() {
+        let mut app = test_app();
+        // Focus Fleet (not target-capable in 6c-iii). Layout is
+        // PTY on top; Docker / Ports / Fleet across the middle; so
+        // j → Docker, l → Ports, l → Fleet.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        assert_eq!(app.view.focused, TileId::Fleet);
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        assert!(
+            app.host_picker.is_none(),
+            "Ctrl-b t on non-target-capable tile must not open picker"
+        );
+    }
+
+    #[test]
+    fn escape_dismisses_picker_without_changing_target() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec())); // open picker
+        let prev_target = app.docker.target.clone();
+
+        app.handle_event(AppEvent::StdinChunk(b"\x1b".to_vec())); // bare Esc
+        assert!(app.host_picker.is_none(), "Esc dismisses picker");
+        assert_eq!(
+            app.docker.target, prev_target,
+            "Esc doesn't commit a retarget"
+        );
+    }
+
+    #[test]
+    fn picker_navigation_arrows_and_jk_move_selection() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec())); // open picker
+        assert_eq!(app.host_picker.as_ref().unwrap().selected, 0);
+
+        // j → down.
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec()));
+        assert_eq!(app.host_picker.as_ref().unwrap().selected, 1);
+
+        // Arrow down (CSI B).
+        app.handle_event(AppEvent::StdinChunk(b"\x1b[B".to_vec()));
+        assert_eq!(app.host_picker.as_ref().unwrap().selected, 2);
+
+        // k → up.
+        app.handle_event(AppEvent::StdinChunk(b"k".to_vec()));
+        assert_eq!(app.host_picker.as_ref().unwrap().selected, 1);
+
+        // Clamping: down past end doesn't go past last row.
+        app.handle_event(AppEvent::StdinChunk(b"jjjj".to_vec()));
+        assert_eq!(
+            app.host_picker.as_ref().unwrap().selected,
+            2,
+            "clamped at last row (Local + 2 hosts = index 2)"
+        );
+    }
+
+    #[test]
+    fn enter_on_connected_host_commits_retarget_and_reshapes_subs() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec())); // open picker
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec())); // → alpha (connected)
+
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
+        assert!(app.host_picker.is_none(), "Enter dismisses picker");
+        assert_eq!(
+            app.docker.target,
+            tepegoz_proto::ScopeTarget::Remote {
+                alias: "alpha".into()
+            },
+            "target is now Remote{{alpha}}"
+        );
+
+        // Must have sent Unsubscribe(docker_sub_id) + Subscribe(Docker,
+        // target: Remote{alpha}) in that order.
+        let subs: Vec<&AppAction> = actions
+            .iter()
+            .filter(|a| matches!(a, AppAction::SendEnvelope(_)))
+            .collect();
+        assert!(
+            subs.len() >= 2,
+            "retarget must emit at least Unsub + Sub envelopes"
+        );
+        let mut saw_unsub = false;
+        let mut saw_resub = false;
+        for a in &subs {
+            if let AppAction::SendEnvelope(env) = a {
+                match &env.payload {
+                    Payload::Unsubscribe { id } if *id == app.docker.sub_id => saw_unsub = true,
+                    Payload::Subscribe(Subscription::Docker { id, target })
+                        if *id == app.docker.sub_id =>
+                    {
+                        assert_eq!(
+                            *target,
+                            tepegoz_proto::ScopeTarget::Remote {
+                                alias: "alpha".into()
+                            },
+                            "resubscribe must carry the new target"
+                        );
+                        saw_resub = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            saw_unsub && saw_resub,
+            "retarget must emit Unsubscribe(old) + Subscribe(new)"
+        );
+
+        // State resets: Connecting + selection 0 + pending_confirm cleared.
+        assert!(matches!(app.docker.state, DockerScopeState::Connecting));
+        assert_eq!(app.docker.selection, 0);
+        assert!(app.docker.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn enter_on_greyed_out_host_is_noop_picker_stays_open() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec())); // focus Docker
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec())); // open picker
+        // Navigate to bravo (row 2, Disconnected → greyed-out).
+        app.handle_event(AppEvent::StdinChunk(b"jj".to_vec()));
+        assert_eq!(app.host_picker.as_ref().unwrap().selected, 2);
+
+        let prev_target = app.docker.target.clone();
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
+        assert!(
+            app.host_picker.is_some(),
+            "Enter on greyed row must leave picker open for another choice"
+        );
+        assert_eq!(
+            app.docker.target, prev_target,
+            "Enter on greyed row must not commit a retarget"
+        );
+        let wire_actions = actions
+            .iter()
+            .filter(|a| matches!(a, AppAction::SendEnvelope(_)))
+            .count();
+        assert_eq!(
+            wire_actions, 0,
+            "Enter on greyed row sends no Subscribe / Unsubscribe envelopes"
+        );
+    }
+
+    #[test]
+    fn click_on_docker_title_bar_opens_picker() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        let rect = app.view.layout.rect_of(TileId::Docker).unwrap();
+
+        // Docker tile top-border row = rect.y. Click anywhere on it.
+        let actions = app.handle_event(AppEvent::MouseClick {
+            x: rect.x + 2,
+            y: rect.y,
+        });
+        assert!(
+            app.host_picker.is_some(),
+            "click on Docker title bar opens picker"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, AppAction::DrawFrame)),
+            "retarget open emits DrawFrame"
+        );
+    }
+
+    #[test]
+    fn click_while_picker_visible_dismisses_it() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        assert!(app.host_picker.is_some());
+
+        // Any click dismisses — same gesture as help overlay.
+        app.handle_event(AppEvent::MouseClick { x: 5, y: 5 });
+        assert!(
+            app.host_picker.is_none(),
+            "click while picker open must dismiss"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_t_while_picker_open_dismisses_it() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        assert!(app.host_picker.is_some());
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        assert!(
+            app.host_picker.is_none(),
+            "second Ctrl-b t must dismiss the open picker (toggle semantics)"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_d_while_picker_open_detaches_escape_hatch() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\x02d".to_vec()));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, AppAction::Detach(DetachReason::User))),
+            "Ctrl-b d is escape hatch — detaches even from picker"
+        );
+    }
+
+    #[test]
+    fn retarget_to_same_target_is_noop_no_envelopes() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        // selected=0 is Local; current target is Local; pressing Enter
+        // should commit to the same target — no Unsubscribe/Subscribe
+        // should fire.
+        assert_eq!(app.docker.target, tepegoz_proto::ScopeTarget::Local);
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
+        assert!(app.host_picker.is_none(), "picker dismissed");
+        let wire_actions = actions
+            .iter()
+            .filter(|a| matches!(a, AppAction::SendEnvelope(_)))
+            .count();
+        assert_eq!(
+            wire_actions, 0,
+            "same-target commit sends no envelopes (noop shortcut in retarget_docker)"
+        );
+    }
+
+    #[test]
+    fn retarget_from_logs_view_exits_logs_and_unsubscribes_both_subs() {
+        let mut app = test_app();
+        populate_fleet_with_two_hosts(&mut app);
+        populate_docker_and_focus(&mut app, vec![make_container("c1", "img", "running")]);
+        // Enter logs view on c1.
+        app.handle_event(AppEvent::StdinChunk(b"l".to_vec()));
+        let logs_sub = match &app.docker.view {
+            DockerView::Logs(l) => l.sub_id,
+            _ => panic!("expected Logs view after pressing l"),
+        };
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec())); // open picker
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec())); // → alpha
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
+
+        assert!(
+            matches!(app.docker.view, DockerView::List),
+            "retarget must exit Logs view"
+        );
+        let unsub_ids: Vec<u64> = actions
+            .iter()
+            .filter_map(|a| match a {
+                AppAction::SendEnvelope(e) => match e.payload {
+                    Payload::Unsubscribe { id } => Some(id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unsub_ids.contains(&logs_sub),
+            "retarget must unsubscribe the logs sub ({logs_sub})"
+        );
+        assert!(
+            unsub_ids.contains(&app.docker.sub_id),
+            "retarget must unsubscribe the list sub"
+        );
     }
 }

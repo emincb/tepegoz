@@ -21,6 +21,7 @@ use std::path::PathBuf;
 mod app;
 mod config;
 mod help;
+mod host_picker;
 mod input;
 mod mouse;
 mod pty_tile;

@@ -40,16 +40,21 @@ Terminal 2 (TUI, from any directory — shell will spawn with that as cwd):
 # reattach with another `./target/debug/tepegoz tui` — scrollback replays
 ```
 
-The TUI keyboard surface (Slice 6.0) is five bindings plus mouse:
+The TUI keyboard surface (Slice 6.0 + 6c-iii) is six bindings plus mouse:
 - `Tab` / `Shift-Tab` — cycle tile focus
 - arrow keys / `j` / `k` — navigate rows inside the focused scope
 - `Enter` — primary action on the selected row (Fleet → open remote pane)
-- `Esc` — cancel / back (clears filter, exits logs view, dismisses help)
+- `Esc` — cancel / back (clears filter, exits logs view, dismisses help + host picker)
 - `Ctrl-b d` — detach
+- `Ctrl-b t` — open the host picker on target-capable tiles (Docker in 6c-iii;
+  Ports + Processes in 6d). Use arrows/`j`/`k` + Enter to commit a retarget,
+  or Esc to cancel. Greyed-out rows are hosts that aren't currently reachable —
+  selectable but not committable.
 - `Ctrl-b ?` — toggle the in-TUI help overlay (authoritative reference)
-- mouse — click to focus tile + select row; click a tab to switch panes;
-  click the `[×]` affordance next to the tab strip to close the active pane;
-  double-click a Fleet row to open a remote pane
+- mouse — click to focus tile + select row; click the Docker tile title bar to
+  open the host picker; click a tab to switch panes; click the `[×]` affordance
+  next to the tab strip to close the active pane; double-click a Fleet row to
+  open a remote pane
 
 Useful flags:
 - `--socket /path/to/sock` — override daemon's socket path; TUI must match
@@ -827,6 +832,41 @@ Slice 6b turns the 6a-embedded agent binaries into something you can actually ru
 **Known limitations** (`docs/ISSUES.md`):
 - Protocol version bumps leave orphaned `agent-v<N-1>` binaries on remote hosts (~1 MB each). Not a correctness issue; Phase 6 close or v1.1 will add a cleanup helper.
 - Universal macOS `lipo` deferred to the Phase 10 release pipeline (requires Xcode tooling not guaranteed on dev/CI boxes). Controllers embed two separate darwin binaries for now.
+
+## Remote Docker scope (Phase 6 Slice 6c)
+
+Slice 6c delivers the first user-visible remote scope: the TUI's Docker tile can route its container list + logs + stats + actions through any Fleet host's deployed agent instead of the daemon's local docker engine.
+
+**Retarget flow** (keyboard):
+
+1. Focus the Docker tile (`Tab` or click).
+2. `Ctrl-b t` — opens the centered host picker modal.
+3. Arrows / `j` / `k` — navigate rows. Local is always first; Fleet hosts follow in discovery order.
+4. `Enter` — commit. Greyed-out rows (host not in `Connected` state) are no-ops; the modal stays open so you can pick a reachable host or reach remediation via the Fleet tile + `Ctrl-b r`.
+5. `Esc` — dismiss without changing the target.
+
+**Retarget flow** (mouse): click anywhere on the Docker tile's title bar to open the picker. Any click outside the modal dismisses it; commit is keyboard-driven (`Enter`).
+
+**Tile title suffix**: the Docker tile title now reads `docker · local` or `docker · <alias>`, making the current target visible at a glance. Logs view titles read `docker · logs · <container> · <target>`.
+
+**Error surfaces**: a remote target that's unreachable at subscribe time (agent not deployed, agent lacks docker capability, writer channel dropped) surfaces as `Event::DockerUnavailable { reason }` — the same shape the TUI already shows when the local docker engine is down. The reason string identifies the alias + diagnosis. No separate UX path for "remote failed" vs "local failed".
+
+```sh
+# Demo: deploy an agent + subscribe Docker remotely end-to-end
+cargo xtask demo-phase-6 up --remote
+# Expect (after handshake):
+#   [demo-phase-6] subscribed Docker on the agent; awaiting first event…
+#
+#     remote Docker subscribe ✓ (DockerUnavailable path)
+#       event:       DockerUnavailable
+#       reason:      docker engine unavailable: …
+#       note:        bind-mount /var/run/docker.sock into the sshd
+#                    container (and add tepegoz to the docker group)
+#                    for a ContainerList.
+cargo xtask demo-phase-6 down --remote
+```
+
+**Out of scope for 6c**: host aggregation ("show all hosts' Docker at once" — v1.1 polish). Retarget for the Ports + Processes tiles (6d — same `Ctrl-b t` + modal, reused as-is with a different capability string).
 
 ## SSH Fleet discovery (Phase 5 Slice 5b)
 
