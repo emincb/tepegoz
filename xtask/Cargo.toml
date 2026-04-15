@@ -15,3 +15,11 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }
+# Workspace-internal: share the daemon's default-socket-path resolution
+# so the demo's readiness check matches what `tepegoz tui` looks for
+# when the user connects in a new terminal.
+tepegoz-proto = { workspace = true }
+# Tiny pure-Rust SIGINT handler. std doesn't cover cross-platform
+# signal handling cleanly, so this is the minimum new dependency
+# needed to gracefully tear the demo fixture down on Ctrl-C.
+ctrlc = { version = "3", features = ["termination"] }

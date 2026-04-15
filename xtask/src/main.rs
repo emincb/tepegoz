@@ -1,6 +1,9 @@
-//! Custom cargo tasks for Tepegöz: agent cross-compile, packaging, release.
+//! Custom cargo tasks for Tepegöz: agent cross-compile, packaging,
+//! release, and the per-phase manual-demo runners.
 
 use clap::{Parser, Subcommand};
+
+mod demo;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "Tepegöz build tasks")]
@@ -15,6 +18,25 @@ enum Command {
     BuildAgents,
     /// Package release artifacts with checksums and minisign signatures.
     Package,
+    /// One-command runner for the Phase 5 Slice 5e manual demo.
+    ///
+    /// `up` provisions an sshd container + throwaway tepegoz config +
+    /// keypair, builds the workspace, spawns the daemon against isolated
+    /// config/data dirs, waits for readiness, then blocks on Ctrl-C.
+    /// `down` tears it all back down (idempotent).
+    #[command(name = "demo-phase-5")]
+    DemoPhase5 {
+        #[command(subcommand)]
+        action: DemoAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DemoAction {
+    /// Bring the demo fixture up and wait for Ctrl-C.
+    Up,
+    /// Tear the demo fixture down (idempotent).
+    Down,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -26,6 +48,10 @@ fn main() -> anyhow::Result<()> {
         Command::Package => {
             println!("xtask package: not yet implemented");
         }
+        Command::DemoPhase5 { action } => match action {
+            DemoAction::Up => demo::up()?,
+            DemoAction::Down => demo::down()?,
+        },
     }
     Ok(())
 }
