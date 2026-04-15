@@ -157,14 +157,24 @@ fn preflight() -> Result<()> {
 }
 
 fn ensure_on_path(binary: &str, hint: &str) -> Result<()> {
-    let status = Command::new(binary)
+    // Spawnability check — not an exit-code check. macOS ssh-keygen
+    // is OpenBSD-derived and rejects `--version` with a non-zero
+    // exit + usage dump; the original preflight flagged a correctly
+    // installed ssh-keygen as missing on every macOS run. `Command::
+    // status()` only returns `Err(NotFound)` when the binary isn't
+    // on PATH at all; any non-zero exit still lands in `Ok(_)` and
+    // proves the binary exists.
+    let result = Command::new(binary)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        _ => bail!("`{binary}` not found on PATH. {hint}"),
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("`{binary}` not found on PATH. {hint}")
+        }
+        Err(e) => bail!("failed to probe `{binary}`: {e}. {hint}"),
     }
 }
 
