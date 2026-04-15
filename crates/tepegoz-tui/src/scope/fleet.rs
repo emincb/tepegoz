@@ -27,6 +27,26 @@ use tepegoz_proto::{HostEntry, HostState};
 
 use crate::app::{FleetScope, FleetScopeState};
 
+/// Width reserved for every status-bar span OTHER than the source
+/// string, in the "source fits without truncation" branch. Counts
+/// roughly: `"X/Y hosts"` (≤11 chars for ≤99 hosts), the `"  "`
+/// separator (2), the `"source: "` prefix (8), and the
+/// `" procs: — (Phase 6)"` placeholder (19) — plus a small slack so
+/// a normal-width source has room to breathe instead of jumping to
+/// truncation at 1-char overages.
+const STATUS_BAR_NON_SOURCE_COMFORT: usize = 24;
+
+/// Same role in the truncation branch; slightly more conservative so
+/// the leading `…` still fits without pushing the procs hint off the
+/// right edge of the tile.
+const STATUS_BAR_NON_SOURCE_TRUNCATE: usize = 30;
+
+/// Hard floor on the visible source slice: if the truncation budget
+/// computes to less than this (tile narrower than the non-source
+/// overhead), fall back to a first-N-char prefix rather than an
+/// empty source field.
+const SOURCE_MIN_CHARS: usize = 8;
+
 pub(crate) fn render(scope: &FleetScope, frame: &mut Frame<'_>, area: Rect, focused: bool) {
     let border_color = if focused {
         Color::Cyan
@@ -173,12 +193,12 @@ fn render_status_bar(
 }
 
 fn short_source(s: &str, max: usize) -> String {
-    if s.len() <= max.saturating_sub(24) {
+    if s.len() <= max.saturating_sub(STATUS_BAR_NON_SOURCE_COMFORT) {
         return s.to_string();
     }
-    let budget = max.saturating_sub(30);
-    if budget < 8 {
-        return s.chars().take(8).collect();
+    let budget = max.saturating_sub(STATUS_BAR_NON_SOURCE_TRUNCATE);
+    if budget < SOURCE_MIN_CHARS {
+        return s.chars().take(SOURCE_MIN_CHARS).collect();
     }
     format!("…{}", &s[s.len().saturating_sub(budget)..])
 }

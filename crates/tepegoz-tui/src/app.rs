@@ -2035,12 +2035,24 @@ impl App {
                 self.handle_pane_opened(info, actions);
             }
             Payload::Error(info) => {
-                // If an `OpenPane` is in flight, attribute the Error
-                // to the head of the FIFO (daemon processes commands
-                // serially, so a failed Open is the next envelope
-                // after the request). Falls through to a generic
-                // daemon-error toast when no open is pending.
-                if let Some(pending) = self.pending_opens.pop_front() {
+                // FIFO correlation to an in-flight `OpenPane`: consume
+                // the head of `pending_opens` ONLY when the daemon's
+                // error message literally starts with one of the
+                // OpenPane failure-path prefixes. Without this guard,
+                // an unrelated Error (SendInput against an unknown
+                // pane, AttachPane race with ClosePane) would
+                // mis-consume a later OpenPane's slot while human-
+                // paced interaction is typing through the pipe. The
+                // prefixes are defined by the daemon at
+                // `tepegoz-core::client`'s open-pane arms:
+                //   `"open pane: ..."` (local failure)
+                //   `"open remote pane (<alias>): ..."` (remote failure)
+                // A proper fix lands in Phase 6 when the wire bump
+                // for agent-backed panes adds per-request ids to
+                // `OpenPane` (`docs/ISSUES.md#fifo-openpane-correlation-edge`).
+                let is_open_failure = info.message.starts_with("open pane")
+                    || info.message.starts_with("open remote pane");
+                if is_open_failure && let Some(pending) = self.pending_opens.pop_front() {
                     let alias = pending.alias.as_deref().unwrap_or("local");
                     let message = format!("open pane {alias} failed: {}", info.message);
                     self.push_toast(ToastKind::Error, message, actions);
@@ -4914,12 +4926,14 @@ mod tests {
         app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
         assert_eq!(app.pending_opens.len(), 1);
 
-        // Daemon replies Error instead of PaneOpened.
+        // Daemon replies Error with the OpenPane failure-path prefix
+        // (mirrors `tepegoz-core::client`'s
+        // `error_envelope(..., "open remote pane ({alias}): {e}")`).
         let env = Envelope {
             version: PROTOCOL_VERSION,
             payload: Payload::Error(ErrorInfo {
                 kind: ErrorKind::Internal,
-                message: "ssh dial failed: connection refused".into(),
+                message: "open remote pane (staging): ssh dial failed: connection refused".into(),
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
@@ -4937,6 +4951,52 @@ mod tests {
         assert!(
             error_toast,
             "Error during pending open surfaces as failure toast; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_error_while_open_pending_does_not_consume_fifo() {
+        // The FIFO consume must guard on the daemon's OpenPane
+        // failure-path prefixes (`open pane` / `open remote pane`).
+        // Without it, a SendInput-against-unknown-pane error (or any
+        // other stray Error) would mis-attribute to the next pending
+        // OpenPane and confuse the user with a red toast about the
+        // wrong alias. Pinned so future refactors of the dispatcher
+        // don't quietly regress the guard.
+        let mut app = test_app();
+        fleet_with_hosts(&mut app, &["staging"]);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02\r".to_vec()));
+        assert_eq!(app.pending_opens.len(), 1);
+
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Error(ErrorInfo {
+                kind: ErrorKind::UnknownPane,
+                message: "send input: unknown pane 123".into(),
+            }),
+        };
+        let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
+        assert_eq!(
+            app.pending_opens.len(),
+            1,
+            "unrelated Error must NOT consume the FIFO entry"
+        );
+        // Generic daemon-error toast still surfaces so the user sees it.
+        let generic_toast = actions.iter().any(|a| {
+            matches!(
+                a,
+                AppAction::ShowToast {
+                    kind: ToastKind::Error,
+                    message,
+                } if message.contains("daemon error") && message.contains("unknown pane")
+            )
+        });
+        assert!(
+            generic_toast,
+            "Unrelated Error still toasted as generic daemon error; got {actions:?}"
         );
     }
 

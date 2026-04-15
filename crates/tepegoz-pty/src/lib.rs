@@ -84,6 +84,19 @@ impl PtyManager {
         // child's environment as `TEPEGOZ_PANE_ID`. Clients use that var
         // to refuse a recursive `tepegoz tui` inside an existing pane.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Phase 5 Slice 5d-i introduced a parallel `RemotePaneManager`
+        // whose allocator starts at `1 << 32`, so local (1+) and
+        // remote (1<<32+) pane ids are disjoint by construction as
+        // long as the local allocator never reaches 4 billion panes.
+        // Cheap dev-build tripwire — if a workload ever gets close,
+        // the assertion fires long before we'd silently collide with
+        // a remote pane id.
+        debug_assert!(
+            id < (1u64 << 32),
+            "local PaneId allocator exhausted the 32-bit range — \
+             would collide with tepegoz-core's RemotePaneManager \
+             namespace; see crates/tepegoz-core/src/remote_pane.rs"
+        );
 
         let pty_system = NativePtySystem::default();
         let pair = pty_system.openpty(size)?;
