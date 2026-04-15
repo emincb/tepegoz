@@ -541,6 +541,14 @@ pub(crate) struct PortsScope {
     /// Subscription id for `Subscribe(Processes)`. Also allocated at
     /// `App::new`; both subs live concurrently.
     pub(crate) processes_sub_id: u64,
+    /// Phase 6 Slice 6d-ii: current target for the Ports subscription.
+    /// Mirrors the Docker tile's `target` field — both views in this
+    /// tile retarget independently (a user can have local Ports +
+    /// remote Processes simultaneously) so we keep two fields.
+    pub(crate) ports_target: tepegoz_proto::ScopeTarget,
+    /// Phase 6 Slice 6d-ii: current target for the Processes
+    /// subscription. See `ports_target` for rationale.
+    pub(crate) processes_target: tepegoz_proto::ScopeTarget,
 }
 
 /// Which view the Ports tile currently renders.
@@ -654,6 +662,8 @@ impl PortsScope {
             active: PortsActiveView::Ports,
             ports_sub_id,
             processes_sub_id,
+            ports_target: tepegoz_proto::ScopeTarget::Local,
+            processes_target: tepegoz_proto::ScopeTarget::Local,
         }
     }
 }
@@ -831,17 +841,22 @@ pub(crate) struct HostPickerModal {
     pub(crate) selected: usize,
 }
 
-/// Which tile owns the retarget dispatch. 6c-iii only supports Docker;
-/// 6d extends to Ports + Processes reusing this modal unchanged.
+/// Which tile owns the retarget dispatch. 6c-iii shipped Docker; 6d-ii
+/// adds Ports + Processes reusing this modal unchanged via the
+/// `required_capability` parameter — `"ports"` / `"processes"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostPickerTargetTile {
     Docker,
+    Ports,
+    Processes,
 }
 
 impl HostPickerModal {
     pub(crate) fn target_tile_label(&self) -> &'static str {
         match self.target_tile {
             HostPickerTargetTile::Docker => "docker",
+            HostPickerTargetTile::Ports => "ports",
+            HostPickerTargetTile::Processes => "processes",
         }
     }
 }
@@ -1269,11 +1284,11 @@ impl App {
             }))),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Ports {
                 id: self.ports.ports_sub_id,
-                target: tepegoz_proto::ScopeTarget::Local,
+                target: self.ports.ports_target.clone(),
             }))),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Processes {
                 id: self.ports.processes_sub_id,
-                target: tepegoz_proto::ScopeTarget::Local,
+                target: self.ports.processes_target.clone(),
             }))),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Fleet {
                 id: self.fleet.sub_id,
@@ -1430,13 +1445,13 @@ impl App {
         // body_y_end (exclusive): help bar row.
         let body_y_end = inner.y.saturating_add(inner.height).saturating_sub(1);
 
-        // Phase 6 Slice 6c-iii: click on the tile's title bar
-        // (y == rect.y, the border row) opens the host picker on
-        // target-capable tiles (Docker in 6c-iii; 6d extends to
-        // Ports + Processes). The border row is the tile's topmost
-        // row, one row above `inner.y`. Click there on Docker →
-        // open picker. Other tiles / other Y positions fall through.
-        if y == rect.y && matches!(kind, ScopeKind::Docker) {
+        // Phase 6 Slice 6c-iii / 6d-ii: click on the tile's title
+        // bar (y == rect.y, the border row) opens the host picker on
+        // target-capable tiles. 6c-iii shipped Docker; 6d-ii adds
+        // Ports (which retargets whichever view is active — Ports
+        // or Processes). Other tiles / other Y positions fall
+        // through to the standard scope-row dispatch.
+        if y == rect.y && matches!(kind, ScopeKind::Docker | ScopeKind::Ports) {
             self.open_host_picker(actions);
             return;
         }
@@ -1782,8 +1797,14 @@ impl App {
 
     /// `Ctrl-b t` (or a click on the target-capable tile's title bar)
     /// opens the host picker modal. No-op if the focused tile isn't
-    /// target-capable (6c-iii: only Docker); 6d extends to Ports +
-    /// Processes.
+    /// target-capable. 6c-iii shipped Docker; 6d-ii adds Ports +
+    /// Processes — both reuse the same modal with their own
+    /// required-capability string.
+    ///
+    /// Ports tile is dual-view (Ports + Processes via `p` toggle); the
+    /// picker targets whichever view is currently active so a user
+    /// reading processes can `Ctrl-b t` to retarget processes
+    /// without having to think about the toggle state.
     ///
     /// Pre-selects the row matching the tile's current target so the
     /// modal opens with `▶` on "what's active" — the user can
@@ -1799,9 +1820,19 @@ impl App {
                 "docker",
                 self.docker.target.clone(),
             ),
-            // 6d: add Ports / Processes branches here. Until then
-            // `Ctrl-b t` on the Ports / Fleet / placeholder tiles is
-            // a silent no-op (documented in the help overlay).
+            ScopeKind::Ports => match self.ports.active {
+                PortsActiveView::Ports => (
+                    HostPickerTargetTile::Ports,
+                    "ports",
+                    self.ports.ports_target.clone(),
+                ),
+                PortsActiveView::Processes => (
+                    HostPickerTargetTile::Processes,
+                    "processes",
+                    self.ports.processes_target.clone(),
+                ),
+            },
+            // Fleet / placeholder tiles aren't target-capable.
             _ => return,
         };
 
@@ -1926,6 +1957,8 @@ impl App {
         self.host_picker = None;
         match target_tile {
             HostPickerTargetTile::Docker => self.retarget_docker(new_target, actions),
+            HostPickerTargetTile::Ports => self.retarget_ports(new_target, actions),
+            HostPickerTargetTile::Processes => self.retarget_processes(new_target, actions),
         }
     }
 
@@ -1971,6 +2004,61 @@ impl App {
         actions.push(AppAction::SendEnvelope(envelope(Payload::Subscribe(
             Subscription::Docker {
                 id: self.docker.sub_id,
+                target: new_target,
+            },
+        ))));
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Phase 6 Slice 6d-ii: apply a new target to the Ports view.
+    /// Same shape as `retarget_docker`: unsub old, reset state to
+    /// Connecting + selection 0, resub with new target. Same-target
+    /// commit is a no-op. Independent of the Processes view's target.
+    fn retarget_ports(
+        &mut self,
+        new_target: tepegoz_proto::ScopeTarget,
+        actions: &mut Vec<AppAction>,
+    ) {
+        if self.ports.ports_target == new_target {
+            actions.push(AppAction::DrawFrame);
+            return;
+        }
+        actions.push(AppAction::SendEnvelope(envelope(Payload::Unsubscribe {
+            id: self.ports.ports_sub_id,
+        })));
+        self.ports.ports.state = PortsViewState::Connecting;
+        self.ports.ports.selection = 0;
+        self.ports.ports_target = new_target.clone();
+        actions.push(AppAction::SendEnvelope(envelope(Payload::Subscribe(
+            Subscription::Ports {
+                id: self.ports.ports_sub_id,
+                target: new_target,
+            },
+        ))));
+        actions.push(AppAction::DrawFrame);
+    }
+
+    /// Phase 6 Slice 6d-ii: apply a new target to the Processes view.
+    /// Mirrors `retarget_ports`. Independent of the Ports view's
+    /// target.
+    fn retarget_processes(
+        &mut self,
+        new_target: tepegoz_proto::ScopeTarget,
+        actions: &mut Vec<AppAction>,
+    ) {
+        if self.ports.processes_target == new_target {
+            actions.push(AppAction::DrawFrame);
+            return;
+        }
+        actions.push(AppAction::SendEnvelope(envelope(Payload::Unsubscribe {
+            id: self.ports.processes_sub_id,
+        })));
+        self.ports.processes.state = ProcessesViewState::Connecting;
+        self.ports.processes.selection = 0;
+        self.ports.processes_target = new_target.clone();
+        actions.push(AppAction::SendEnvelope(envelope(Payload::Subscribe(
+            Subscription::Processes {
+                id: self.ports.processes_sub_id,
                 target: new_target,
             },
         ))));
@@ -6688,6 +6776,153 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ---- Phase 6 Slice 6d-ii: Ports/Processes retarget reuse ----
+
+    fn populate_fleet_with_ports_processes_caps(app: &mut App) {
+        populate_fleet_with_two_hosts(app);
+        // Add ports + processes to alpha's capability list (it
+        // already has docker from populate_fleet_with_two_hosts).
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Event(EventFrame {
+                subscription_id: app.fleet.sub_id,
+                event: Event::AgentCapabilities {
+                    alias: "alpha".into(),
+                    capabilities: vec!["docker".into(), "ports".into(), "processes".into()],
+                },
+            }),
+        };
+        app.handle_event(AppEvent::DaemonEnvelope(env));
+    }
+
+    #[test]
+    fn ctrl_b_t_on_ports_view_opens_picker_with_ports_capability() {
+        let mut app = test_app();
+        populate_fleet_with_ports_processes_caps(&mut app);
+        // Focus PTY → Docker → Ports. PTY default → j → Docker → l → Ports.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        assert_eq!(app.view.focused, TileId::Ports);
+        // Default Ports view is the Ports view (not Processes).
+        assert!(matches!(app.ports.active, PortsActiveView::Ports));
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        let picker = app.host_picker.as_ref().expect("picker opened");
+        assert_eq!(picker.target_tile, HostPickerTargetTile::Ports);
+        assert_eq!(picker.required_capability, "ports");
+    }
+
+    #[test]
+    fn ctrl_b_t_on_processes_view_uses_processes_capability() {
+        let mut app = test_app();
+        populate_fleet_with_ports_processes_caps(&mut app);
+        // Focus Ports tile and toggle to Processes view.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"p".to_vec())); // toggle
+        assert!(matches!(app.ports.active, PortsActiveView::Processes));
+
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        let picker = app.host_picker.as_ref().expect("picker opened");
+        assert_eq!(picker.target_tile, HostPickerTargetTile::Processes);
+        assert_eq!(picker.required_capability, "processes");
+    }
+
+    #[test]
+    fn enter_commits_ports_retarget_and_resubscribes() {
+        let mut app = test_app();
+        populate_fleet_with_ports_processes_caps(&mut app);
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec())); // focus Ports
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec())); // open picker
+        app.handle_event(AppEvent::StdinChunk(b"j".to_vec())); // → alpha
+
+        let actions = app.handle_event(AppEvent::StdinChunk(b"\r".to_vec()));
+        assert_eq!(
+            app.ports.ports_target,
+            tepegoz_proto::ScopeTarget::Remote {
+                alias: "alpha".into()
+            }
+        );
+        // Processes target unchanged — independent retargets.
+        assert_eq!(
+            app.ports.processes_target,
+            tepegoz_proto::ScopeTarget::Local
+        );
+
+        let mut saw_unsub = false;
+        let mut saw_resub = false;
+        for a in &actions {
+            if let AppAction::SendEnvelope(env) = a {
+                match &env.payload {
+                    Payload::Unsubscribe { id } if *id == app.ports.ports_sub_id => {
+                        saw_unsub = true;
+                    }
+                    Payload::Subscribe(Subscription::Ports { id, target })
+                        if *id == app.ports.ports_sub_id =>
+                    {
+                        assert_eq!(
+                            *target,
+                            tepegoz_proto::ScopeTarget::Remote {
+                                alias: "alpha".into()
+                            }
+                        );
+                        saw_resub = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_unsub && saw_resub);
+    }
+
+    #[test]
+    fn ports_and_processes_targets_are_independent() {
+        // Retarget Ports to alpha, retarget Processes to local
+        // (separately) — neither should affect the other's target
+        // field. This locks the "two independent fields" design.
+        let mut app = test_app();
+        populate_fleet_with_ports_processes_caps(&mut app);
+
+        // Retarget Ports → alpha.
+        app.handle_event(AppEvent::StdinChunk(b"\x02j".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02l".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"j\r".to_vec()));
+
+        assert_eq!(
+            app.ports.ports_target,
+            tepegoz_proto::ScopeTarget::Remote {
+                alias: "alpha".into()
+            }
+        );
+        assert_eq!(
+            app.ports.processes_target,
+            tepegoz_proto::ScopeTarget::Local
+        );
+
+        // Toggle to Processes view + retarget Processes → alpha too.
+        app.handle_event(AppEvent::StdinChunk(b"p".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"\x02t".to_vec()));
+        app.handle_event(AppEvent::StdinChunk(b"j\r".to_vec()));
+
+        assert_eq!(
+            app.ports.processes_target,
+            tepegoz_proto::ScopeTarget::Remote {
+                alias: "alpha".into()
+            }
+        );
+        // Ports target still Remote{alpha} from the first retarget.
+        assert_eq!(
+            app.ports.ports_target,
+            tepegoz_proto::ScopeTarget::Remote {
+                alias: "alpha".into()
+            }
+        );
+        // Docker target still Local (untouched by Ports/Processes retargets).
+        assert_eq!(app.docker.target, tepegoz_proto::ScopeTarget::Local);
     }
 
     #[test]

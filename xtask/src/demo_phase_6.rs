@@ -278,8 +278,15 @@ async fn drive_remote_deploy(paths: &RemotePaths, port: u16, agent_bin: &Path) -
     // `DockerUnavailable` — either path proves the round-trip.
     drive_remote_docker_subscribe(&mut channel).await?;
 
+    // Phase 6 Slice 6d-ii: same shape for Ports + Processes — the
+    // agent always advertises both capabilities on supported
+    // platforms, so these arms emit real `PortList` / `ProcessList`
+    // events from the remote host.
+    drive_remote_ports_subscribe(&mut channel).await?;
+    drive_remote_processes_subscribe(&mut channel).await?;
+
     let _ = session.disconnect().await;
-    println!("[demo-phase-6] remote deploy + handshake + Docker sub complete.");
+    println!("[demo-phase-6] remote deploy + handshake + Docker/Ports/Processes subs complete.");
     println!(
         "[demo-phase-6] fixture left running; tear down with `cargo xtask demo-phase-6 down --remote`."
     );
@@ -383,6 +390,170 @@ async fn drive_remote_docker_subscribe(channel: &mut tepegoz_ssh::SshChannel) ->
         other => {
             anyhow::bail!("expected Event envelope, got {other:?}");
         }
+    }
+    Ok(())
+}
+
+/// Phase 6 Slice 6d-ii: drive a one-shot `Subscribe(Ports)` against
+/// the agent + print the first event. Same shape as
+/// `drive_remote_docker_subscribe`.
+async fn drive_remote_ports_subscribe(channel: &mut tepegoz_ssh::SshChannel) -> Result<()> {
+    use tepegoz_proto::{
+        Envelope, Event, EventFrame, PROTOCOL_VERSION, Payload, ScopeTarget, Subscription,
+        codec::read_envelope,
+    };
+
+    let sub_id: u64 = 525252;
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Subscribe(Subscription::Ports {
+            id: sub_id,
+            target: ScopeTarget::Local,
+        }),
+    };
+    let body = rkyv::to_bytes::<rkyv::rancor::Error>(&env)
+        .map_err(|e| anyhow::anyhow!("serialize Subscribe(Ports): {e}"))?;
+    let len = u32::try_from(body.len())
+        .map_err(|_| anyhow::anyhow!("Subscribe envelope too large: {}", body.len()))?;
+
+    let inner = channel.channel_mut();
+    inner
+        .data(len.to_be_bytes().to_vec().as_slice())
+        .await
+        .map_err(|e| anyhow::anyhow!("write length prefix: {e}"))?;
+    inner
+        .data(body.as_ref())
+        .await
+        .map_err(|e| anyhow::anyhow!("write body: {e}"))?;
+
+    println!("[demo-phase-6] subscribed Ports on the agent; awaiting first event…");
+    let mut reader = inner.make_reader();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_envelope(&mut reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("agent didn't respond to Subscribe(Ports) within 10s"))?
+    .map_err(|e| anyhow::anyhow!("read Event: {e}"))?;
+
+    match response.payload {
+        Payload::Event(EventFrame {
+            subscription_id,
+            event,
+        }) => {
+            assert_eq!(subscription_id, sub_id);
+            match event {
+                Event::PortList { ports, source } => {
+                    println!();
+                    println!("  remote Ports subscribe ✓");
+                    println!("    event:       PortList");
+                    println!("    ports:       {}", ports.len());
+                    println!("    source:      {source}");
+                    for p in ports.iter().take(3) {
+                        println!(
+                            "      - {}/{}  pid={} {}",
+                            p.protocol, p.local_port, p.pid, p.process_name
+                        );
+                    }
+                    if ports.len() > 3 {
+                        println!("      … (+{} more)", ports.len() - 3);
+                    }
+                    println!();
+                }
+                Event::PortsUnavailable { reason } => {
+                    println!();
+                    println!("  remote Ports subscribe ✓ (PortsUnavailable path)");
+                    println!("    reason:      {reason}");
+                    println!();
+                }
+                other => {
+                    anyhow::bail!("expected PortList or PortsUnavailable, got {other:?}");
+                }
+            }
+        }
+        other => anyhow::bail!("expected Event envelope, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// Phase 6 Slice 6d-ii: drive a one-shot `Subscribe(Processes)`
+/// against the agent + print the first event. Same shape as
+/// `drive_remote_ports_subscribe`.
+async fn drive_remote_processes_subscribe(channel: &mut tepegoz_ssh::SshChannel) -> Result<()> {
+    use tepegoz_proto::{
+        Envelope, Event, EventFrame, PROTOCOL_VERSION, Payload, ScopeTarget, Subscription,
+        codec::read_envelope,
+    };
+
+    let sub_id: u64 = 626262;
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Subscribe(Subscription::Processes {
+            id: sub_id,
+            target: ScopeTarget::Local,
+        }),
+    };
+    let body = rkyv::to_bytes::<rkyv::rancor::Error>(&env)
+        .map_err(|e| anyhow::anyhow!("serialize Subscribe(Processes): {e}"))?;
+    let len = u32::try_from(body.len())
+        .map_err(|_| anyhow::anyhow!("Subscribe envelope too large: {}", body.len()))?;
+
+    let inner = channel.channel_mut();
+    inner
+        .data(len.to_be_bytes().to_vec().as_slice())
+        .await
+        .map_err(|e| anyhow::anyhow!("write length prefix: {e}"))?;
+    inner
+        .data(body.as_ref())
+        .await
+        .map_err(|e| anyhow::anyhow!("write body: {e}"))?;
+
+    println!("[demo-phase-6] subscribed Processes on the agent; awaiting first event…");
+    let mut reader = inner.make_reader();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_envelope(&mut reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("agent didn't respond to Subscribe(Processes) within 10s"))?
+    .map_err(|e| anyhow::anyhow!("read Event: {e}"))?;
+
+    match response.payload {
+        Payload::Event(EventFrame {
+            subscription_id,
+            event,
+        }) => {
+            assert_eq!(subscription_id, sub_id);
+            match event {
+                Event::ProcessList { rows, source } => {
+                    println!();
+                    println!("  remote Processes subscribe ✓");
+                    println!("    event:       ProcessList");
+                    println!("    rows:        {}", rows.len());
+                    println!("    source:      {source}");
+                    for r in rows.iter().take(3) {
+                        println!(
+                            "      - pid={} {} ({} bytes)",
+                            r.pid, r.command, r.mem_bytes
+                        );
+                    }
+                    if rows.len() > 3 {
+                        println!("      … (+{} more)", rows.len() - 3);
+                    }
+                    println!();
+                }
+                Event::ProcessesUnavailable { reason } => {
+                    println!();
+                    println!("  remote Processes subscribe ✓ (ProcessesUnavailable path)");
+                    println!("    reason:      {reason}");
+                    println!();
+                }
+                other => {
+                    anyhow::bail!("expected ProcessList or ProcessesUnavailable, got {other:?}");
+                }
+            }
+        }
+        other => anyhow::bail!("expected Event envelope, got {other:?}"),
     }
     Ok(())
 }

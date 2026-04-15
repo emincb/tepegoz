@@ -37,7 +37,7 @@ use futures_util::StreamExt;
 use tepegoz_proto::{
     DockerActionOutcome, DockerActionRequest, DockerActionResult, DockerContainer, DockerStats,
     Envelope, ErrorInfo, ErrorKind, Event, EventFrame, LogStream, PROTOCOL_VERSION, Payload,
-    Subscription,
+    ProbePort, ProbeProcess, Subscription,
     codec::{read_envelope, write_envelope},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -51,6 +51,13 @@ use tracing::{debug, warn};
 const DOCKER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Backoff before re-attempting `Engine::connect` after a failure.
 const DOCKER_RECONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Phase 6 Slice 6d-ii: Ports + Processes refresh / reconnect cadences
+/// — match the daemon's local-target intervals so remote feels
+/// indistinguishable.
+const PORTS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const PORTS_RECONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const PROCESSES_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const PROCESSES_RECONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run the agent over the process's stdio. Drives the event loop
 /// until stdin closes or a fatal read/write error is hit.
@@ -71,10 +78,14 @@ where
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Envelope>();
     let writer_handle = spawn_writer_task(writer, event_rx);
 
-    // Active Docker / DockerLogs / DockerStats subscriptions keyed by
-    // the daemon-allocated id. Shared across the three Docker kinds
-    // because `Unsubscribe { id }` doesn't carry a kind discriminator.
-    let mut docker_subs: HashMap<u64, AbortHandle> = HashMap::new();
+    // Active subscription forwarders keyed by daemon-allocated id.
+    // One map across all subscription kinds (Docker / DockerLogs /
+    // DockerStats / Ports / Processes — all the kinds the agent
+    // serves) because `Unsubscribe { id }` doesn't carry a kind
+    // discriminator. The daemon's own per-client handler keeps
+    // separate maps for diagnostic clarity but the agent runs one
+    // tunnel; one map is enough.
+    let mut agent_subs: HashMap<u64, AbortHandle> = HashMap::new();
 
     let outcome = loop {
         let envelope = match read_envelope(&mut reader).await {
@@ -110,13 +121,13 @@ where
             break Ok(());
         }
 
-        handle_envelope(envelope.payload, &event_tx, &mut docker_subs).await;
+        handle_envelope(envelope.payload, &event_tx, &mut agent_subs).await;
     };
 
     // Abort every live subscription forwarder so they don't outlive
     // the connection, then drop the event tx so the writer task drains
     // any in-flight sends and exits.
-    for (_, handle) in docker_subs.drain() {
+    for (_, handle) in agent_subs.drain() {
         handle.abort();
     }
     drop(event_tx);
@@ -130,7 +141,7 @@ where
 pub(crate) async fn handle_envelope(
     payload: Payload,
     event_tx: &mpsc::UnboundedSender<Envelope>,
-    docker_subs: &mut HashMap<u64, AbortHandle>,
+    agent_subs: &mut HashMap<u64, AbortHandle>,
 ) {
     match payload {
         Payload::AgentHandshake { request_id } => {
@@ -161,7 +172,7 @@ pub(crate) async fn handle_envelope(
         // bollard doesn't care, and the daemon layer is the right
         // place to enforce target semantics.
         Payload::Subscribe(Subscription::Docker { id, target: _ }) => {
-            if let Some(prev) = docker_subs.remove(&id) {
+            if let Some(prev) = agent_subs.remove(&id) {
                 debug!(id, "replacing existing docker subscription");
                 prev.abort();
             }
@@ -169,7 +180,7 @@ pub(crate) async fn handle_envelope(
             let handle = tokio::spawn(async move {
                 forward_docker(id, tx).await;
             });
-            docker_subs.insert(id, handle.abort_handle());
+            agent_subs.insert(id, handle.abort_handle());
         }
 
         Payload::Subscribe(Subscription::DockerLogs {
@@ -179,7 +190,7 @@ pub(crate) async fn handle_envelope(
             tail_lines,
             target: _,
         }) => {
-            if let Some(prev) = docker_subs.remove(&id) {
+            if let Some(prev) = agent_subs.remove(&id) {
                 debug!(id, "replacing existing docker logs subscription");
                 prev.abort();
             }
@@ -187,7 +198,7 @@ pub(crate) async fn handle_envelope(
             let handle = tokio::spawn(async move {
                 forward_docker_logs(id, container_id, follow, tail_lines, tx).await;
             });
-            docker_subs.insert(id, handle.abort_handle());
+            agent_subs.insert(id, handle.abort_handle());
         }
 
         Payload::Subscribe(Subscription::DockerStats {
@@ -195,7 +206,7 @@ pub(crate) async fn handle_envelope(
             container_id,
             target: _,
         }) => {
-            if let Some(prev) = docker_subs.remove(&id) {
+            if let Some(prev) = agent_subs.remove(&id) {
                 debug!(id, "replacing existing docker stats subscription");
                 prev.abort();
             }
@@ -203,11 +214,35 @@ pub(crate) async fn handle_envelope(
             let handle = tokio::spawn(async move {
                 forward_docker_stats(id, container_id, tx).await;
             });
-            docker_subs.insert(id, handle.abort_handle());
+            agent_subs.insert(id, handle.abort_handle());
+        }
+
+        Payload::Subscribe(Subscription::Ports { id, target: _ }) => {
+            if let Some(prev) = agent_subs.remove(&id) {
+                debug!(id, "replacing existing ports subscription");
+                prev.abort();
+            }
+            let tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                forward_ports(id, tx).await;
+            });
+            agent_subs.insert(id, handle.abort_handle());
+        }
+
+        Payload::Subscribe(Subscription::Processes { id, target: _ }) => {
+            if let Some(prev) = agent_subs.remove(&id) {
+                debug!(id, "replacing existing processes subscription");
+                prev.abort();
+            }
+            let tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                forward_processes(id, tx).await;
+            });
+            agent_subs.insert(id, handle.abort_handle());
         }
 
         Payload::Unsubscribe { id } => {
-            if let Some(handle) = docker_subs.remove(&id) {
+            if let Some(handle) = agent_subs.remove(&id) {
                 debug!(id, "unsubscribing agent forwarder");
                 handle.abort();
             }
@@ -241,14 +276,24 @@ pub(crate) async fn handle_envelope(
 
 /// Probe which remote-scope capabilities this agent can serve. Called
 /// during handshake so the controller knows ahead of time whether a
-/// `Subscribe(Docker { Remote })` can succeed — the TUI uses this to
-/// grey out hosts in the picker modal that lack the required
-/// capability (e.g. an agent host without a running docker daemon).
+/// `Subscribe(...)` against this agent will succeed.
 ///
-/// 6c-proper: "docker" populates iff `Engine::connect().await` succeeds.
-/// 6d will add "ports" / "processes" on the same probe-at-handshake
-/// shape. Capabilities are a snapshot: if docker comes up after the
-/// agent started, the next handshake (on reconnect) picks it up.
+/// - `"docker"` — present iff `Engine::connect().await` succeeds.
+///   Conditional because docker daemons can be down or absent.
+/// - `"ports"` — always present on supported platforms (Linux +
+///   macOS). The probe is statically linked into the agent and
+///   surfaces partial-data rows on permission errors rather than
+///   failing the capability outright.
+/// - `"processes"` — always present on supported platforms. Same
+///   rationale: sysinfo is statically linked, the probe surfaces
+///   degraded data instead of failing.
+///
+/// "Always present" for the probe-backed capabilities is the right
+/// call for picker UX: a Connected host always shows as usable for
+/// Ports / Processes, and per-subscribe `PortsUnavailable` /
+/// `ProcessesUnavailable` events surface real failures at use time.
+/// Probing the probes here would just add handshake latency for
+/// near-zero accuracy gain.
 async fn probe_capabilities() -> Vec<String> {
     let mut caps = Vec::new();
     // 5s timeout matches `tepegoz_docker`'s PROBE_TIMEOUT_SECS; we
@@ -257,6 +302,8 @@ async fn probe_capabilities() -> Vec<String> {
     if tepegoz_docker::Engine::connect().await.is_ok() {
         caps.push("docker".to_string());
     }
+    caps.push("ports".to_string());
+    caps.push("processes".to_string());
     caps
 }
 
@@ -450,6 +497,218 @@ async fn run_docker_action(req: DockerActionRequest) -> DockerActionResult {
     }
 }
 
+/// Per-`Subscribe(Ports)` forwarder. Mirrors
+/// `tepegoz_core::client::forward_ports` — same `list_ports` cadence,
+/// same unavailable-transition semantics, same macOS pid → container
+/// correlation. The agent runs the probe against its own host so a
+/// remote subscriber sees the agent host's listening sockets.
+async fn forward_ports(subscription_id: u64, event_tx: mpsc::UnboundedSender<Envelope>) {
+    let mut last_was_unavailable: Option<bool> = None;
+    #[cfg(target_os = "macos")]
+    let mut docker_engine: Option<tepegoz_docker::Engine> = None;
+
+    loop {
+        let probe_result = tokio::task::spawn_blocking(tepegoz_probe::list_ports).await;
+
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut ports = match probe_result {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                warn!(subscription_id, error = %msg, "agent ports probe failed");
+                if !matches!(last_was_unavailable, Some(true))
+                    && event_tx
+                        .send(ports_unavailable_envelope(subscription_id, msg))
+                        .is_err()
+                {
+                    return;
+                }
+                last_was_unavailable = Some(true);
+                tokio::time::sleep(PORTS_RECONNECT_INTERVAL).await;
+                continue;
+            }
+            Err(join_err) => {
+                let msg = format!("agent ports probe task panicked: {join_err}");
+                warn!(subscription_id, error = %msg, "agent ports probe task panic");
+                if !matches!(last_was_unavailable, Some(true))
+                    && event_tx
+                        .send(ports_unavailable_envelope(subscription_id, msg))
+                        .is_err()
+                {
+                    return;
+                }
+                last_was_unavailable = Some(true);
+                tokio::time::sleep(PORTS_RECONNECT_INTERVAL).await;
+                continue;
+            }
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let needs_correlation = ports.iter().any(|p| p.container_id.is_none() && p.pid != 0);
+            if needs_correlation {
+                if docker_engine.is_none() {
+                    docker_engine = tepegoz_docker::Engine::connect().await.ok();
+                }
+                if let Some(engine) = docker_engine.as_ref() {
+                    match engine.list_containers().await {
+                        Ok(containers) => correlate_ports_to_containers(&mut ports, &containers),
+                        Err(e) => {
+                            debug!(
+                                subscription_id,
+                                error = %e,
+                                "agent docker engine failed during ports correlation; \
+                                 dropping engine handle"
+                            );
+                            docker_engine = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        if event_tx
+            .send(port_list_envelope(
+                subscription_id,
+                ports,
+                tepegoz_probe::SOURCE_LABEL.to_string(),
+            ))
+            .is_err()
+        {
+            return;
+        }
+        last_was_unavailable = Some(false);
+
+        tokio::time::sleep(PORTS_REFRESH_INTERVAL).await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn correlate_ports_to_containers(ports: &mut [ProbePort], containers: &[DockerContainer]) {
+    for port in ports.iter_mut() {
+        if port.container_id.is_some() {
+            continue;
+        }
+        for container in containers {
+            if container
+                .ports
+                .iter()
+                .any(|cp| cp.public_port == port.local_port && cp.public_port != 0)
+            {
+                port.container_id = Some(container.id.clone());
+                break;
+            }
+        }
+    }
+}
+
+/// Per-`Subscribe(Processes)` forwarder. Mirrors
+/// `tepegoz_core::client::forward_processes` — same stateful
+/// `ProcessesProbe` move-into-spawn-blocking + return-back-via-tuple
+/// pattern that preserves sysinfo's CPU% delta state across iterations
+/// while keeping the runtime unblocked. On task panic the probe resets;
+/// the next emit correctly carries `cpu_percent: None` for every row
+/// because we can't compute a delta across the crash boundary.
+async fn forward_processes(subscription_id: u64, event_tx: mpsc::UnboundedSender<Envelope>) {
+    let mut last_was_unavailable: Option<bool> = None;
+    let mut probe = tepegoz_probe::ProcessesProbe::new();
+
+    loop {
+        let (probe_back, sample_result) = match tokio::task::spawn_blocking(move || {
+            let mut p = probe;
+            let r = p.sample();
+            (p, r)
+        })
+        .await
+        {
+            Ok((p, r)) => (p, r),
+            Err(join_err) => (
+                tepegoz_probe::ProcessesProbe::new(),
+                Err(tepegoz_probe::ProcessesError::Backend(format!(
+                    "agent processes probe task panicked: {join_err}"
+                ))),
+            ),
+        };
+        probe = probe_back;
+
+        let rows = match sample_result {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(subscription_id, error = %msg, "agent processes probe failed");
+                if !matches!(last_was_unavailable, Some(true))
+                    && event_tx
+                        .send(processes_unavailable_envelope(subscription_id, msg))
+                        .is_err()
+                {
+                    return;
+                }
+                last_was_unavailable = Some(true);
+                tokio::time::sleep(PROCESSES_RECONNECT_INTERVAL).await;
+                continue;
+            }
+        };
+
+        if event_tx
+            .send(process_list_envelope(
+                subscription_id,
+                rows,
+                tepegoz_probe::processes::SOURCE_LABEL.to_string(),
+            ))
+            .is_err()
+        {
+            return;
+        }
+        last_was_unavailable = Some(false);
+
+        tokio::time::sleep(PROCESSES_REFRESH_INTERVAL).await;
+    }
+}
+
+fn port_list_envelope(subscription_id: u64, ports: Vec<ProbePort>, source: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::PortList { ports, source },
+        }),
+    }
+}
+
+fn ports_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::PortsUnavailable { reason },
+        }),
+    }
+}
+
+fn process_list_envelope(
+    subscription_id: u64,
+    rows: Vec<ProbeProcess>,
+    source: String,
+) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::ProcessList { rows, source },
+        }),
+    }
+}
+
+fn processes_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::ProcessesUnavailable { reason },
+        }),
+    }
+}
+
 fn container_list_envelope(
     subscription_id: u64,
     containers: Vec<DockerContainer>,
@@ -548,12 +807,21 @@ mod tests {
                 assert_eq!(version, PROTOCOL_VERSION);
                 assert_eq!(os, std::env::consts::OS);
                 assert_eq!(arch, std::env::consts::ARCH);
-                // capabilities is env-dependent ("docker" iff a local
-                // engine answers within the probe timeout). Only
+                // 6d-ii: capabilities is env-dependent for "docker"
+                // (iff a local engine answers) but always includes
+                // "ports" + "processes" on supported platforms. Only
                 // assert the set is valid — no unknown strings.
+                assert!(
+                    capabilities.contains(&"ports".to_string()),
+                    "ports capability must always be present (got {capabilities:?})"
+                );
+                assert!(
+                    capabilities.contains(&"processes".to_string()),
+                    "processes capability must always be present (got {capabilities:?})"
+                );
                 for cap in &capabilities {
                     assert!(
-                        matches!(cap.as_str(), "docker"),
+                        matches!(cap.as_str(), "docker" | "ports" | "processes"),
                         "unexpected capability {cap:?}"
                     );
                 }

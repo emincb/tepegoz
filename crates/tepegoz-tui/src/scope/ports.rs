@@ -22,6 +22,17 @@ use crate::app::{
     PortsActiveView, PortsScope, PortsView, PortsViewState, ProcessesView, ProcessesViewState,
 };
 
+/// Phase 6 Slice 6d-ii: render the tile title's target suffix —
+/// mirrors `tepegoz_tui::scope::docker::target_suffix_for`. Could
+/// hoist to `scope/mod.rs` if a third caller appears (Fleet?
+/// Phase 9 Claude Code?).
+fn target_suffix(target: &tepegoz_proto::ScopeTarget) -> String {
+    match target {
+        tepegoz_proto::ScopeTarget::Local => "local".to_string(),
+        tepegoz_proto::ScopeTarget::Remote { alias } => alias.clone(),
+    }
+}
+
 /// Entry point. Draws the Ports tile into `area`, matching the scope
 /// rendering contract in `docs/ARCHITECTURE.md` §9.
 pub(crate) fn render(
@@ -32,9 +43,14 @@ pub(crate) fn render(
     hovered: bool,
 ) {
     let (border_color, border_modifier) = crate::scope::border_style(focused, hovered);
+    // Phase 6 Slice 6d-ii: title-bar suffix shows current target so
+    // the user sees `ports · prod-box` / `processes · local` at a
+    // glance. Mirrors the Docker tile's pattern from 6c-iii.
     let title = match scope.active {
-        PortsActiveView::Ports => "ports".to_string(),
-        PortsActiveView::Processes => "processes".to_string(),
+        PortsActiveView::Ports => format!("ports · {}", target_suffix(&scope.ports_target)),
+        PortsActiveView::Processes => {
+            format!("processes · {}", target_suffix(&scope.processes_target))
+        }
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -485,6 +501,8 @@ mod tests {
             active: PortsActiveView::Ports,
             ports_sub_id: 3,
             processes_sub_id: 4,
+            ports_target: tepegoz_proto::ScopeTarget::Local,
+            processes_target: tepegoz_proto::ScopeTarget::Local,
         }
     }
 
@@ -500,6 +518,8 @@ mod tests {
             active: PortsActiveView::Processes,
             ports_sub_id: 3,
             processes_sub_id: 4,
+            ports_target: tepegoz_proto::ScopeTarget::Local,
+            processes_target: tepegoz_proto::ScopeTarget::Local,
         }
     }
 

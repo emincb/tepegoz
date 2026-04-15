@@ -123,9 +123,29 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## Engineer section
 
-**Last updated:** 2026-04-15, post-Phase-6-Slice-6d-i-close (wire v12 + `Event::AgentCapabilities` + TUI picker correctness — closes the 6c-iii watch-item about agent capabilities not propagating to TUI). Next is Slice 6d-ii (agent-side Ports + Processes probes + daemon routing + TUI retarget reuse + Fleet procs column fill + opt-in tests). Fresh engineer reading cold: `git log --oneline -10` shows the 6d-i commit on top of `0f6061d` (6c-iii). STATUS.md row 6 stays 🟠.
+**Last updated:** 2026-04-15, post-Phase-6-Slice-6d-ii-close (agent-side Ports + Processes probes + daemon routing + TUI retarget reuse + opt-in tests + xtask demo extension). Phase 6 Slice 6d is **complete end-to-end** — remote Ports + Processes round-trip via the same picker UX as Docker. Next is Slice 6e (Phase 6 close — polish + version-drift CI check + 8-scenario manual demo). Fresh engineer reading cold: `git log --oneline -10` shows the 6d-ii commit on top of `f3840d7` (6d-i). STATUS.md row 6 stays 🟠 (6e outstanding).
 
 ### Where I left off
+
+**Phase 6 Slice 6d-ii closed (remote Ports + Processes end-to-end).** Six-task bundle closing remote scopes:
+
+- **Agent-side Ports probe + handler** — `tepegoz-agent::serve` gains a `Subscription::Ports` arm that spawns `forward_ports`, mirroring the daemon's `forward_ports` shape (interval + spawn_blocking probe + macOS docker-port correlation). `probe_capabilities` always includes `"ports"` on supported platforms.
+- **Agent-side Processes probe + handler** — `Subscription::Processes` arm spawns `forward_processes` with the move-into-spawn-blocking + return-back-via-tuple stateful pattern (preserves sysinfo's CPU% delta state across iterations); `probe_capabilities` always includes `"processes"`.
+- **Renamed agent's `docker_subs` → `agent_subs`** — single map across all subscription kinds since `Unsubscribe { id }` doesn't carry a kind discriminator. Agent-side semantics are simpler than daemon's per-kind maps.
+- **Daemon routing extension** — `route_remote_subscribe` already wire-v11-ready; just needed Ports/Processes arms in `handle_command` + `RoutedScope::{Ports, Processes}` enum variants + per-scope unavailable-envelope synthesizer (PortsUnavailable / ProcessesUnavailable / DockerUnavailable / DockerStreamEnded all routed correctly per the invoking scope kind). `route_remote_subscribe` signature gained a `required_capability: &str` parameter so the unavailable reason can interpolate (`"no ports on alpha"` etc.).
+- **TUI retarget reuse** — `HostPickerTargetTile::{Ports, Processes}` variants added; `open_host_picker` matches on `ScopeKind::Ports` and dispatches to the right tile based on `PortsActiveView` (Ports view → Ports retarget; Processes view → Processes retarget). New `retarget_ports` / `retarget_processes` state-machines mirror `retarget_docker`. `PortsScope` gains `ports_target` + `processes_target` independent fields. Title-bar suffix in `scope::ports::render` reads `ports · <target>` or `processes · <target>` per the active view. Click on Ports tile title bar (`y == rect.y`) opens the picker.
+- **Fleet procs column** — kept as em-dash placeholder per CTO carve-out (per-host procs aggregation deferred to v1.1; would need ~200 LOC of cross-subscription plumbing for a status-bar count). Placeholder text refreshed to read as a deferred design choice (mentions `Ctrl-b t` workaround) rather than a TODO.
+- **Opt-in integration test** `crates/tepegoz-core/tests/remote_probes_subscription_roundtrip.rs` — bundles Ports + Processes round-trips into one fixture (single sshd container + agent deploy) for CI wall-clock economy. Asserts `Event::AgentCapabilities` arrives with `"ports"` + `"processes"` (closes the 6d-i propagation loop end-to-end), `Event::PortList` + `Event::ProcessList` arrive on their respective sub ids, unsubscribe doesn't crash the daemon.
+- **xtask `demo-phase-6 up --remote`** extension — drives `Subscribe(Ports)` + `Subscribe(Processes)` after the existing Docker subscribe; prints first event from each. Visual one-command demo of the three remote scopes round-tripping.
+
+**New tests (4 state-machine + 1 opt-in):**
+- `app::tests::ctrl_b_t_on_ports_view_opens_picker_with_ports_capability`
+- `app::tests::ctrl_b_t_on_processes_view_uses_processes_capability` (Ports tile dual-view: target dispatches per active view)
+- `app::tests::enter_commits_ports_retarget_and_resubscribes`
+- `app::tests::ports_and_processes_targets_are_independent` (locks the two-fields design — retargeting one doesn't bleed into the other)
+- `remote_probes_subscription_roundtrip::remote_ports_and_processes_subscription_roundtrip` (opt-in)
+
+**398 tests workspace-wide** (was 393). Clippy `--workspace --all-targets -D warnings` clean. fmt clean.
 
 **Phase 6 Slice 6d-i closed (wire v12 + AgentCapabilities event).** Standalone capability-propagation slice closing the 6c-iii watch-item:
 
@@ -179,22 +199,26 @@ Full Slice 6.0 arc: `input.rs` rewrite (keybind surface + Tab/Shift-Tab intercep
 
 ### What I'm mid-flight on
 
-**Phase 6 Slice 6d-ii — agent-side Ports + Processes probes + daemon routing + TUI retarget reuse + Fleet procs column fill + opt-in tests + xtask demo extension.** Per CTO 6d scope (2026-04-15):
-
-1. **Agent-side Ports probe** — populate `"ports"` capability at handshake (probe via `tepegoz-probe::list_ports`); add `Subscription::Ports` handler in `tepegoz_agent::handle_envelope` mirroring Docker's shape from 6c-ii.
-2. **Agent-side Processes probe** — populate `"processes"` capability; add `Subscription::Processes` handler.
-3. **Daemon routing extension** — `route_remote_subscribe` (already wire-v11-ready from 6c-ii) extended with `RoutedScope::Ports` / `RoutedScope::Processes`; `route_remote_subscribe` arms for both subscription kinds in `handle_command`. Cleanup paths emit `PortsUnavailable` / `ProcessesUnavailable` parallel to `DockerUnavailable`.
-4. **TUI retarget reuse** — Ports and Processes tiles get title-bar suffixes (`ports · <target>` / `processes · <target>`); `Ctrl-b t` on Ports/Processes focus + click-on-title-bar opens the picker with `required_capability = "ports"` / `"processes"`. `retarget_ports` / `retarget_processes` state-machines mirror `retarget_docker`.
-5. **Fleet procs column fill** — replace em-dash placeholder with real values from per-host remote Processes probe. Coupling check: if cross-subscription plumbing becomes spaghetti (Fleet tile would need per-alias subscription orchestration), flag scope concern + accept em-dash as v1.1 polish per CTO carve-out.
-6. **Opt-in integration tests** — `remote_ports_subscription_roundtrip` + `remote_processes_subscription_roundtrip` against real agent deploy. No docker-in-docker needed (probes don't require docker).
-7. **xtask `demo-phase-6 up --remote`** — extend to drive subscribe + print first event for Ports + Processes (alongside Docker).
-8. **Docs** — STATUS row 6 post-6d; OPERATIONS picks up remote Ports/Processes usage + capability-propagation visibility.
+_Nothing — 6d-ii is pushed. Phase 6 remote scopes are end-to-end across Docker + Ports + Processes. Next: Slice 6e (Phase 6 close — polish + version-drift CI check + 8-scenario manual demo)._
 
 ### What I'm expecting from the CTO next
 
-- **6d-ii sign-off & close** once probes + routing + retarget + tests + demo land. Tactical call on whether Fleet procs fill makes the cut or defers per the carve-out.
-- **Slice 6e** — Phase 6 close: polish + version-drift CI check + 8-scenario manual demo walk against a real remote host via `demo-phase-6 up --remote`. Includes the 6c-iii watch-item #1 ContainerList-over-SSH coverage gap (CTO directed: opportunistic in 6d if the docker.sock bind-mount fixture stays close to the existing remote_ports/processes test setup; else 6e).
-- **Panes past slot 9 unreachable.** Still open from Slice 6.0; Phase 6 agent multiplexing is the natural time to revisit the overflow UX.
+- **Slice 6e scope.** Phase 6 close: polish + version-drift CI check (run `xtask build-agents` in a CI step that verifies manifest integrity without shipping binaries — cheap sanity gate) + 8-scenario manual demo walk against a real remote host via `demo-phase-6 up --remote`. Folds in 6c-iii watch-item #1 (ContainerList-over-SSH positive-arm coverage) — straightforward `docker.sock` bind-mount + docker-group-membership extension to the existing fixture.
+- **Panes past slot 9 unreachable.** Still open from Slice 6.0; Phase 6 agent multiplexing is the natural time to revisit the overflow UX. May fold into 6e or defer to v1.1 — tactical call once 6e scope is set.
+- **Fleet procs column** v1.1 polish — accept-and-defer per the 6d-ii carve-out. If user feedback during 6e demo surfaces real pain, can revisit; otherwise the per-host workaround (`Ctrl-b t` retargets Processes tile to a host) ships.
+
+### Phase 6 close-state summary
+
+Ten commits across 6a → 6d-ii ship Phase 6 end-to-end:
+- **6a** (`f39931f`): agent scaffolding + wire v10 + local handshake demo
+- **6b** (`674b7d3`): remote agent deploy pipeline + `tepegoz doctor --agents`
+- **6c-i** (`0531462`): wire v11 — `ScopeTarget` on retargetable subscriptions
+- **6c-ii** (`16ca267`): daemon agent pool + transparent-proxy routing
+- **6c-iii** (`0f6061d`): Docker retarget UX + `Ctrl-b t` + Decision #7 amendment
+- **6d-i** (`f3840d7`): wire v12 — `Event::AgentCapabilities` + picker capability greying
+- **6d-ii** (current): remote Ports + Processes end-to-end
+
+Outstanding for 6e: docs close, 8-scenario manual demo, version-drift CI step, Fleet procs aggregation accept-or-revisit decision.
 
 ### Anything that would surprise a fresh-me (post-Phase-5-close)
 

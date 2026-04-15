@@ -126,7 +126,14 @@ pub enum RoutedScope {
         container_id: String,
         action_kind: tepegoz_proto::DockerActionKind,
     },
-    // 6d: Ports, Processes — reuse the same routing table.
+    /// Phase 6 Slice 6d-ii: remote Ports subscription. On cleanup
+    /// emits `Event::PortsUnavailable` parallel to local ports
+    /// outages.
+    Ports,
+    /// Phase 6 Slice 6d-ii: remote Processes subscription. On cleanup
+    /// emits `Event::ProcessesUnavailable` parallel to local
+    /// processes-probe failures.
+    Processes,
 }
 
 /// Spawn the driver task pair for an agent connection. The driver
@@ -351,6 +358,17 @@ async fn drain_routing_on_disconnect(alias: &str, conn: &Arc<AgentConnection>) {
                     reason.clone(),
                 ));
             }
+            RoutedScope::Ports => {
+                let _ = routed
+                    .client_event_tx
+                    .send(ports_unavailable_envelope(routed.client_id, reason.clone()));
+            }
+            RoutedScope::Processes => {
+                let _ = routed.client_event_tx.send(processes_unavailable_envelope(
+                    routed.client_id,
+                    reason.clone(),
+                ));
+            }
         }
     }
 }
@@ -514,6 +532,26 @@ fn docker_action_failure_envelope(
             kind: action_kind,
             outcome: DockerActionOutcome::Failure { reason },
             target: tepegoz_proto::ScopeTarget::Local,
+        }),
+    }
+}
+
+fn ports_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::PortsUnavailable { reason },
+        }),
+    }
+}
+
+fn processes_unavailable_envelope(subscription_id: u64, reason: String) -> Envelope {
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id,
+            event: Event::ProcessesUnavailable { reason },
         }),
     }
 }

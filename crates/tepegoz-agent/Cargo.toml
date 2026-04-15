@@ -20,3 +20,7 @@ anyhow = { workspace = true }
 futures-util = "0.3"
 tepegoz-proto = { workspace = true }
 tepegoz-docker = { workspace = true }
+# Phase 6 Slice 6d-ii: Ports + Processes probes via the same
+# implementation the daemon uses for local-target subscriptions.
+# Single source of truth for probe behavior on the agent side.
+tepegoz-probe = { workspace = true }

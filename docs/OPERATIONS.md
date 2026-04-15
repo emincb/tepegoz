@@ -868,6 +868,36 @@ cargo xtask demo-phase-6 down --remote
 
 **Out of scope for 6c**: host aggregation ("show all hosts' Docker at once" — v1.1 polish). Retarget for the Ports + Processes tiles (6d — same `Ctrl-b t` + modal, reused as-is with a different capability string).
 
+## Remote Ports + Processes scopes (Phase 6 Slice 6d-ii)
+
+Slice 6d-ii extends the 6c-iii retarget UX to the Ports + Processes tiles. Same `Ctrl-b t` + click-on-title-bar gestures, same picker modal, same `(no docker)` / `(no ports)` / `(no processes)` greying — the picker is tile-agnostic with a per-invocation `required_capability` string.
+
+**Title-bar suffix** on the Ports tile reads `ports · <target>` or `processes · <target>` depending on which view is currently active (toggled with `p`). The two views have **independent targets** — a user can run local Ports + remote Processes simultaneously without one retarget bleeding into the other.
+
+**Ports / Processes capabilities** are always present on supported platforms (Linux + macOS) — the probes are statically linked into the agent. Unlike Docker (which probes `Engine::connect` at handshake time), Ports + Processes don't have an external dependency that can be down. A subscription-time failure surfaces as `PortsUnavailable` / `ProcessesUnavailable` on the wire (e.g. permission-denied on `/proc` reads).
+
+```sh
+# Demo: subscribe Docker + Ports + Processes against a remote agent
+cargo xtask demo-phase-6 up --remote
+# Expect (after handshake):
+#
+#     remote Docker subscribe ✓ (DockerUnavailable path)
+#       reason:      docker engine unavailable: …
+#
+#     remote Ports subscribe ✓
+#       event:       PortList
+#       ports:       N
+#       source:      …
+#
+#     remote Processes subscribe ✓
+#       event:       ProcessList
+#       rows:        N
+#       source:      sysinfo
+cargo xtask demo-phase-6 down --remote
+```
+
+**Out of scope for 6d**: per-host procs aggregation in the Fleet tile (CTO carve-out — v1.1 polish; the user can already see per-host process counts by retargeting the Processes tile to a specific host).
+
 ## SSH Fleet discovery (Phase 5 Slice 5b)
 
 Tepegöz resolves the SSH Fleet host list from three sources, in strict

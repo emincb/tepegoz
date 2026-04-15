@@ -3922,6 +3922,7 @@ dependencies = [
  "anyhow",
  "futures-util",
  "tepegoz-docker",
+ "tepegoz-probe",
  "tepegoz-proto",
  "tokio",
  "tracing",

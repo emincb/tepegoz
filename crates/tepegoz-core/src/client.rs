@@ -284,6 +284,7 @@ async fn handle_command(
                     id,
                     alias,
                     RoutedScope::Docker,
+                    "docker",
                     |daemon_id| Subscription::Docker {
                         id: daemon_id,
                         target: ScopeTarget::Local,
@@ -319,6 +320,7 @@ async fn handle_command(
                     id,
                     alias,
                     RoutedScope::DockerLogs,
+                    "docker",
                     |daemon_id| Subscription::DockerLogs {
                         id: daemon_id,
                         container_id,
@@ -355,6 +357,7 @@ async fn handle_command(
                     id,
                     alias,
                     RoutedScope::DockerStats,
+                    "docker",
                     |daemon_id| Subscription::DockerStats {
                         id: daemon_id,
                         container_id,
@@ -365,29 +368,65 @@ async fn handle_command(
             }
         },
 
-        Payload::Subscribe(Subscription::Ports { id, target: _ }) => {
-            if let Some(prev) = ports_subs.remove(&id) {
-                debug!(id, "replacing existing ports subscription");
-                prev.abort();
+        Payload::Subscribe(Subscription::Ports { id, target }) => match target {
+            ScopeTarget::Local => {
+                if let Some(prev) = ports_subs.remove(&id) {
+                    debug!(id, "replacing existing ports subscription");
+                    prev.abort();
+                }
+                let tx = event_tx.clone();
+                let handle = tokio::spawn(async move {
+                    forward_ports(id, tx).await;
+                });
+                ports_subs.insert(id, handle.abort_handle());
             }
-            let tx = event_tx.clone();
-            let handle = tokio::spawn(async move {
-                forward_ports(id, tx).await;
-            });
-            ports_subs.insert(id, handle.abort_handle());
-        }
+            ScopeTarget::Remote { alias } => {
+                route_remote_subscribe(
+                    state,
+                    event_tx,
+                    client_agent_subs,
+                    id,
+                    alias,
+                    RoutedScope::Ports,
+                    "ports",
+                    |daemon_id| Subscription::Ports {
+                        id: daemon_id,
+                        target: ScopeTarget::Local,
+                    },
+                )
+                .await;
+            }
+        },
 
-        Payload::Subscribe(Subscription::Processes { id, target: _ }) => {
-            if let Some(prev) = processes_subs.remove(&id) {
-                debug!(id, "replacing existing processes subscription");
-                prev.abort();
+        Payload::Subscribe(Subscription::Processes { id, target }) => match target {
+            ScopeTarget::Local => {
+                if let Some(prev) = processes_subs.remove(&id) {
+                    debug!(id, "replacing existing processes subscription");
+                    prev.abort();
+                }
+                let tx = event_tx.clone();
+                let handle = tokio::spawn(async move {
+                    forward_processes(id, tx).await;
+                });
+                processes_subs.insert(id, handle.abort_handle());
             }
-            let tx = event_tx.clone();
-            let handle = tokio::spawn(async move {
-                forward_processes(id, tx).await;
-            });
-            processes_subs.insert(id, handle.abort_handle());
-        }
+            ScopeTarget::Remote { alias } => {
+                route_remote_subscribe(
+                    state,
+                    event_tx,
+                    client_agent_subs,
+                    id,
+                    alias,
+                    RoutedScope::Processes,
+                    "processes",
+                    |daemon_id| Subscription::Processes {
+                        id: daemon_id,
+                        target: ScopeTarget::Local,
+                    },
+                )
+                .await;
+            }
+        },
 
         Payload::Subscribe(Subscription::Fleet { id }) => {
             if let Some(prev) = fleet_subs.remove(&id) {
@@ -842,6 +881,7 @@ async fn route_remote_subscribe(
     client_id: u64,
     alias: String,
     scope: RoutedScope,
+    required_capability: &str,
     subscription_builder: impl FnOnce(u64) -> Subscription,
 ) {
     let conn = {
@@ -849,17 +889,19 @@ async fn route_remote_subscribe(
         guard.get(&alias).cloned()
     };
     let Some(conn) = conn else {
-        let _ = event_tx.send(docker_unavailable_envelope(
+        let _ = event_tx.send(unavailable_envelope_for_scope(
+            &scope,
             client_id,
             format!("agent not connected: {alias}"),
         ));
         return;
     };
 
-    if !conn.capabilities.iter().any(|c| c == "docker") {
-        let _ = event_tx.send(docker_unavailable_envelope(
+    if !conn.capabilities.iter().any(|c| c == required_capability) {
+        let _ = event_tx.send(unavailable_envelope_for_scope(
+            &scope,
             client_id,
-            format!("no docker on {alias}"),
+            format!("no {required_capability} on {alias}"),
         ));
         return;
     }
@@ -873,7 +915,7 @@ async fn route_remote_subscribe(
                 client_event_tx: event_tx.clone(),
                 client_id,
                 kind: RoutedKind::Subscription,
-                scope,
+                scope: scope.clone(),
             },
         );
     }
@@ -888,9 +930,14 @@ async fn route_remote_subscribe(
         .is_err()
     {
         // Agent's writer task has exited — routing entry is now
-        // orphaned. Clean up and surface the same Unavailable shape.
+        // orphaned. Clean up and surface the same Unavailable shape
+        // as a missing-agent miss so the client's UX doesn't have to
+        // distinguish (both are "this remote isn't serving us right
+        // now"; the TUI tile re-renders unavailable, retarget picker
+        // greys the row).
         conn.routing.lock().await.remove(&daemon_id);
-        let _ = event_tx.send(docker_unavailable_envelope(
+        let _ = event_tx.send(unavailable_envelope_for_scope(
+            &scope,
             client_id,
             format!("agent writer closed: {alias}"),
         ));
@@ -898,6 +945,35 @@ async fn route_remote_subscribe(
     }
 
     client_agent_subs.insert(client_id, AgentSubHandle { alias, daemon_id });
+}
+
+/// Per-scope "unavailable" envelope synthesizer. Routing-layer
+/// failures (missing agent, missing capability, dead writer) need to
+/// surface as the matching Unavailable variant so the right tile
+/// renders the failure — emitting `DockerUnavailable` on a Ports
+/// subscription would silently drop on the client (TUI's Docker tile
+/// would render an unexpected event for an unknown sub id).
+fn unavailable_envelope_for_scope(scope: &RoutedScope, client_id: u64, reason: String) -> Envelope {
+    let event = match scope {
+        RoutedScope::Docker => Event::DockerUnavailable { reason },
+        RoutedScope::DockerLogs | RoutedScope::DockerStats => Event::DockerStreamEnded { reason },
+        RoutedScope::DockerAction { .. } => {
+            // DockerAction shouldn't reach this path — it's handled
+            // by `route_remote_docker_action` separately. Defensive
+            // fallthrough emits DockerUnavailable so a future caller
+            // misuse surfaces visibly rather than silently.
+            Event::DockerUnavailable { reason }
+        }
+        RoutedScope::Ports => Event::PortsUnavailable { reason },
+        RoutedScope::Processes => Event::ProcessesUnavailable { reason },
+    };
+    Envelope {
+        version: PROTOCOL_VERSION,
+        payload: Payload::Event(EventFrame {
+            subscription_id: client_id,
+            event,
+        }),
+    }
 }
 
 /// Route a `DockerAction { target: Remote }` through an agent. Allocates

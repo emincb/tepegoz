@@ -82,12 +82,20 @@ async fn agent_handshake_roundtrip() {
                 std::env::consts::ARCH,
                 "agent's reported arch must match the test-process host"
             );
-            // Slice 6c-proper probes "docker" at handshake time; env-
-            // dependent, so accept any subset of the known caps.
+            // 6d-ii: ports + processes always present on supported
+            // platforms; docker is env-dependent.
+            assert!(
+                capabilities.contains(&"ports".to_string()),
+                "ports capability must always be present (got {capabilities:?})"
+            );
+            assert!(
+                capabilities.contains(&"processes".to_string()),
+                "processes capability must always be present (got {capabilities:?})"
+            );
             for cap in &capabilities {
                 assert!(
-                    matches!(cap.as_str(), "docker"),
-                    "unexpected capability {cap:?} — known set is {{docker}} in 6c-proper"
+                    matches!(cap.as_str(), "docker" | "ports" | "processes"),
+                    "unexpected capability {cap:?} — known set is {{docker, ports, processes}}"
                 );
             }
         }

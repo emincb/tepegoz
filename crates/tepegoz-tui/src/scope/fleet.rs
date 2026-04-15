@@ -161,8 +161,15 @@ fn render_status_bar(
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
+    // Phase 6 Slice 6d-ii: per-host procs aggregation deferred to
+    // v1.1 polish per CTO scope carve-out. The plumbing (per-host
+    // Processes subscriptions kept open, dispatch on receive,
+    // aggregation on render) costs ~200 LOC for a status-bar count
+    // that the user can already see by retargeting the Processes
+    // tile to a specific host. Hint updated so the placeholder
+    // reads as "deferred design choice", not "implementation TODO".
     let procs_placeholder = Span::styled(
-        " procs: — (Phase 6)",
+        " procs: — (per-host count v1.1 — `Ctrl-b t` retargets Processes tile to a host)",
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
