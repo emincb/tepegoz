@@ -67,13 +67,56 @@ channel. Panes become cheap (one `OpenPane` wire frame each), and
 the "how many connections am I opening?" question disappears from
 the user's mental model.
 
-### `Ctrl-b w` pane-list overlay deferred (5d-ii → 5e or v1.1)
+### `Ctrl-b w` pane-list overlay deferred to v1.1
 
-5d-ii lands the pane-stack with `Ctrl-b 0..9` jump + `Ctrl-b n`/`p`
-cycle. The list-view overlay for >9 panes is scoped for 5e polish.
-Users with >9 concurrent panes today can still navigate via cycling;
-jump-by-number just wraps at 9. Not a bug, but flag as a v1.1 polish
-item if real-world usage surfaces it.
+5d-ii landed the pane-stack with `Ctrl-b 0..9` jump + `Ctrl-b n`/`p`
+cycle + a tab strip capped at 9 numbered slots + a `[+N]` overflow
+indicator when the stack grows past 9. The list-view overlay for
+enumerating the full stack (including panes past slot 9, which are
+reachable via keybind but invisibly) is deferred to v1.1 — `Ctrl-b w`
+is explicitly swallowed in the input filter today so accidental
+presses don't leak `w` to the pty. Users with >9 concurrent panes can
+still navigate via cycling; jump-by-number covers the 10th via
+`Ctrl-b 0` and otherwise wraps at 9. Not a bug, but flag if real-world
+usage surfaces >9 concurrent panes as a routine case.
+
+### Pane stack is session-local (5d-ii → Phase 6 agent consolidation)
+
+The TUI's `pane_stack: Vec<PaneEntry>` is built from
+`ensure_pane`'s startup response and live `PaneOpened` / `PaneExit`
+events. On `Ctrl-b d` the socket closes; on reattach the new session
+re-enters `ensure_pane`'s `ListPanes` reuse path, which picks a
+single alive pane — the pre-detach stack structure (tab order, which
+pane was active) is NOT restored. The user sees one pane in the tab
+strip even if the daemon still has multiple alive panes.
+
+**Phase 6 upgrade path**. The agent deployment unlocks a cleaner
+reattach model: on handshake, the daemon returns the client's prior
+session's stack ordering + active index via a new `SessionResume`
+frame (wire bump). Until then, `tepegoz tui` reattach after detach
+gives you one pane, and extra alive panes can be re-discovered via
+`tepegoz doctor` (future) or by closing the attached pane to let
+`ensure_pane` cycle through the next alive one.
+
+### FIFO `OpenPane` correlation has edge cases (5d-ii → Phase 6 wire v10)
+
+The wire protocol has no per-request id on `OpenPane`. Clients
+correlate the `PaneOpened` response to their request by FIFO order
+(the daemon processes commands serially on a single writer task, so
+reply order matches request order). 5e's prefix-guard
+(`info.message.starts_with("open pane")` / `"open remote pane"`)
+keeps unrelated `Error` envelopes from mis-consuming the queue, but
+the design still carries one thin edge: if an `OpenPane` fails and
+then AttachPane against a DIFFERENT stale pane also fails with an
+`"open pane"`-prefixed message (daemon-side malformation), the
+mis-attribution reopens. Not observed in practice — daemon's
+AttachPane error prefix is `"attach pane"`, distinct from OpenPane's.
+
+**Phase 6 upgrade path**. Wire v10 (agent-backed panes) adds a
+`request_id: u64` field to `OpenPane`'s `PaneOpened` and `Error`
+responses, matching `DockerAction` / `FleetAction`. Client-side FIFO
+correlation becomes unnecessary and the prefix-guard in the TUI's
+Error handler becomes dead code to delete.
 
 ---
 

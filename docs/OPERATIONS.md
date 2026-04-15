@@ -547,6 +547,186 @@ pkill -f "python3 -c import socket" 2>/dev/null
 pkill -f "tepegoz daemon" 2>/dev/null
 ```
 
+## Slice 5e manual demo prep (Phase 5 close)
+
+Closes Phase 5. Same shape as 4d: 8 scenarios, pass/fail matrix, all rows are the gate. Scenarios 1-3 cover the 5d-ii pane-stack + tab strip + CLI; 4 documents the session-local stack policy; 5-8 cover the 5a-5c-i SSH lifecycle surface (drop / reconnect / auth fail / TOFU mismatch). The demo needs a real SSH server you can reach — the `linuxserver/openssh-server` Docker image is the easiest fixture and what 5d-i's integration test uses.
+
+### Prep
+
+```sh
+# Terminal 0 — workspace tempdir + keypair + sshd container fixture
+WORK=$(mktemp -d)
+ssh-keygen -t ed25519 -N "" -f "$WORK/id_ed25519" -q -C "tepegoz-5e-demo"
+PUB=$(cat "$WORK/id_ed25519.pub")
+
+# Start an openssh-server we can dial. Maps to a random host port.
+docker run -d --name tepegoz-5e-sshd \
+  -e PUID=1000 -e PGID=1000 -e USER_NAME=tepegoz \
+  -e "PUBLIC_KEY=$PUB" \
+  -p 0:2222 \
+  lscr.io/linuxserver/openssh-server:latest
+SSHD_PORT=$(docker port tepegoz-5e-sshd 2222/tcp | sed 's/.*://')
+echo "sshd listening on 127.0.0.1:$SSHD_PORT (key: $WORK/id_ed25519)"
+
+# Land a tepegoz config pointing at the container as alias `staging`.
+mkdir -p "$WORK/tepegoz-config"
+cat > "$WORK/tepegoz-config/config.toml" <<EOF
+[[ssh.hosts]]
+alias = "staging"
+hostname = "127.0.0.1"
+port = $SSHD_PORT
+user = "tepegoz"
+identity_file = "$WORK/id_ed25519"
+EOF
+
+# Use isolated config + data dirs so this demo doesn't touch your real
+# ~/.ssh/known_hosts or ~/.config/tepegoz state.
+export TEPEGOZ_CONFIG_DIR="$WORK/tepegoz-config"
+export TEPEGOZ_DATA_DIR="$WORK/tepegoz-data"
+
+# Build + run daemon.
+cargo build
+./target/debug/tepegoz daemon
+```
+
+Sanity-check the host list:
+
+```sh
+# Terminal 1 — verify the host shows up before the TUI run.
+TEPEGOZ_CONFIG_DIR="$WORK/tepegoz-config" TEPEGOZ_DATA_DIR="$WORK/tepegoz-data" \
+  ./target/debug/tepegoz doctor --ssh-hosts
+# Expect: source: tepegoz config (...) / hosts (1): staging tepegoz@127.0.0.1:<port>
+```
+
+### Demo sequence
+
+**Step 1 — `tepegoz connect staging` opens a remote pane from the CLI.**
+
+```sh
+TEPEGOZ_CONFIG_DIR="$WORK/tepegoz-config" TEPEGOZ_DATA_DIR="$WORK/tepegoz-data" \
+  ./target/debug/tepegoz connect staging
+```
+
+The TUI launches with the god view; the PTY tile's tab strip shows a single `[1 ssh:staging*]` entry. The remote shell prompt (linuxserver image's default `tepegoz@<container-id>$`) is responsive — type `uname -a` + Enter, see `Linux <hostname> ... GNU/Linux`. The Fleet tile's `staging` row glyph shifts from `○` (Disconnected) → `◐` (Connecting) → `●` (Connected) within the connect window. Press `Ctrl-b d` to detach: TUI exits cleanly, terminal returns to your outer shell prompt, the daemon + the remote pane stay alive.
+
+→ Pass: `connect staging` opens, runs a real remote command, detaches with `Ctrl-b d`. Tab strip shows exactly one `ssh:staging` entry (no local root pane).
+
+**Step 2 — `tepegoz tui` + `Ctrl-b Enter` on Fleet opens a second remote pane.**
+
+```sh
+TEPEGOZ_CONFIG_DIR="$WORK/tepegoz-config" TEPEGOZ_DATA_DIR="$WORK/tepegoz-data" \
+  ./target/debug/tepegoz tui
+```
+
+The TUI launches with a single local pane: tab strip shows `[1 zsh*]` (or `bash`/`fish` per `$SHELL`). Navigate to the Fleet tile (`Ctrl-b j` to Docker → `Ctrl-b l` to Ports → `Ctrl-b l` to Fleet); border highlights bright cyan when focused. The `staging` row is highlighted via `▶` selection marker. Press `Ctrl-b Enter`: an Info toast `opening ssh:staging…` flashes; within 1-3 s the tab strip updates to `[1 zsh] [2 ssh:staging*]`, focus jumps back to the PTY tile, and the remote shell prompt appears.
+
+→ Pass: tab strip shows both entries with `*` on the new remote pane; focus returned to PTY automatically; remote shell responds to `uname -a`.
+
+**Step 3 — `Ctrl-b 1` / `Ctrl-b 2` / `Ctrl-b n` / `Ctrl-b p` switch between panes without losing scrollback.**
+
+In the local pane (tab 1), run `seq 1 30` so there's distinguishable scrollback. Press `Ctrl-b 2`: tab strip flips `*` to slot 2, the remote pane's last screen reappears (NOT a refresh of the local one). Press `Ctrl-b 1`: back to the local pane with `seq 1 30` output still visible. Press `Ctrl-b n`: cycles to the next pane (slot 2). Press `Ctrl-b p`: cycles back. Press `Ctrl-b p` again: wraps to the last pane (slot 2 in this two-pane case).
+
+→ Pass: switching tabs preserves each pane's vt100 screen content; `n` / `p` wrap correctly.
+
+**Step 4 — `Ctrl-b d` + reattach: pane stack is session-local, expect a single pane on reattach (NOT a regression).**
+
+From the two-pane state above, press `Ctrl-b d`. TUI exits; outer shell returns. Re-launch:
+
+```sh
+TEPEGOZ_CONFIG_DIR="$WORK/tepegoz-config" TEPEGOZ_DATA_DIR="$WORK/tepegoz-data" \
+  ./target/debug/tepegoz tui
+```
+
+The tab strip now shows ONE entry — whichever pane the daemon's `ListPanes` returns first. This is the session-local stack policy (`docs/ISSUES.md#pane-stack-is-session-local`): the TUI doesn't persist tab order across detach. Both daemon-side panes are still alive (one of them is what you're attached to); to verify, press `Ctrl-b &` to close the visible pane — the other one becomes visible in slot 1 (or, if both are gone, a fresh local root spawns).
+
+→ Pass: reattach shows one pane; closing it surfaces the other (proves both daemon-side panes survived the detach); user understands the session-local policy.
+
+Detach (`Ctrl-b d`) and clean up the daemon-side panes by reconnecting + `Ctrl-b &` until you're back to a single local pane (or kill the daemon and restart it for Step 5).
+
+**Step 5 — SSH server drop mid-session: remote pane terminates cleanly with a toast.**
+
+Re-launch the TUI, then `Ctrl-b j → l → l → Enter` on the `staging` row to open a remote pane. Confirm the prompt is responsive. From a third terminal:
+
+```sh
+docker stop tepegoz-5e-sshd
+```
+
+Within seconds, the active remote pane gets an Info toast like `pane ssh:staging exited (code <code>)`, the tab strip drops the entry (or auto-reopens a local root if it was the only pane), and focus returns to whichever pane is now active. The Fleet row glyph shifts to `○` (Disconnected) within ~30 s as the supervisor's heartbeat times out. Restart the container so subsequent steps can use it: `docker start tepegoz-5e-sshd`.
+
+→ Pass: SSH drop surfaces as a per-pane Info toast (NOT a TUI crash); tab strip updates; Fleet row glyph turns gray within the heartbeat window; restart restores the host to discoverable state.
+
+**Step 6 — `Ctrl-b r` on Fleet row dispatches a reconnect with an Info "dispatched" toast.**
+
+With the container restarted (per Step 5 cleanup), focus the Fleet tile; the `staging` row should be at `○` (Disconnected) initially, transitioning to `◐` → `●` if the supervisor is auto-reconnecting. To force the demo: focus Fleet (`Ctrl-b j → l → l`), select the `staging` row, press `r`. An Info toast `reconnect staging — dispatched` appears; the row glyph transitions through `◐` to `●` within a few seconds.
+
+→ Pass: `r` produces the Info "dispatched" toast (NOT a state-change toast; that comes seconds later via `HostStateChanged`); the row glyph reaches `●` within the connect window.
+
+**Step 7 — Auth failure on first connect: `⚠` row glyph + red toast with verbatim russh reason.**
+
+Detach (`Ctrl-b d`). Generate a second keypair the sshd doesn't know about, swap it into config, re-launch:
+
+```sh
+ssh-keygen -t ed25519 -N "" -f "$WORK/wrong_key" -q -C "tepegoz-5e-wrong"
+sed -i.bak "s|identity_file = .*|identity_file = \"$WORK/wrong_key\"|" "$WORK/tepegoz-config/config.toml"
+TEPEGOZ_CONFIG_DIR="$WORK/tepegoz-config" TEPEGOZ_DATA_DIR="$WORK/tepegoz-data" \
+  ./target/debug/tepegoz tui
+```
+
+Focus Fleet, press `r` on `staging` to force a connect attempt. The row glyph transitions to `⚠` (red); a red toast appears with the russh failure attempts list (something like `staging: auth failed — publickey: Permission denied`). Recovery:
+
+```sh
+sed -i.bak "s|identity_file = .*|identity_file = \"$WORK/id_ed25519\"|" "$WORK/tepegoz-config/config.toml"
+```
+
+Press `Ctrl-b r` again on the row — should succeed this time (or the next supervisor retry will succeed within the backoff window).
+
+→ Pass: red `⚠` glyph + verbatim russh-reasoned red toast; restoring the correct key + retrying recovers cleanly.
+
+**Step 8 — Host-key mismatch after TOFU: red toast with path:line + `tepegoz doctor --ssh-forget` recovery + clean re-TOFU.**
+
+After Step 7's recovery, your tepegoz known_hosts file has a TOFU'd entry for `127.0.0.1:<port>`. To simulate a host-key change, regenerate the sshd container's keys:
+
+```sh
+docker exec tepegoz-5e-sshd rm -f /config/ssh_host_keys/*
+docker restart tepegoz-5e-sshd
+```
+
+Re-attach (or `Ctrl-b r` if still attached): the row glyph transitions to `⚠` (red); a red toast surfaces `staging: host key rejected — <reason from russh, includes path:line of the stored entry>` (the entry lives in `$WORK/tepegoz-data/known_hosts`). Recover via:
+
+```sh
+TEPEGOZ_CONFIG_DIR="$WORK/tepegoz-config" TEPEGOZ_DATA_DIR="$WORK/tepegoz-data" \
+  ./target/debug/tepegoz doctor --ssh-forget staging
+# Expect: removed N entry(ies) for 127.0.0.1:<port> ... — next connection ... will re-TOFU
+```
+
+Re-attach the TUI + press `Ctrl-b r` on `staging`. The supervisor re-TOFUs the new host key and connects cleanly: glyph back to `●`.
+
+→ Pass: mismatch surfaces with file:line in the toast; `--ssh-forget` removes the stale entry; subsequent connect succeeds via re-TOFU.
+
+### Pass/fail matrix
+
+| # | Scenario | Pass |
+|---|---|---|
+| 1 | `tepegoz connect staging` opens, runs a remote command, `Ctrl-b d` detaches cleanly | ☐ |
+| 2 | `Ctrl-b Enter` on Fleet from `tepegoz tui` opens a 2nd pane; tab strip shows both with `*` on new | ☐ |
+| 3 | `Ctrl-b 1/2/n/p` swaps active pane; each pane preserves its own scrollback across switches | ☐ |
+| 4 | `Ctrl-b d` + reattach → 1 pane (session-local stack); closing it surfaces the other surviving pane | ☐ |
+| 5 | `docker stop` mid-session → per-pane Info toast; tab strip drops entry; Fleet row → `○` within heartbeat window | ☐ |
+| 6 | `Ctrl-b r` on Fleet row → Info "dispatched" toast; row glyph reaches `●` within connect window | ☐ |
+| 7 | Wrong IdentityFile → `⚠` red glyph + red toast with russh attempts list; restoring correct key + retry recovers | ☐ |
+| 8 | Container key regen → red `⚠` glyph + red toast `host key rejected — <reason>`; `doctor --ssh-forget` removes; re-TOFU connects cleanly | ☐ |
+
+**All 8 scenarios are the gate.** Scenarios 4-5-7-8 in particular pin behaviors the integration tests can't fully exercise (session-local reattach, mid-session SSH drop UX, TOFU recovery loop). If any fail, file a 5e polish item in `docs/ISSUES.md` — fix before the Phase 5 close commit flips row 5 to ✅.
+
+### Tear down
+
+```sh
+docker rm -f tepegoz-5e-sshd 2>/dev/null
+pkill -f "tepegoz daemon" 2>/dev/null
+rm -rf "$WORK"
+unset TEPEGOZ_CONFIG_DIR TEPEGOZ_DATA_DIR
+```
+
 ## SSH Fleet discovery (Phase 5 Slice 5b)
 
 Tepegöz resolves the SSH Fleet host list from three sources, in strict
