@@ -233,6 +233,15 @@ pub(crate) struct DockerScope {
     /// press can't switch the target mid-prompt); focus moving away
     /// from the Docker tile cancels; a 10 s idle timeout cancels.
     pub(crate) pending_confirm: Option<PendingConfirm>,
+    /// Phase 6 Slice 6c: current target for the Docker subscription +
+    /// dispatched `DockerAction`s. `Local` (the default) mirrors
+    /// pre-v11 behaviour; `Remote { alias }` routes through the
+    /// Fleet-supervised agent connection. Swapped via the host-picker
+    /// modal (click the tile-title's target suffix). Task E defines
+    /// the picker state + retarget dispatch; this field is the
+    /// source of truth for both the wire-level `Subscription::Docker
+    /// { target }` value and the title-suffix render.
+    pub(crate) target: tepegoz_proto::ScopeTarget,
 }
 
 /// Docker tile view state. C3a had a single implicit "list" view;
@@ -310,6 +319,10 @@ impl DockerScope {
             filter_active: false,
             sub_id,
             pending_confirm: None,
+            // Default `Local`: pre-v11 behaviour. Target flips via
+            // Task E's host-picker modal → `retarget_docker`
+            // dispatch.
+            target: tepegoz_proto::ScopeTarget::Local,
         }
     }
 
@@ -1167,12 +1180,15 @@ impl App {
             })),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Docker {
                 id: self.docker.sub_id,
+                target: self.docker.target.clone(),
             }))),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Ports {
                 id: self.ports.ports_sub_id,
+                target: tepegoz_proto::ScopeTarget::Local,
             }))),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Processes {
                 id: self.ports.processes_sub_id,
+                target: tepegoz_proto::ScopeTarget::Local,
             }))),
             AppAction::SendEnvelope(envelope(Payload::Subscribe(Subscription::Fleet {
                 id: self.fleet.sub_id,
@@ -2152,6 +2168,9 @@ impl App {
                 // megabytes on entry; revisit with a bounded default
                 // as a Phase-3 polish item.
                 tail_lines: 0,
+                // v11: logs follow the Docker tile's current target
+                // so remote-Docker logs stream through the agent.
+                target: self.docker.target.clone(),
             },
         ))));
         actions.push(AppAction::DrawFrame);
@@ -2197,6 +2216,10 @@ impl App {
                 request_id,
                 container_id,
                 kind,
+                // v11: action follows the Docker tile's current
+                // target so remote containers get acted on via the
+                // agent.
+                target: self.docker.target.clone(),
             },
         ))));
         actions.push(AppAction::DrawFrame);
@@ -2926,7 +2949,7 @@ mod tests {
         // Subscribe(Docker) with the docker sub_id.
         match &actions[2] {
             AppAction::SendEnvelope(env) => match &env.payload {
-                Payload::Subscribe(Subscription::Docker { id }) => {
+                Payload::Subscribe(Subscription::Docker { id, .. }) => {
                     assert_eq!(*id, app.docker.sub_id);
                 }
                 other => panic!("expected Subscribe(Docker), got {other:?}"),
@@ -2937,7 +2960,7 @@ mod tests {
         // Subscribe(Ports) with the ports sub_id.
         match &actions[3] {
             AppAction::SendEnvelope(env) => match &env.payload {
-                Payload::Subscribe(Subscription::Ports { id }) => {
+                Payload::Subscribe(Subscription::Ports { id, .. }) => {
                     assert_eq!(*id, app.ports.ports_sub_id);
                 }
                 other => panic!("expected Subscribe(Ports), got {other:?}"),
@@ -2948,7 +2971,7 @@ mod tests {
         // Subscribe(Processes) with the processes sub_id.
         match &actions[4] {
             AppAction::SendEnvelope(env) => match &env.payload {
-                Payload::Subscribe(Subscription::Processes { id }) => {
+                Payload::Subscribe(Subscription::Processes { id, .. }) => {
                     assert_eq!(*id, app.ports.processes_sub_id);
                 }
                 other => panic!("expected Subscribe(Processes), got {other:?}"),
@@ -3317,6 +3340,7 @@ mod tests {
                 outcome: DockerActionOutcome::Failure {
                     reason: "container not running".into(),
                 },
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
@@ -3356,6 +3380,7 @@ mod tests {
                 container_id: "id-nginx".into(),
                 kind: DockerActionKind::Restart,
                 outcome: DockerActionOutcome::Success,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
@@ -3856,6 +3881,7 @@ mod tests {
                 outcome: DockerActionOutcome::Failure {
                     reason: "container not running".into(),
                 },
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
@@ -3889,6 +3915,7 @@ mod tests {
                 outcome: DockerActionOutcome::Failure {
                     reason: "not found".into(),
                 },
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         };
         let actions = app.handle_event(AppEvent::DaemonEnvelope(env));
@@ -4072,6 +4099,7 @@ mod tests {
                         container_id,
                         follow,
                         tail_lines,
+                        target: _,
                     }) => {
                         assert!(*follow, "logs must follow on entry");
                         assert_eq!(

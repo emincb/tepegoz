@@ -538,6 +538,7 @@ mod tests {
             filter_active,
             sub_id: 42,
             pending_confirm: None,
+            target: tepegoz_proto::ScopeTarget::Local,
         }
     }
 

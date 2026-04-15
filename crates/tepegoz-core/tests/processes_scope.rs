@@ -60,6 +60,7 @@ async fn processes_subscription_emits_either_process_list_or_unavailable() {
             version: PROTOCOL_VERSION,
             payload: Payload::Subscribe(Subscription::Processes {
                 id: PROCESSES_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )
@@ -138,6 +139,7 @@ async fn processes_subscription_sees_spawned_child_within_budget() {
             version: PROTOCOL_VERSION,
             payload: Payload::Subscribe(Subscription::Processes {
                 id: PROCESSES_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )

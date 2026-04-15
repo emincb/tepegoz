@@ -120,9 +120,27 @@ async fn desync_repro_with_select_tick_interrupting_read_envelope() {
     // Subscribe to the three Phase 4 scopes (plus Docker) concurrently
     // — matches what the TUI does at startup.
     for (id, sub) in [
-        (2u64, Subscription::Docker { id: 2 }),
-        (3u64, Subscription::Ports { id: 3 }),
-        (4u64, Subscription::Processes { id: 4 }),
+        (
+            2u64,
+            Subscription::Docker {
+                id: 2,
+                target: tepegoz_proto::ScopeTarget::Local,
+            },
+        ),
+        (
+            3u64,
+            Subscription::Ports {
+                id: 3,
+                target: tepegoz_proto::ScopeTarget::Local,
+            },
+        ),
+        (
+            4u64,
+            Subscription::Processes {
+                id: 4,
+                target: tepegoz_proto::ScopeTarget::Local,
+            },
+        ),
     ] {
         write_envelope(
             &mut writer,

@@ -52,6 +52,12 @@ pub mod socket;
 //   arch, capabilities }`. Capabilities are strings for forward-
 //   compatibility as 6c/d add real docker / ports / processes / pty
 //   probes.
+// - v11 (Phase 6 Slice 6c): `ScopeTarget::{Local, Remote { alias }}`
+//   added to `Subscription::{Docker, DockerLogs, DockerStats, Ports,
+//   Processes}` + `DockerActionRequest` + `DockerActionResult`.
+//   `#[default] Local` keeps pre-v11 locality implicit at
+//   construction; explicit at the wire boundary. One breakpoint
+//   services 6c (Docker routing) + 6d (Ports / Processes routing).
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
 
 /// Identifier for a pty pane owned by the daemon.
@@ -185,8 +191,13 @@ pub enum Subscription {
     /// availability transitions. Daemon will retry connecting if docker is
     /// unreachable, so a single `Docker` subscription survives `dockerd`
     /// restarts without the client having to resubscribe.
+    ///
+    /// v11 (Phase 6 Slice 6c): `target` chooses local vs. Fleet-aliased
+    /// remote. Remote is routed through an agent connection; local
+    /// keeps the pre-v11 behaviour.
     Docker {
         id: u64,
+        target: ScopeTarget,
     },
     /// Stream a single container's logs. `tail_lines = 0` means "all". When
     /// `follow = true` the subscription stays live until cancelled, the
@@ -197,6 +208,7 @@ pub enum Subscription {
         container_id: String,
         follow: bool,
         tail_lines: u32,
+        target: ScopeTarget,
     },
     /// Stream a single container's stats (CPU%, memory). Periodic events
     /// every ~1 s while the container is alive. Like docker logs, the
@@ -204,6 +216,7 @@ pub enum Subscription {
     DockerStats {
         id: u64,
         container_id: String,
+        target: ScopeTarget,
     },
     /// Subscribe to listening-port events: per-refresh `PortList` events with
     /// pid / process-name / container correlation. On probe failure the
@@ -212,6 +225,7 @@ pub enum Subscription {
     /// without the client having to resubscribe.
     Ports {
         id: u64,
+        target: ScopeTarget,
     },
     /// Subscribe to running-process events: per-refresh `ProcessList` events
     /// with pid, parent, command, cpu%, mem. On probe failure the daemon
@@ -221,6 +235,7 @@ pub enum Subscription {
     /// delta to compute CPU% against.
     Processes {
         id: u64,
+        target: ScopeTarget,
     },
     /// Subscribe to SSH fleet events: per-host state transitions plus an
     /// initial `HostList`. Phase 5 Slice 5b ships the discovery + tile
@@ -398,6 +413,30 @@ pub enum PaneTarget {
     },
 }
 
+/// Phase 6 Slice 6c target selector for non-pty subscriptions +
+/// `DockerAction`. `Local` routes to the daemon's own probes (the
+/// pre-v11 behaviour); `Remote { alias }` routes through the
+/// Fleet-supervised agent connection for that host. Mirrors
+/// `PaneTarget`'s shape so the TUI retarget UX + rkyv codec can
+/// share patterns — the two types stay distinct because a
+/// subscription target and a pty target have no operational overlap
+/// (panes are user-visible terminals; subscriptions are daemon
+/// event streams).
+///
+/// Parallel to `PaneTarget`: `#[default] Local` means rkyv reads
+/// legacy-shape envelopes (pre-v11 clients that never set target)
+/// as `Local`. Handshake catches any version-skew anyway; this
+/// belt-and-suspenders keeps the default-construction ergonomics
+/// sane for builder-style uses.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum ScopeTarget {
+    #[default]
+    Local,
+    Remote {
+        alias: String,
+    },
+}
+
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 pub struct EnvVar {
     pub key: String,
@@ -491,6 +530,11 @@ pub struct DockerActionRequest {
     pub request_id: u64,
     pub container_id: String,
     pub kind: DockerActionKind,
+    /// v11 (Phase 6 Slice 6c): chooses local vs. Fleet-aliased remote
+    /// docker engine. `Local` runs against the daemon's own bollard;
+    /// `Remote { alias }` is tunneled through the agent connection
+    /// for that host.
+    pub target: ScopeTarget,
 }
 
 /// Daemon's reply to a `DockerActionRequest`.
@@ -500,6 +544,10 @@ pub struct DockerActionResult {
     pub container_id: String,
     pub kind: DockerActionKind,
     pub outcome: DockerActionOutcome,
+    /// v11: echoes the originating request's target so the TUI's
+    /// pending-action sweep + toast surfacing can attribute the
+    /// outcome to the right engine.
+    pub target: ScopeTarget,
 }
 
 /// Result of a docker lifecycle action.

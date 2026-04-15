@@ -49,7 +49,10 @@ async fn docker_subscription_emits_either_container_list_or_unavailable() {
         &mut w,
         &Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Docker { id: DOCKER_SUB_ID }),
+            payload: Payload::Subscribe(Subscription::Docker {
+                id: DOCKER_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
+            }),
         },
     )
     .await
@@ -116,7 +119,10 @@ async fn docker_subscription_returns_container_list_when_engine_is_running() {
         &mut w,
         &Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Docker { id: DOCKER_SUB_ID }),
+            payload: Payload::Subscribe(Subscription::Docker {
+                id: DOCKER_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
+            }),
         },
     )
     .await
@@ -174,6 +180,7 @@ async fn docker_action_against_unreachable_engine_returns_failure_with_reason() 
                 request_id: ACTION_REQ_ID,
                 container_id: "no-such-container".into(),
                 kind: DockerActionKind::Restart,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )
@@ -241,6 +248,7 @@ async fn docker_logs_against_unreachable_engine_emits_stream_ended() {
                 container_id: "no-such-container".into(),
                 follow: true,
                 tail_lines: 0,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )
@@ -292,6 +300,7 @@ async fn docker_stats_against_unreachable_engine_emits_stream_ended() {
             payload: Payload::Subscribe(Subscription::DockerStats {
                 id: STATS_SUB_ID,
                 container_id: "no-such-container".into(),
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )
@@ -382,6 +391,7 @@ async fn docker_action_logs_stats_end_to_end_against_real_engine() {
                 container_id: container_id.clone(),
                 follow: true,
                 tail_lines: 0,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )
@@ -420,6 +430,7 @@ async fn docker_action_logs_stats_end_to_end_against_real_engine() {
             payload: Payload::Subscribe(Subscription::DockerStats {
                 id: STATS_SUB_ID,
                 container_id: container_id.clone(),
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )
@@ -459,6 +470,7 @@ async fn docker_action_logs_stats_end_to_end_against_real_engine() {
                 request_id: ACTION_REQ_ID,
                 container_id: container_id.clone(),
                 kind: DockerActionKind::Restart,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )
@@ -565,7 +577,10 @@ async fn docker_scope_lists_provisioned_container_within_2s() {
         &mut w,
         &Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Docker { id: DOCKER_SUB_ID }),
+            payload: Payload::Subscribe(Subscription::Docker {
+                id: DOCKER_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
+            }),
         },
     )
     .await
@@ -704,7 +719,10 @@ async fn restart_propagates_to_follow_up_container_list() {
         &mut w,
         &Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Docker { id: DOCKER_SUB_ID }),
+            payload: Payload::Subscribe(Subscription::Docker {
+                id: DOCKER_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
+            }),
         },
     )
     .await
@@ -750,6 +768,7 @@ async fn restart_propagates_to_follow_up_container_list() {
                 request_id: ACTION_REQ_ID,
                 container_id: container_id.clone(),
                 kind: DockerActionKind::Restart,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )

@@ -44,7 +44,10 @@ async fn ports_subscription_emits_either_port_list_or_unavailable() {
         &mut w,
         &Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Ports { id: PORTS_SUB_ID }),
+            payload: Payload::Subscribe(Subscription::Ports {
+                id: PORTS_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
+            }),
         },
     )
     .await
@@ -109,7 +112,10 @@ async fn ports_subscription_sees_locally_bound_listener_within_budget() {
         &mut w,
         &Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Ports { id: PORTS_SUB_ID }),
+            payload: Payload::Subscribe(Subscription::Ports {
+                id: PORTS_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
+            }),
         },
     )
     .await

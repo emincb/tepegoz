@@ -105,7 +105,10 @@ time.sleep(60)
         &mut w,
         &Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Ports { id: PORTS_SUB_ID }),
+            payload: Payload::Subscribe(Subscription::Ports {
+                id: PORTS_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
+            }),
         },
     )
     .await
@@ -116,6 +119,7 @@ time.sleep(60)
             version: PROTOCOL_VERSION,
             payload: Payload::Subscribe(Subscription::Processes {
                 id: PROCESSES_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
             }),
         },
     )
@@ -290,7 +294,10 @@ async fn docker_bound_port_surfaces_with_container_correlation() {
         &mut w,
         &Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Ports { id: PORTS_SUB_ID }),
+            payload: Payload::Subscribe(Subscription::Ports {
+                id: PORTS_SUB_ID,
+                target: tepegoz_proto::ScopeTarget::Local,
+            }),
         },
     )
     .await

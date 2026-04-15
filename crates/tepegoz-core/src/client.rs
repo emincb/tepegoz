@@ -233,7 +233,12 @@ async fn handle_command(
             send_status(state, event_tx, id).await?;
         }
 
-        Payload::Subscribe(Subscription::Docker { id }) => {
+        Payload::Subscribe(Subscription::Docker { id, target: _ }) => {
+            // Task A landed the v11 target-on-Subscription shape;
+            // Task D wires the Remote branch through agent_pool.
+            // Until D lands, the target is ignored and this path
+            // always runs the local forwarder. That's safe: pre-6c
+            // behaviour is the Local branch.
             if let Some(prev) = docker_subs.remove(&id) {
                 debug!(id, "replacing existing docker subscription");
                 prev.abort();
@@ -250,6 +255,7 @@ async fn handle_command(
             container_id,
             follow,
             tail_lines,
+            target: _,
         }) => {
             if let Some(prev) = docker_subs.remove(&id) {
                 debug!(id, "replacing existing docker logs subscription");
@@ -262,7 +268,11 @@ async fn handle_command(
             docker_subs.insert(id, handle.abort_handle());
         }
 
-        Payload::Subscribe(Subscription::DockerStats { id, container_id }) => {
+        Payload::Subscribe(Subscription::DockerStats {
+            id,
+            container_id,
+            target: _,
+        }) => {
             if let Some(prev) = docker_subs.remove(&id) {
                 debug!(id, "replacing existing docker stats subscription");
                 prev.abort();
@@ -274,7 +284,7 @@ async fn handle_command(
             docker_subs.insert(id, handle.abort_handle());
         }
 
-        Payload::Subscribe(Subscription::Ports { id }) => {
+        Payload::Subscribe(Subscription::Ports { id, target: _ }) => {
             if let Some(prev) = ports_subs.remove(&id) {
                 debug!(id, "replacing existing ports subscription");
                 prev.abort();
@@ -286,7 +296,7 @@ async fn handle_command(
             ports_subs.insert(id, handle.abort_handle());
         }
 
-        Payload::Subscribe(Subscription::Processes { id }) => {
+        Payload::Subscribe(Subscription::Processes { id, target: _ }) => {
             if let Some(prev) = processes_subs.remove(&id) {
                 debug!(id, "replacing existing processes subscription");
                 prev.abort();
@@ -829,6 +839,9 @@ async fn run_docker_action(req: DockerActionRequest) -> DockerActionResult {
         container_id: req.container_id,
         kind: req.kind,
         outcome,
+        // v11 echoes the originating target back so TUI attribution
+        // stays correct on round-trip. Preserved by moving req.target.
+        target: req.target,
     }
 }
 

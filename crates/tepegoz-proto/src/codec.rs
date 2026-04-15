@@ -317,21 +317,26 @@ mod tests {
 
         let original = Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(crate::Subscription::Docker { id: 42 }),
+            payload: Payload::Subscribe(crate::Subscription::Docker {
+                id: 42,
+                target: crate::ScopeTarget::Local,
+            }),
         };
 
         write_envelope(&mut a, &original).await.unwrap();
         let decoded = read_envelope(&mut b).await.unwrap();
 
         match decoded.payload {
-            Payload::Subscribe(crate::Subscription::Docker { id }) => assert_eq!(id, 42),
+            Payload::Subscribe(crate::Subscription::Docker { id, target: _ }) => {
+                assert_eq!(id, 42)
+            }
             other => panic!("expected Subscribe(Docker), got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn docker_action_roundtrip_preserves_request_id_and_kind() {
-        use crate::{DockerActionKind, DockerActionRequest};
+        use crate::{DockerActionKind, DockerActionRequest, ScopeTarget};
         let (mut a, mut b) = tokio::io::duplex(1024);
         let original = Envelope {
             version: PROTOCOL_VERSION,
@@ -339,6 +344,7 @@ mod tests {
                 request_id: 17,
                 container_id: "abc123".into(),
                 kind: DockerActionKind::Restart,
+                target: ScopeTarget::Local,
             }),
         };
         write_envelope(&mut a, &original).await.unwrap();
@@ -366,6 +372,7 @@ mod tests {
                 outcome: DockerActionOutcome::Failure {
                     reason: "container is not running".into(),
                 },
+                target: crate::ScopeTarget::Local,
             }),
         };
         write_envelope(&mut a, &original).await.unwrap();
@@ -375,6 +382,7 @@ mod tests {
                 assert_eq!(res.request_id, 17);
                 assert_eq!(res.container_id, "abc123");
                 assert_eq!(res.kind, DockerActionKind::Stop);
+                assert_eq!(res.target, crate::ScopeTarget::Local);
                 match res.outcome {
                     DockerActionOutcome::Failure { reason } => {
                         assert_eq!(reason, "container is not running");
@@ -388,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_docker_logs_roundtrip() {
-        use crate::Subscription;
+        use crate::{ScopeTarget, Subscription};
         let (mut a, mut b) = tokio::io::duplex(2048);
         let original = Envelope {
             version: PROTOCOL_VERSION,
@@ -397,6 +405,7 @@ mod tests {
                 container_id: "abc".into(),
                 follow: true,
                 tail_lines: 200,
+                target: ScopeTarget::Local,
             }),
         };
         write_envelope(&mut a, &original).await.unwrap();
@@ -407,6 +416,7 @@ mod tests {
                 container_id,
                 follow,
                 tail_lines,
+                target: _,
             }) => {
                 assert_eq!(id, 99);
                 assert_eq!(container_id, "abc");
@@ -492,16 +502,19 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_ports_roundtrip() {
-        use crate::Subscription;
+        use crate::{ScopeTarget, Subscription};
         let (mut a, mut b) = tokio::io::duplex(1024);
         let original = Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Ports { id: 71 }),
+            payload: Payload::Subscribe(Subscription::Ports {
+                id: 71,
+                target: ScopeTarget::Local,
+            }),
         };
         write_envelope(&mut a, &original).await.unwrap();
         let decoded = read_envelope(&mut b).await.unwrap();
         match decoded.payload {
-            Payload::Subscribe(Subscription::Ports { id }) => assert_eq!(id, 71),
+            Payload::Subscribe(Subscription::Ports { id, target: _ }) => assert_eq!(id, 71),
             other => panic!("expected Subscribe(Ports), got {other:?}"),
         }
     }
@@ -587,16 +600,19 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_processes_roundtrip() {
-        use crate::Subscription;
+        use crate::{ScopeTarget, Subscription};
         let (mut a, mut b) = tokio::io::duplex(1024);
         let original = Envelope {
             version: PROTOCOL_VERSION,
-            payload: Payload::Subscribe(Subscription::Processes { id: 83 }),
+            payload: Payload::Subscribe(Subscription::Processes {
+                id: 83,
+                target: ScopeTarget::Local,
+            }),
         };
         write_envelope(&mut a, &original).await.unwrap();
         let decoded = read_envelope(&mut b).await.unwrap();
         match decoded.payload {
-            Payload::Subscribe(Subscription::Processes { id }) => assert_eq!(id, 83),
+            Payload::Subscribe(Subscription::Processes { id, target: _ }) => assert_eq!(id, 83),
             other => panic!("expected Subscribe(Processes), got {other:?}"),
         }
     }
@@ -1033,6 +1049,237 @@ mod tests {
                 assert!(capabilities.is_empty());
             }
             other => panic!("expected AgentHandshakeResponse, got {other:?}"),
+        }
+    }
+
+    // --- Phase 6 Slice 6c: ScopeTarget wire v11 round-trips ---------------
+
+    /// Helper — one-shot envelope round-trip for the Subscription +
+    /// DockerAction variants. Constructs the envelope, writes it to a
+    /// duplex channel, reads it back, hands the decoded payload to
+    /// the caller for shape-specific assertions. Keeps the test
+    /// bodies focused on what the new `target` field does, not on
+    /// envelope plumbing.
+    async fn subscription_roundtrip<F>(sub: crate::Subscription, check: F)
+    where
+        F: FnOnce(Payload),
+    {
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::Subscribe(sub),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        check(decoded.payload);
+    }
+
+    #[tokio::test]
+    async fn subscribe_docker_roundtrip_preserves_local_target() {
+        use crate::{ScopeTarget, Subscription};
+        subscription_roundtrip(
+            Subscription::Docker {
+                id: 1,
+                target: ScopeTarget::Local,
+            },
+            |payload| match payload {
+                Payload::Subscribe(Subscription::Docker { id, target }) => {
+                    assert_eq!(id, 1);
+                    assert_eq!(target, ScopeTarget::Local);
+                }
+                other => panic!("expected Subscribe(Docker), got {other:?}"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_docker_roundtrip_preserves_remote_alias() {
+        use crate::{ScopeTarget, Subscription};
+        subscription_roundtrip(
+            Subscription::Docker {
+                id: 1,
+                target: ScopeTarget::Remote {
+                    alias: "staging".into(),
+                },
+            },
+            |payload| match payload {
+                Payload::Subscribe(Subscription::Docker { target, .. }) => match target {
+                    ScopeTarget::Remote { alias } => assert_eq!(alias, "staging"),
+                    other => panic!("expected Remote, got {other:?}"),
+                },
+                other => panic!("expected Subscribe(Docker), got {other:?}"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_docker_logs_roundtrip_preserves_target_and_follow_fields() {
+        use crate::{ScopeTarget, Subscription};
+        subscription_roundtrip(
+            Subscription::DockerLogs {
+                id: 2,
+                container_id: "abc123".into(),
+                follow: true,
+                tail_lines: 100,
+                target: ScopeTarget::Remote {
+                    alias: "eu-west".into(),
+                },
+            },
+            |payload| match payload {
+                Payload::Subscribe(Subscription::DockerLogs {
+                    id,
+                    container_id,
+                    follow,
+                    tail_lines,
+                    target,
+                }) => {
+                    assert_eq!(id, 2);
+                    assert_eq!(container_id, "abc123");
+                    assert!(follow);
+                    assert_eq!(tail_lines, 100);
+                    match target {
+                        ScopeTarget::Remote { alias } => assert_eq!(alias, "eu-west"),
+                        other => panic!("expected Remote, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Subscribe(DockerLogs), got {other:?}"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_docker_stats_roundtrip_preserves_target() {
+        use crate::{ScopeTarget, Subscription};
+        subscription_roundtrip(
+            Subscription::DockerStats {
+                id: 3,
+                container_id: "def456".into(),
+                target: ScopeTarget::Local,
+            },
+            |payload| match payload {
+                Payload::Subscribe(Subscription::DockerStats {
+                    id,
+                    container_id,
+                    target,
+                }) => {
+                    assert_eq!(id, 3);
+                    assert_eq!(container_id, "def456");
+                    assert_eq!(target, ScopeTarget::Local);
+                }
+                other => panic!("expected Subscribe(DockerStats), got {other:?}"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_ports_roundtrip_preserves_target() {
+        use crate::{ScopeTarget, Subscription};
+        // Ports retarget wiring lands in Slice 6d — the wire shape
+        // is locked here (v11) so 6d can ship without a further
+        // protocol bump.
+        subscription_roundtrip(
+            Subscription::Ports {
+                id: 4,
+                target: ScopeTarget::Remote {
+                    alias: "prod".into(),
+                },
+            },
+            |payload| match payload {
+                Payload::Subscribe(Subscription::Ports { id, target }) => {
+                    assert_eq!(id, 4);
+                    match target {
+                        ScopeTarget::Remote { alias } => assert_eq!(alias, "prod"),
+                        other => panic!("expected Remote, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Subscribe(Ports), got {other:?}"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_processes_roundtrip_preserves_target() {
+        use crate::{ScopeTarget, Subscription};
+        // Same 6d-pending note as Ports.
+        subscription_roundtrip(
+            Subscription::Processes {
+                id: 5,
+                target: ScopeTarget::Remote {
+                    alias: "canary".into(),
+                },
+            },
+            |payload| match payload {
+                Payload::Subscribe(Subscription::Processes { id, target }) => {
+                    assert_eq!(id, 5);
+                    match target {
+                        ScopeTarget::Remote { alias } => assert_eq!(alias, "canary"),
+                        other => panic!("expected Remote, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Subscribe(Processes), got {other:?}"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docker_action_request_roundtrip_preserves_remote_target() {
+        use crate::{DockerActionKind, DockerActionRequest, ScopeTarget};
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerAction(DockerActionRequest {
+                request_id: 7,
+                container_id: "abc123".into(),
+                kind: DockerActionKind::Restart,
+                target: ScopeTarget::Remote {
+                    alias: "prod".into(),
+                },
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::DockerAction(req) => {
+                assert_eq!(req.request_id, 7);
+                match req.target {
+                    ScopeTarget::Remote { alias } => assert_eq!(alias, "prod"),
+                    other => panic!("expected Remote, got {other:?}"),
+                }
+            }
+            other => panic!("expected DockerAction, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn docker_action_result_roundtrip_echoes_target() {
+        use crate::{DockerActionKind, DockerActionOutcome, DockerActionResult, ScopeTarget};
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let original = Envelope {
+            version: PROTOCOL_VERSION,
+            payload: Payload::DockerActionResult(DockerActionResult {
+                request_id: 7,
+                container_id: "abc123".into(),
+                kind: DockerActionKind::Restart,
+                outcome: DockerActionOutcome::Success,
+                target: ScopeTarget::Remote {
+                    alias: "prod".into(),
+                },
+            }),
+        };
+        write_envelope(&mut a, &original).await.unwrap();
+        let decoded = read_envelope(&mut b).await.unwrap();
+        match decoded.payload {
+            Payload::DockerActionResult(res) => match res.target {
+                ScopeTarget::Remote { alias } => assert_eq!(alias, "prod"),
+                other => panic!("expected Remote, got {other:?}"),
+            },
+            other => panic!("expected DockerActionResult, got {other:?}"),
         }
     }
 }
