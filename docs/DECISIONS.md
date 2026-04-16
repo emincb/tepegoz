@@ -134,6 +134,16 @@ configurability of the layout is explicitly deferred; revisit in v2.
 removed as part of C1.5. The `AppEvent`/`AppAction` bus is retained;
 `View` is redefined as `{ layout: TileLayout, focused: TileId }`.
 
+## 8. v1 scope trim: ship Phases 1–6 + release packaging; defer 7/8/9 + QUIC
+
+**Decision (2026-04-16).** v1.0 ships Phases 1 through 6 (agent + remote scopes, landed 2026-04-16) plus a repurposed Phase 10 that is release packaging only. Phases 7 (port scanner), 8 (recording + replay), 9 (Claude Code pane awareness) are cut from v1 and preserved in `docs/ROADMAP.md` as v1.1 candidates. The original Phase 10 scope carried QUIC-over-SSH hot-path transport + release packaging; QUIC is deferred to v1.0.1 or v1.1 (preserved as a subsection at the end of Phase 10's scope).
+
+**Rationale.** User call (verbatim): "tool can do more than I can; ship, use, let gaps find you." Phases 1–6 deliver the core "pty multiplexing + SSH fleet + remote Docker/Ports/Processes scopes in one screen" thesis. Port scanning (Phase 7), recording (Phase 8), and Claude Code awareness (Phase 9) are valuable but don't gate daily utility; better to surface real priorities from use. QUIC's latency win doesn't gate daily-use usability either; SSH stdio has been fine in Phases 5–6 manual walks.
+
+**v1.0 release slices (R1–R4)** outlined in `ROADMAP.md` Phase 10: cross-build xtask, GitHub Actions release workflow, install mechanisms (install script + Homebrew + cargo install), first-run UX polish + v1.0.0 tag. Standing disciplines apply: CI-green + clean-state per slice; demo-tooling cold-walk both failure path AND success path before declaring ready; 60-second cold-start rule for any install-script deliverable.
+
+**Reopen path.** v1.1 planning begins after v1.0 ships + user has daily-driven long enough for gaps to surface. Phases 7/8/9 candidates are prioritized based on which gaps actually bite (not on scope order). QUIC reopens if SSH stdio latency surfaces as a real pain point.
+
 ---
 
 ## Durable working rules

@@ -1,10 +1,16 @@
 # Tepegöz v1 roadmap
 
-Target: **0.1.0 release** at end of Phase 10. Rough budget: 15–20 weeks full-time.
+Target: **v1.0.0 release** at end of Phase 10 (renamed from "QUIC hot path + release 0.1.0" per the 2026-04-16 v1 scope trim — see `docs/DECISIONS.md#8`).
 
 Status key: ✅ complete · 🟡 code+tests green, user acceptance pending · 🟠 in progress · ⚪ not started · 🔵 deferred to a future release.
 
 Per-phase: goal, delivered (or scope), acceptance test, explicit non-goals, risks.
+
+## v1.0 ships: Phases 0–6 + Phase 10 (install packaging)
+
+Phase 6 closed 2026-04-16; Phases 7 (port scanner), 8 (recording + replay), 9 (Claude Code pane awareness) cut from v1 scope per the v1 scope-trim decision (original scope text preserved in-place below as reference for when they pick up as v1.1 candidates). Phase 10 renamed to "v1.0 release — install packaging"; QUIC transport swap that was previously in Phase 10 is moved to v1.0.1 / v1.1 candidates (preserved as a subsection at the end of Phase 10).
+
+Rationale for the trim: "tool can do more than I can; ship, use, let gaps find you." Daily-use gaps drive the v1.1 backlog once v1.0 is in the user's hands.
 
 ---
 
@@ -507,25 +513,31 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
 
 ---
 
-## Phase 6 — Agent binary + remote scope panels · 🟠 (6a + 6b landed 2026-04-15)
+## Phase 6 — Agent binary + remote scope panels · ✅ (2026-04-16)
 
 **Goal.** Deploy a lightweight agent to remote hosts; the same scope panels work against remote as against local.
 
-**Slice 6a — Agent scaffolding + local handshake (landed 2026-04-15).** `tepegoz-agent` is a real stdio-framed protocol server with a reusable `lib::run_stdio()` entry point; the controller's `tepegoz agent --stdio` subcommand routes through the same `run_stdio`. Wire protocol bumped to v10 with `Payload::AgentHandshake { request_id }` + `Payload::AgentHandshakeResponse { request_id, version, os, arch, capabilities }`. `PROTOCOL_VERSION` moved to a plain-text source of truth at `crates/tepegoz-proto/PROTOCOL_VERSION` read by the proto `build.rs`, the controller `build.rs`, and the xtask. Controller `build.rs` embeds each populated agent via `include_bytes!` + asserts the manifest `protocol_version` matches the text file at compile time (hard failure on drift). Graceful fallback: `cargo build` without a populated `target/agents/` emits one `cargo:warning` and every embedded slot is `None`. `cargo xtask build-agents` cross-compiles the 4 targets via `cargo zigbuild --profile release-agent` and writes `manifest.json` sidecars. `cargo xtask demo-phase-6 up/down` spawns a host-target agent, drives the handshake, prints the response. Acceptance: `agent_handshake_roundtrip` integration test (spawns real subprocess, asserts full wire round-trip).
+**Outcome.** Shipped end-to-end across 10 commits. Wire protocol bumped v9→v12 with `Payload::AgentHandshake` / `AgentHandshakeResponse` (v10), `ScopeTarget::{Local, Remote { alias }}` field extension on all retargetable Subscriptions + DockerAction (v11), `Event::AgentCapabilities { alias, capabilities }` standalone event (v12). Controller's `build.rs` embeds all four Decision #3 agent arches via `include_bytes!` + asserts manifest `protocol_version` matches proto text file at compile time. `tepegoz-ssh::deploy` module implements raw-channel `cat > .tmp` + atomic `mv` + verify-by-hash with no `russh-sftp` dep. Daemon's `host_supervisor` + `AgentConnection` pool auto-deploys + registers agents on Fleet-connect + shuts them down on any session-end path. TUI `host_picker` modal (centered, chrome-rows=5) opens on `Ctrl-b t` or title-bar click against the Docker or Ports tile, greys per-capability (`(no docker)` / `(no ports)` / `(no processes)`) + per-state (`(not connected)` / `(auth failed)`). New CI `agents` job runs `cargo xtask build-agents` + `cargo check -p tepegoz` as a cheap drift-check gate against controller build.rs regressions. 398 tests workspace-wide on macOS.
 
-**Slice 6b — Remote deploy pipeline (landed 2026-04-15).** `tepegoz-ssh::deploy` module exposes `detect_target` (uname-sm → target triple with macOS arm64 → aarch64 normalization), `inspect_remote_agent` (presence + SHA256 + stat), `deploy_agent` (raw-channel `cat > .tmp` + atomic `mv` + `chmod +x` + verify-by-hash with one retry on mismatch; no russh-sftp dep), `spawn_agent_channel` (exec deployed binary, returns channel for wire-protocol use), `handshake_agent` (writes AgentHandshake + reads AgentHandshakeResponse + asserts version — terminal on mismatch). Remote path convention `$HOME/.cache/tepegoz/agent-v<N>`. Agent TOFU model: content-hash verified every deploy, no first-seen DB (embedded bytes are source of truth). New `tepegoz doctor --agents` walks the Fleet host list and reports per-host deploy state. `cargo xtask demo-phase-6 --remote` exercises the full pipeline against a throwaway sshd container. Universal macOS `lipo` deferred to Phase 10 release pipeline. Acceptance: opt-in `remote_agent_deploy_and_handshake` integration test (gated on TEPEGOZ_SSH_TEST=1 + TEPEGOZ_DOCKER_TEST=1; asserts first-deploy uploads, second-deploy cache-hits, agent responds with correct os/arch/version).
+**Slice 6a — Agent scaffolding + local handshake (`f39931f`, 2026-04-15).** stdio-framed `tepegoz-agent` + wire v10 + controller embedding + `cargo xtask build-agents` + `cargo xtask demo-phase-6 up/down` (host-target subprocess handshake).
 
-**Slices 6c/d — Remote scope panels.** Docker, Ports, Processes — same wire protocol, agent-backed. Agent `capabilities` list (empty in 6a/6b) populates as probes land. Daemon-side agent session pool + per-host forwarder tasks inherit the Phase 5 Fleet-supervisor shape.
+**Slice 6b — Remote deploy pipeline (`674b7d3`, 2026-04-15).** `tepegoz-ssh::deploy` (`detect_target` / `inspect_remote_agent` / `deploy_agent` / `spawn_agent_channel` / `handshake_agent`) + `tepegoz doctor --agents` + `demo-phase-6 up --remote` (sshd container + cross-build + deploy + handshake round-trip). Agent TOFU: content-hash every deploy against embedded bytes; no first-seen DB.
 
-**Acceptance (full phase).** Full fleet test: deploy agent to a test VM via SSH, open a remote pane, verify docker panel works against remote docker, verify port scan finds a known open port on remote host.
+**Slice 6c — Remote Docker scope (3 commits).** 6c-i (`0531462`) wire v11 zero-behavior `ScopeTarget` field extension + 8 codec roundtrips. 6c-ii (`16ca267`) daemon `agent_conns` pool + Fleet-supervisor deploy-on-Connected hook + `run_daemon_with_resolver` entry + full routing layer (`route_remote_subscribe` / `route_remote_docker_action` with id translation + missing-alias/capability/writer synthesis of DockerUnavailable). 6c-iii (`0f6061d`) TUI `host_picker` module + `Ctrl-b t` keybind (Decision #7 amendment 5→6 bindings) + `retarget_docker` state-machine + opt-in `remote_docker_subscription_roundtrip` SSH test.
 
-**Not in scope.** Agent auto-update (agents are redeployed per controller version). Multi-user agents.
+**Slice 6d — Capability propagation + remote Ports/Processes (2 commits).** 6d-i (`f3840d7`) wire v12 + `Event::AgentCapabilities` emit-on-register + TUI `App::host_capabilities` populate + picker capability-greying gates commit. 6d-ii (`a2c07d9`) agent-side Ports/Processes probe handlers (mirroring daemon `forward_ports` / `forward_processes` shape; sysinfo CPU-delta state preservation; always-advertised on supported platforms) + daemon `RoutedScope::{Ports, Processes}` + `PortsScope` independent `ports_target` / `processes_target` + `p`-toggle-aware retarget dispatch + opt-in `remote_probes_subscription_roundtrip`.
 
-**Risks.** Cross-compiling the agent for 4 targets is real work (6a proved out the zig-backed path). Protocol/library version drift between controller and embedded agents is caught by the 6a build.rs drift check + runtime handshake version field.
+**Slice 6e — Phase 6 close polish (3 prep commits).** 6e-prep (`3d79b0a`) 8-scenario manual demo script in OPERATIONS + new CI `agents` job (version-drift gate against controller build.rs) + ISSUES v1.1 carve-out entries (Fleet procs em-dash, panes-past-slot-9, ContainerList-over-SSH positive-arm fixture). 6e-prep-2 (`c006587`) cross-build toolchain preflight as step 0 of `preflight_remote` (CTO-flagged fallthrough regression: macOS-sans-zigbuild fell through to broken plain-cargo path + left orphan sshd container). 6e-prep-3 (`a735945`) two-layer preflight fix (rustup target std-lib layer + cargo-zigbuild/musl-gcc linker layer are independent AND not OR; round-2 regression of the same shape) + side-effect reorder (cross-build runs BEFORE any keypair/tempdir/container creation so future unknown toolchain surprises leave zero orphan state). Three-path cold-walk: (1) both layers missing → composite install hint + exit 1 + zero side effects, (2) linker present + std-lib missing → `rustup target add` hint + zero side effects, (3) both present → agent cross-builds (55s fresh release-profile) + sshd container + full handshake + 3 remote subs (Docker DockerUnavailable expected on stock fixture, Ports 2 rows, Processes 28 rows).
+
+**Close (`_close commit_`, 2026-04-16).** User walked the 8-scenario manual demo per OPERATIONS §"Phase 6 close manual demo prep" ("i tested stuff"). STATUS row 6 + ROADMAP Phase 6 marker → ✅. v1 scope-trim decision landed with the close (Decision #8): Phases 7/8/9 → 🔵 deferred to v1.1; Phase 10 renamed "v1.0 release — install packaging" with QUIC scope deferred. v1.0 release slices R1–R4 outlined below.
+
+**Not in scope (shipped as-is).** Agent auto-update (agents redeploy per controller version). Multi-user agents. Three v1.1 carve-outs documented in `docs/ISSUES.md`: Fleet per-host procs-column aggregation (workaround: `Ctrl-b t` on Processes tile retargets to a specific host + shows full list), panes-past-slot-9 reachability (three candidate shapes enumerated), ContainerList-over-SSH positive-arm fixture (scope-bust analysis: docker.sock bind-mount + userns friction on macOS DD; v1.1 path: nested docker-in-docker or managed-VM CI).
+
+**Risks (in flight).** Cross-compiling the agent for 4 targets proved out via the zig-backed path; new CI `agents` job keeps drift between controller build.rs + actual agent build in check on every push. Protocol version drift between controller and user-deployed agents is caught by the compile-time build.rs check + runtime handshake version assertion.
 
 ---
 
-## Phase 7 — Port scanner · ⚪
+## Phase 7 — Port scanner · 🔵 deferred to v1.1
 
 **Goal.** Port scanning as a first-class capability. TCP-connect in v1; SYN deferred to v1.1 (Linux first).
 
@@ -542,7 +554,7 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
 
 ---
 
-## Phase 8 — Recording + replay · ⚪
+## Phase 8 — Recording + replay · 🔵 deferred to v1.1
 
 **Goal.** Every pane keystroke/output is recorded, encrypted at rest, replayable offline.
 
@@ -560,7 +572,7 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
 
 ---
 
-## Phase 9 — Claude Code pane awareness · ⚪
+## Phase 9 — Claude Code pane awareness · 🔵 deferred to v1.1
 
 **Goal.** Parse `~/.claude/projects/` state to augment pty pane metadata. TUI status line shows `● claude: editing foo.rs (42s)` without interrupting the agent.
 
@@ -577,26 +589,54 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
 
 ---
 
-## Phase 10 — QUIC hot path + release 0.1.0 · ⚪
+## Phase 10 — v1.0 release — install packaging · ⚪
 
-**Goal.** Ship.
+**Goal.** Ship v1.0. One-command installation on any macOS or Linux machine without a Rust toolchain.
 
-**Scope.**
-- QUIC via `quinn` over SSH port-forward for hot-path streams (logs, high-volume pane output). Roaming survives wifi flap in ms.
-- Release pipeline in `xtask package`:
-  - Cross-compiled binaries (mac x86_64/arm64, linux x86_64/aarch64 musl).
-  - SHA256 + **minisign signatures** on every artifact (checksums catch corruption; signatures catch tampering).
-  - Homebrew tap `emincb/tap/tepegoz`.
-  - `curl | sh` install script.
-  - Optional `cargo install tepegoz` via crates.io.
-- Agent embedding: `include_bytes!` all four arches into controller (~15 MB total), per `docs/DECISIONS.md#3`.
-- Size/perf tuning: `opt-level="z"`, LTO, strip, feature-gate. Target controller <20 MB, agent <5 MB.
+Renamed 2026-04-16 from the original "QUIC hot path + release 0.1.0" framing — the v1 scope trim (Decision #8) moved QUIC transport swap to v1.0.1 / v1.1 candidates. v1.0 is release packaging only. Original QUIC scope preserved under "Deferred to v1.0.1 / v1.1" below as reference for when the transport-swap picks up.
 
-**Acceptance.** Download binary from GH releases, run it, full fleet demo works. Minisign signature validates against the published pubkey.
+**Slice R1 — Release binary cross-build (xtask).**
+- Extend the `cargo xtask build-agents` pattern with `cargo xtask build-release` that cross-compiles the full `tepegoz` binary (not just the agent) for four targets: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. Reuses the cargo-zigbuild path from 6a/6b.
+- Pick up the universal macOS `lipo` task deferred from Phase 6 Slice 6b. Produces `tepegoz-universal-apple-darwin` that runs on both Apple Silicon and Intel Macs.
+- Artifact layout: `target/release-bundles/<triple>/tepegoz` + `SHA256SUMS` + `manifest.json` (`version`, `built_at_unix_secs`, `target_triple`).
+- Acceptance: local run produces five binaries (four triples + one universal macOS) that each `--version` correctly.
 
-**Not in scope.** Team features. Web UI (v2). AI (v3). Auto-update.
+**Slice R2 — GitHub Actions release workflow.**
+- New `.github/workflows/release.yml` triggered on `v*.*.* ` tag push.
+- Runs `cargo xtask build-release` on ubuntu-latest (Linux targets) AND macos-latest (macOS targets — avoids needing the Xcode SDK on Linux for darwin cross-compile). Collects artifacts, uploads to GitHub Releases.
+- SHA256 checksums published alongside binaries. GPG signing optional for v1.0 — decision deferred to R2 kickoff.
+- Acceptance: push a test tag (e.g. `v0.0.1-test`); release workflow produces a draft release with all five binaries attached + SHA256SUMS.
 
-**Risks.** minisign key management — lose the signing key and future releases can't be signed without rotation. Publish the pubkey in README + tap formula + docs.
+**Slice R3 — Install mechanisms.**
+- **Install script** hosted at `get.tepegoz.dev/install.sh` (register domain) OR `raw.githubusercontent.com/emincb/tepegoz/main/install.sh` (free fallback, decision at R3 kickoff). Auto-detects OS + arch, downloads matching binary from latest GitHub Release, verifies SHA256, installs to `~/.local/bin/tepegoz` (fallback `/usr/local/bin` with `sudo` prompt if `~/.local/bin` not on PATH).
+- **Homebrew formula** in a new tap repo `emincb/homebrew-tap`. `brew install emincb/tap/tepegoz` downloads the right binary from GitHub Releases.
+- **`cargo install tepegoz`** — the workspace already publishes a usable binary crate; verify `cargo install tepegoz` produces a working binary from a fresh Rust toolchain.
+- Acceptance: three fresh VMs (macOS arm64, macOS x86_64, linux x86_64) can each run one of the three install commands and end up with a working `tepegoz` binary.
+
+**Slice R4 — First-run UX polish + v1.0.0 tag + release.**
+- `tepegoz doctor` prints install path + version + dependency self-check (docker reachable / ssh available / rustup target for demo usage).
+- `tepegoz daemon` first-run creates `$XDG_CONFIG_HOME/tepegoz/` with a default config.toml if none exists.
+- README install section: swap placeholder shell commands for real URLs/formulas. Add a `## Installing` section with per-OS instructions.
+- OPERATIONS install + upgrade walkthrough section.
+- Tag `v1.0.0`, trigger the R2 release workflow, publish v1.0.0 on GitHub Releases with release notes linking back to the close-commit STATUS + ROADMAP.
+- Acceptance: user walks `curl ... | sh` on a fresh macOS or Linux machine without a Rust toolchain, ends up running `tepegoz daemon` + `tepegoz tui` in under 30 seconds.
+
+**Not in scope (v1.0).** Team features. Web UI (v2). AI (v3). Auto-update.
+
+**Risks.** GPG key management if signing lands — lose the signing key and future releases can't be signed without rotation. Publish the pubkey in README + tap formula + docs.
+
+### Deferred to v1.0.1 / v1.1 — QUIC hot-path transport (preserved from the original Phase 10 scope)
+
+Original Phase 10 scope included a QUIC-over-SSH port-forward for hot-path streams (logs, high-volume pane output) so roaming survives wifi flap in ms. v1 scope trim moved this to v1.0.1 / v1.1 candidate — the speedup is nice-to-have but not gating daily-use usability. Picks up if SSH stdio latency surfaces as a real pain point during v1.0 daily-use.
+
+Scope when picked up:
+- QUIC via `quinn` over SSH port-forward. Daemon opens the QUIC stream inside an already-authenticated SSH session so auth + TOFU stay on the SSH layer.
+- Graceful fallback to SSH stdio if QUIC negotiation fails.
+- Wire protocol unchanged (same rkyv envelopes, different transport underneath).
+
+### Deferred to release hardening — minisign signing (preserved from original Phase 10 scope)
+
+Original scope called for minisign signatures on every artifact (checksums catch corruption; signatures catch tampering). v1.0 ships SHA256 only; minisign picks up at release hardening (v1.0.1 or v1.1 based on user/community signal).
 
 ---
 

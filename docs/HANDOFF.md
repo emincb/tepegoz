@@ -16,7 +16,79 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## CTO section
 
-**Last updated:** 2026-04-16, post-6e-prep-2 (`c006587`, local commit two ahead of origin; engineer holding push per standing discipline). HEAD `c006587` local, `a2c07d9` origin. **Stack**: `c006587` (6e-prep-2 cross-build toolchain preflight fix) on top of `3d79b0a` (6e-prep docs+CI) on top of `a2c07d9` (6d-ii). **6e-prep-2 narrative**: user cold-walked initial prep on clean macOS host without `cargo-zigbuild`; xtask wall-clock-failed at step 0 with side effects (sshd container left running, ed25519 keypair generated, 5+ crates downloaded) + misleading "add musl target" hint — direct violation of `feedback_demo_tooling.md` rule. Engineer landed preflight fix: `preflight_cross_build_toolchain` at position #4 of `preflight_remote` (after cargo/docker/ssh-keygen, before `docker info` + all downstream side effects); requires `cargo-zigbuild` on PATH OR (Linux-only) `rustup target list --installed` listing `x86_64-unknown-linux-musl`; removed silent zigbuild→plain-cargo fallback from `cargo_build_linux_musl_agent`. Cold-walk verified by engineer on representative host: <1s exit-1 with install hint, zero side effects. Also OPERATIONS.md Slice 6b demo-prereqs phrasing fix + engineer-side memory entry `feedback_demo_tooling_cold_walk.md`. **CTO sign-off discipline lesson saved** to memory (`feedback_demo_tooling_signoff_discipline.md`): ask engineer "have you cold-walked this on a representative host?" before greenlighting user-walk readiness on demo-tooling deliverables. **User-gated**: install `cargo-zigbuild` + walk 8-scenario demo; pass-across-all-8 → Phase 6 close commit. **Fresh CTO reading cold — engineer memory cleared at same boundary; both sides pick up from HANDOFF + repo state.**
+**Last updated:** 2026-04-16, **SESSION RESTART BOUNDARY — both CTO and engineer sessions cleared simultaneously at user's request.** HEAD: `a735945` local (three commits ahead of origin `a2c07d9`). Stack top to bottom: `a735945` (6e-prep-3 two-layer preflight + side-effect reorder) → `c006587` (6e-prep-2 single-layer preflight) → `3d79b0a` (6e-prep docs + CI + ISSUES v1.1 carve-outs) → `a2c07d9` (6d-ii, origin tip).
+
+---
+
+### SESSION RESTART ORIENTATION (read me first if you're freshly loaded CTO)
+
+**Where we are:**
+
+1. **Phase 6 engineering work is COMPLETE** end-to-end across 7 commits (6a → 6d-ii) + 3 prep commits (6e-prep / 6e-prep-2 / 6e-prep-3). The three prep commits are local-only, NOT pushed yet — engineer has been holding push per standing "no push without explicit ask" discipline.
+2. **User walked the 8-scenario manual demo** between the prior CTO session's last message and this session restart. User's words: "i tested stuff." Interpretation: user ran `cargo xtask demo-phase-6 up --remote` + walked the OPERATIONS.md §"Phase 6 close manual demo prep" scenarios. No per-scenario pass/fail matrix was relayed; CTO interpretation is that it passed cleanly enough that user is ready to close Phase 6 and move to v1.0 release work. **If per-scenario breakdown matters for the close commit message, ask the user.**
+3. **Phase 6 close commit is PENDING.** Needs STATUS row 6 → ✅ + ROADMAP Phase 6 marker → ✅ + the five `_slice-*-commit_` placeholder hashes in STATUS row 6 + prior rows filled with real SHAs + ROADMAP Phases 7/8/9/10 rename/reclassify per v1 scope trim (see below) + `docs/DECISIONS.md` note about v1 scope trim.
+4. **v1 scope trim LOCKED** (2026-04-16 user + PM-Claude + CTO-Claude discussion; memory entry `project_v1_scope_trim`). Phases 7 (port scanner), 8 (pane recording), 9 (polish) are cut from v1. v1.0 ships Phases 1-6 + Phase 10 (renamed to "v1.0 release — install packaging"). Rationale: user said "my tool can do more than I can do; ship, use, let gaps find you." Phases 7/8/9 become v1.1 candidates with original scope preserved in ROADMAP as reference.
+5. **v1.0 release scope trimmed from Phase 10's original framing**: Phase 10 was "QUIC hot path + release 0.1.0". User's emphasis is on **easy installation** — "allow single command installations to any machine that runs macOS or Linux." CTO recommendation: **drop QUIC-over-SSH transport swap from v1.0**, defer to v1.0.1 or v1.1 if SSH stdio latency surfaces during daily use. v1.0 = release packaging only. See "v1.0 release scope (R1-R4)" below.
+6. **v2 product discussion saved to `docs/V2_VISION.md`** and memory entry `project_v2_direction`. v2 is a native Android app for remote-prompting Claude Code agents; two load-bearing architectural questions remain open (daemon-on-VM vs daemon-on-laptop; FCM vs foreground-service for notifications). **v2 engineering does NOT start until v1.0 ships and user has lived in it long enough for daily-use gaps to surface.** If user asks to revisit v2 before v1.0 ships, redirect.
+
+**What the fresh CTO session does next:**
+
+- Verify `git log --oneline -10` matches the stack-top claim above. If tree has advanced past `a735945`, read the new commits and reset expectations.
+- **Do NOT push.** That's the engineer's call after they read their own HANDOFF section and validate the stack.
+- Await engineer's report of "Phase 6 close commit landed." When it arrives, verify STATUS + ROADMAP flipped correctly, CI green on push, then relay **v1.0 Slice R1 scope** (first release-packaging slice — see below).
+
+**What the fresh engineer session does next** (see Engineer section too):
+
+- Read `docs/HANDOFF.md` Engineer section (prior engineer wrote their own signoff at 6e-prep-3). Confirm pending state.
+- Review local unpushed stack (`a735945` + `c006587` + `3d79b0a`).
+- Push the stack to origin (`git push`). Validate CI green, including the new `agents` job added in `3d79b0a` (first time that job runs on CI — possible first-push surprises).
+- Land Phase 6 close commit: STATUS row 6 ✅ + ROADMAP Phase 6 ✅ + placeholder hashes filled + Phases 7/8/9 in ROADMAP marked 🔵 deferred (preserve original scope text as reference) + Phase 10 renamed to "v1.0 release — install packaging" with scope trimmed (QUIC removed, see below) + `docs/DECISIONS.md` gets a v1 scope trim entry + HANDOFF engineer section closed for Phase 6 + README install section updated (placeholders stay placeholders until Slice R3 makes the URLs real).
+- Report close commit back; await v1.0 Slice R1 scope relay from CTO.
+
+---
+
+### v1.0 release scope (renamed from Phase 10) — relay to engineer after Phase 6 close
+
+**Primary goal.** One-command installation on any macOS or Linux machine without a Rust toolchain.
+
+**NOT in v1.0** (dropped from original Phase 10):
+- **QUIC-over-SSH transport swap.** The speedup is a nice-to-have but not gating daily-use usability. Defer to v1.0.1 or v1.1 if SSH stdio latency surfaces as a real pain point during daily use. Keep the Phase 10 "QUIC hot path" text in ROADMAP as reference material for when it picks up.
+
+**Slice R1 — Release binary cross-build (xtask)**
+- Extend `cargo xtask build-agents` pattern with `cargo xtask build-release` that cross-compiles the full `tepegoz` binary (not just the agent) for 4 targets: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. Reuse cargo-zigbuild path.
+- Pick up the universal macOS `lipo` task deferred from Phase 6 Slice 6b. Produces `tepegoz-universal-apple-darwin` that runs on both Apple Silicon and Intel Macs.
+- Artifact layout: `target/release-bundles/<triple>/tepegoz` + `SHA256SUMS` + `manifest.json` (version, built_at_unix_secs, target_triple).
+- Acceptance: local run produces 5 binaries (4 triples + 1 universal macOS) that each `--version` correctly.
+
+**Slice R2 — GitHub Actions release workflow**
+- New workflow in `.github/workflows/release.yml` triggered on `git tag v*.*.* ` push.
+- Runs `cargo xtask build-release` on ubuntu-latest AND macos-latest (Linux targets on ubuntu, macOS targets on macos-latest — avoid cross-compiling macOS on Linux which needs Xcode SDK), collects artifacts, uploads to GitHub Releases.
+- SHA256 checksums published alongside binaries. GPG signing optional for v1.0 — flag decision at R2 kickoff.
+- Acceptance: push a test tag (`v0.0.1-test`), release workflow produces a draft release with all 5 binaries attached.
+
+**Slice R3 — Install mechanisms**
+- **Install script** hosted at `get.tepegoz.dev/install.sh` (or `raw.githubusercontent.com/...` for v1.0 if domain not yet set up). Auto-detects OS + arch, downloads matching binary from latest GitHub Release, verifies SHA256, installs to `~/.local/bin/tepegoz` (fallback `/usr/local/bin` with `sudo` prompt if `~/.local/bin` not in PATH).
+- **Homebrew formula** in a new tap repo `emincb/homebrew-tap` (or similar). `brew install emincb/tap/tepegoz` downloads the right binary from GitHub Releases.
+- **`cargo install tepegoz`** — kept working since the workspace already publishes to crates.io-shaped. Verify `cargo install tepegoz` produces a runnable binary from a fresh Rust toolchain.
+- Acceptance: three fresh VMs (macOS-arm64, macOS-x86_64, linux-x86_64) can each run ONE of the three install commands and end up with a working `tepegoz` binary.
+
+**Slice R4 — First-run UX polish + v1.0.0 tag + release**
+- `tepegoz doctor` prints install path + version + dependency self-check (docker reachable / ssh available / rustup target for demo usage).
+- `tepegoz daemon` first-run creates `$XDG_CONFIG_HOME/tepegoz/` with a default config if none exists.
+- README install section: swap placeholder shell commands with real URLs/formulas. Add a `## Installing` section with per-OS instructions.
+- OPERATIONS install + upgrade walkthrough section.
+- Tag `v1.0.0`, trigger release workflow, publish v1.0.0 on GitHub Releases with release notes.
+- Acceptance: user walks `curl ... | sh` on a fresh macOS or Linux machine without a Rust toolchain, ends up running `tepegoz daemon` + `tepegoz tui` in under 30 seconds.
+
+**Standing disciplines apply unchanged**: CI-green + clean-state on every slice commit; demo-tooling cold-walk both failure path AND success path before declaring ready; 60-second cold-start rule for any installer deliverable.
+
+---
+
+### v2 discussion — shelved
+
+See `docs/V2_VISION.md` for full state. Two decisions pending from user before any v2 work: (1) daemon-on-VM vs daemon-on-laptop; (2) FCM wakeup vs foreground-service. v2 engineering does not start until v1.0 ships.
+
+---
 
 ### What I just signed off on
 - **Phase 6 Slice 6e-prep-2 landed: cross-build toolchain preflight fix** (2026-04-16). Commit `c006587` on top of `3d79b0a` (still local, 2 ahead of origin). User cold-walk surfaced demo-tooling regression on clean macOS host: `cargo xtask demo-phase-6 up --remote` without `cargo-zigbuild` silently fell back to broken plain-cargo path, generating a sshd container + ed25519 keypair + 5 downloaded crates before failing with misleading "add musl target" hint (in reality macOS needs target + linker like `musl-cross`, not just `rustup target add`). Direct violation of `feedback_demo_tooling.md` 60-second cold-start rule. Fix: `preflight_cross_build_toolchain` at position #4 of `preflight_remote` — runs before `docker info` + any side effects; accepts `cargo-zigbuild` on PATH OR (Linux only) `rustup target list --installed` listing `x86_64-unknown-linux-musl`; macOS hard-requires zigbuild with explicit install hint (`cargo install --locked cargo-zigbuild && brew install zig`). Silent zigbuild→plain-cargo fallback removed from `cargo_build_linux_musl_agent` — preflight guarantees subcommand validity. Cold-walk verified by engineer on representative host: <1s exit-1, zero side effects (no tempdir / no container / no downloaded crates beyond xtask's own compile). Loop-closing work: OPERATIONS.md Slice 6b demo-prereqs phrasing fix (misleading "musl target + linker" → preflight-accurate `rustup target add` for Linux); engineer-side memory entry `feedback_demo_tooling_cold_walk.md` so future engineer sessions cold-walk demo runners themselves before declaring ready. Clippy / fmt / `cargo test --workspace` all green. **My CTO sign-off discipline gap also closed**: saved memory entry `feedback_demo_tooling_signoff_discipline.md` — ask engineer the cold-walk question explicitly before greenlighting user-walk readiness on demo-tooling deliverables; user shouldn't have had to surface this with "ask the engineer has he even tried running it." **User-gated next step**: install `cargo-zigbuild` (`cargo install --locked cargo-zigbuild && brew install zig`), then push the two-commit stack (`3d79b0a` + `c006587`) to origin to validate the new CI `agents` job in isolation, then walk the 8-scenario demo.
@@ -54,16 +126,36 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ### What's in flight with the engineer
 
-**Phase 6 Slice 6e — Phase 6 close polish.** Final engineering slice; after user eyeball gate passes, Phase 6 ships. Scope: (1) **8-scenario manual demo script** — engineer defines the 8 scenarios in OPERATIONS.md, each driven by `cargo xtask demo-phase-6 up --remote`; covers cold-start remote Docker subscribe, lifecycle action against remote container, remote Ports + Processes populating from agent probes, agent disconnect → *Unavailable toasts, reconnect → state resumes, concurrent multi-tile remote subscribe (Docker + Ports + Processes same host), retarget Local ↔ Remote via `Ctrl-b t` across all three tile kinds, capability-greying correctness (Connected-but-no-cap host shown greyed in picker). User walks the script + reports pass/fail per scenario — same discipline as Phase 4 close. (2) **Version-drift CI step** — `cargo xtask build-agents` runs in CI; verifies manifest integrity (protocol_version matches `PROTOCOL_VERSION` text file, triple matches target) without shipping binaries to artifacts. Cheap sanity gate against controller `build.rs` drift vs. actual agent build. (3) **ContainerList-over-SSH positive-arm fixture** — extend 6c-iii's `remote_docker_subscription_roundtrip` opt-in test with docker.sock bind-mount + docker-group membership in the container so the ContainerList arm (not just DockerUnavailable arm) gets SSH coverage. Budget <60 min; if engineer hits scope concern, accept as ISSUES entry for v1.1 polish. (4) **STATUS row 6 flip to ✅** with full commit list (6a → 6d-ii, 7 commits) + test-count deltas + manual-demo pass citation after user walks. (5) **ROADMAP Phase 6 marker ✅ (2026-04-16)** or user's sign-off date. (6) **ISSUES carve-out entries** — Fleet procs aggregation em-dash (v1.1 polish; `Ctrl-b t` on Processes tile is the workaround; aggregation deferred because cross-host simultaneous Processes subscription doesn't fit 6d's single-target picker model); panes-past-slot-9 (accepted as v1.1 unless manual demo surfaces real user-blocker — then engineer surfaces tactical-call shape). (7) **Docs sweeps** — OPERATIONS close for remote scopes if anything from 6d landed mid-flight; HANDOFF close for Phase 6. **Non-scope for 6e**: Phase 7 (port scanner) scoping — that's a separate phase entry; 6e is purely Phase 6 close.
+**Phase 6 close commit (PENDING — user demo walk passed per "i tested stuff").** Engineer picks up fresh, pushes the 3-commit prep stack (`a735945` + `c006587` + `3d79b0a`) to validate the new `agents` CI job, then lands Phase 6 close commit folded with v1 scope-trim doc updates. Scope of the close commit:
+
+1. **STATUS row 6 → ✅** with commit list (6a → 6d-ii, 7 commits), test-count deltas (341 → 398), manual-demo pass citation (user walked 8 scenarios per OPERATIONS.md §"Phase 6 close manual demo prep"; per-scenario pass/fail matrix should be asked of user if needed, else cite as "user signed off, see HANDOFF CTO section").
+2. **ROADMAP Phase 6 marker → ✅** (2026-04-16) with commit hashes filled: 6a `f39931f`, 6b `674b7d3`, 6c-i `0531462`, 6c-ii `16ca267`, 6c-iii `0f6061d`, 6d-i `f3840d7`, 6d-ii `a2c07d9`, plus 6e-prep chain `3d79b0a` / `c006587` / `a735945` as Phase 6 close-prep commits. Also fill placeholders for `_slice-6a commit_` / `_slice-6b commit_` / `_slice-6d-ii commit_` in STATUS row 6.
+3. **ROADMAP v1 scope trim**: Phases 7/8/9 flip from ⚪ to 🔵 deferred (original scope text preserved in-place as reference — do NOT delete; future v1.1 picks up from there). Phase 10 renamed from "QUIC hot path + release 0.1.0" to **"v1.0 release — install packaging"** with scope trimmed: QUIC-over-SSH transport swap text moved to a "Deferred to v1.0.1 / v1.1" subsection (preserve as reference). New scope text describes R1-R4 slices (see CTO SESSION RESTART ORIENTATION block above for the full plan).
+4. **`docs/DECISIONS.md` gets a new dated entry** capturing the v1 scope-trim decision (2026-04-16, user + PM-Claude + CTO-Claude discussion; rationale: "tool can do more than I can; ship, use, let gaps find you"). Link to `project_v1_scope_trim` memory entry if the DECISIONS format supports cross-references.
+5. **README install section**: stays placeholder (the three commands listed already — `brew install emincb/tap/tepegoz` / `curl -fsSL https://get.tepegoz.dev | sh` / `cargo install tepegoz`). Do NOT make them real URLs yet — Slice R3 lands the real mechanisms. Keep the "placeholder — tap not live yet" comments until then.
+6. **HANDOFF engineer section** closes Phase 6, notes Phase 10 (now v1.0 release) scope is incoming from CTO.
+
+Engineer tactical: single close commit OR close commit + separate scope-trim commit. Single commit is fine; landing the scope-trim with the close makes the history cleaner ("v1 scope locked, Phase 6 ships, v1.0 release kicks off" is one moment).
 
 ### What I'm expecting next
 
-- **Engineer's Slice 6e commit(s)** — Phase 6 close polish per scope above. 8-scenario manual demo script in OPERATIONS.md + version-drift CI step + ContainerList-over-SSH positive-arm fixture (budget <60 min; scope-concern flag acceptable) + STATUS/ROADMAP markers flipped + ISSUES carve-outs for Fleet procs em-dash + panes-past-slot-9. CI green on push.
-- **User walks 8-scenario demo + reports pass/fail per scenario** — eyeball gate; same discipline as Phase 4 close. Any failure → engineer diagnose + fix + re-walk. Green-across-all-8 → STATUS + ROADMAP flip to ✅.
-- **Phase 7 (port scanner) scoping relay** — after Phase 6 ships. Fresh proposal (7-ish questions) from engineer, same shape as Phase 5's — CTO review + adjust + greenlight.
-- **Panes-past-slot-9 revisit** — accepted as-is for v1; Phase 6 agent multiplex is the natural time to design the overflow UX. Likely surfaces as a tactical call once remote panes stack up during 6c/6d use; engineer picks a shape (clickable `[+N]` modal vs. horizontal-scroll tab strip vs. agent-shaped alternative) and flags for sign-off if the fix isn't trivially in-scope.
+1. **Engineer pushes the 3-commit stack + validates CI green.** First time the `agents` job runs on CI; engineer watches for zig/cargo-zigbuild install surprises on ubuntu-latest.
+2. **Engineer lands Phase 6 close commit** per scope above. CI green on push.
+3. **CTO relays v1.0 Slice R1 scope** (release binary cross-build) after close commit lands — scope outlined in the SESSION RESTART ORIENTATION block above; engineer picks tactical details.
+4. **v1.0 R1 → R2 → R3 → R4** sequentially, same sliced discipline as Phase 5-6 had. Standing rules apply: CI-green + clean-state per slice; demo-tooling cold-walk both paths before declaring ready; 60-second cold-start rule for any install-script deliverable.
+5. **User walks Slice R3 install-script cold-walk** as the v1.0 eyeball gate (fresh macOS or Linux machine without Rust toolchain → one curl/brew command → working tepegoz in under 30 seconds). This is the user-facing acceptance.
+6. **`v1.0.0` tag + GitHub Release** → v1.0 ships. User starts daily-driving. After a few weeks of use, v1.1 planning begins from daily-use gaps (v1.0.1 for any bugs surfaced; v1.1 picks up from Phases 7/8/9 candidates if user flags them missed; v2 discussion resumes if user flags mobile need).
 
 ### Open questions I'm holding (not yet in DECISIONS.md)
+
+**Note to fresh CTO (2026-04-16):** Most entries below are historical Phase 3/4/5/6 notes preserved for audit. The live open questions post-v1-scope-trim are two:
+
+- **v1.0 release install-script host/domain**: `get.tepegoz.dev` (new domain, needs registration + hosting) vs. `raw.githubusercontent.com/...` (free, but less memorable). Tactical at Slice R3 kickoff. My lean: `raw.githubusercontent.com` for v1.0.0 simplicity; register `tepegoz.dev` for v1.1.
+- **v1.0 GPG release signing**: optional or mandatory for the GitHub Release workflow? My lean: skip for v1.0, add in v1.0.1 if security-conscious users flag. Tactical at Slice R2 kickoff.
+
+All v2 open questions live in `docs/V2_VISION.md` §"Open architectural questions" and are frozen until post-v1.0-ship.
+
+**Historical (Phase 5/6 era, kept for audit):**
 
 - **Phase 5 load-bearing Q5 resolution is option (b) tab-strip.** Decision NOT amended. If 5d's tab-strip visuals turn out too noisy in practice (>4 panes at 120-col widths), the fallback polish is compacting labels to `[N]` without the name, OR reserving an overflow indicator `[+N more]`. Don't pre-optimize; let the 5d eyeball pass surface it if real.
 - **5a follow-ups status (all five tracked from 5a review):**
@@ -126,9 +218,20 @@ When docs and HANDOFF conflict, docs win. Update HANDOFF (or delete the stale en
 
 ## Engineer section
 
-**Last updated:** 2026-04-16, post-Phase-6-Slice-6e-prep-3 (CTO-flagged demo-tooling round-2 regression fixed: preflight now checks both rust std-lib layer AND linker layer independently; side-effect reordering means agent cross-build runs BEFORE any keypair/container/tempdir creation, so any future toolchain surprise leaves zero orphan state). Phase 6 engineering is **complete across all 7 commits (6a → 6d-ii)**; 6e prep lands as three commits (`3d79b0a` docs + CI; `c006587` first preflight pass; 6e-prep-3 two-layer preflight + side-effect reorder). Awaiting user's 8-scenario manual demo walk. After user signs off per scenario, the Phase 6 close commit flips STATUS row 6 + ROADMAP marker to ✅ and fills in the placeholder commit hashes. Fresh engineer reading cold: `git log --oneline -10` shows the 6e-prep-3 commit on top of `c006587` (6e-prep-2) on top of `3d79b0a` (6e-prep) on top of `a2c07d9` (6d-ii). STATUS.md row 6 stays 🟠 until demo walk completes.
+**Last updated:** 2026-04-16, post-Phase-6-close. **Phase 6 SHIPPED end-to-end.** User walked the 8-scenario manual demo per OPERATIONS §"Phase 6 close manual demo prep" ("i tested stuff"). STATUS row 6 + ROADMAP Phase 6 marker flipped to ✅ with commit hashes filled. v1 scope trim locked (`docs/DECISIONS.md#8`): Phases 7/8/9 → 🔵 deferred to v1.1 (scope text preserved in ROADMAP as reference); Phase 10 renamed "v1.0 release — install packaging" with QUIC transport swap deferred to v1.0.1/v1.1. v1.0 release slices R1–R4 outlined in ROADMAP Phase 10. **Awaiting CTO relay of v1.0 Slice R1 kickoff scope** (release binary cross-build xtask). Fresh engineer reading cold (new session): `git log --oneline -10` shows the Phase 6 close commit on top of `a735945` / `c006587` / `3d79b0a` / `a2c07d9`; all four pushed to origin. STATUS.md row 6 is ✅; next slice is a fresh R1 scoping from the CTO.
 
 ### Where I left off
+
+**Phase 6 close commit landed (2026-04-16).** Fold of the user's 8-scenario demo-walk sign-off with the v1-scope-trim docs. Zero code change:
+
+- `docs/STATUS.md` row 6 ✅ with the 10-commit Phase 6 history (6a → close) + 398-test count + user demo-walk citation ("i tested stuff"). Placeholder hashes (`_slice-6a commit_` / `_slice-6b commit_` / `_slice-6d-ii commit_`) filled with real SHAs. Matrix keys gain 🔵 deferred state. "Next phase" section rewritten to point at v1.0 release (renamed Phase 10).
+- `docs/ROADMAP.md` Phase 6 marker ✅ with commit hashes + end-to-end outcome narrative; Phase 7/8/9 headers → 🔵 deferred to v1.1 (scope text preserved below the header as reference); Phase 10 renamed "v1.0 release — install packaging" with R1–R4 slice outlines (cross-build xtask → GitHub Actions release workflow → install mechanisms → first-run UX + v1.0.0 tag); original QUIC scope preserved as "Deferred to v1.0.1 / v1.1" subsection at the end of Phase 10. Top-of-file intro updated with v1 scope trim rationale.
+- `docs/DECISIONS.md` new Decision #8 (v1 scope trim) captures the scope lock + reopen path. Dated 2026-04-16.
+- `docs/HANDOFF.md` engineer section (this file) closes Phase 6, notes awaiting v1.0 Slice R1 relay.
+
+Four commits landed + pushed: Phase 6 close (just landed) on top of 6e-prep-3 (`a735945`) on top of 6e-prep-2 (`c006587`) on top of 6e-prep (`3d79b0a`) on top of origin's 6d-ii (`a2c07d9`). Push validated the new CI `agents` job end-to-end (first cargo xtask build-agents + cargo check -p tepegoz gate run under CI's zig-install path).
+
+**Phase 6 Slice 6e-prep-3 closed (`a735945`, preflight-layers fix + side-effect reorder).** See the commit message + ISSUES v1.1 carve-outs for the scope-bust shape. Zero user-facing behavior change when the toolchain is complete.
 
 **Phase 6 Slice 6e-prep-3 closed (preflight-layers fix + side-effect reorder, zero user-facing behavior change when toolchain is complete).** CTO-flagged after 6e-prep-2 — I had shipped a preflight that accepted "zigbuild OR rustup target" as an OR, conflating a linker layer (zigbuild) with a std-lib layer (rustup target). A macOS host with zigbuild installed per my first hint but without the musl target green-lit through preflight, then failed mid-cross-build with `can't find crate for 'core'`, leaving an orphan sshd container. Second regression of the same shape — I also hadn't cold-walked the success path of my 6e-prep-2 fix (only the failure path), so the round-2 precondition wasn't stripped from my environment. Fixes:
 
@@ -236,26 +339,31 @@ Full Slice 6.0 arc: `input.rs` rewrite (keybind surface + Tab/Shift-Tab intercep
 
 ### What I'm mid-flight on
 
-_6e prep commit is pushed. Awaiting user's 8-scenario manual demo walk against `cargo xtask demo-phase-6 up --remote` + manual daemon/TUI spin-up per the new "Phase 6 close manual demo prep" OPERATIONS section. After user reports pass/fail per scenario, the Phase 6 close commit (task #8 in the internal task list) flips STATUS row 6 + ROADMAP marker to ✅, fills in the `_slice-6a commit_` / `_slice-6b commit_` / `_slice-6d-ii commit_` placeholder hashes, and closes HANDOFF for Phase 6._
+_Nothing — Phase 6 is closed and pushed. Awaiting CTO's v1.0 Slice R1 scope relay (release binary cross-build xtask; `cargo xtask build-release` that mirrors the `build-agents` pattern for the full `tepegoz` binary across four target triples, producing `target/release-bundles/<triple>/tepegoz` + SHA256SUMS + manifest.json + a universal-macOS `lipo` binary). See ROADMAP §Phase 10 "Slice R1" for the outlined scope. Standing disciplines apply: CI-green + clean-state per slice commit; demo-tooling cold-walk both failure and success paths; 60-second cold-start for any installer deliverable._
 
 ### What I'm expecting from the CTO next
 
-- **User 8-scenario demo walk + pass/fail reports per scenario.** Same discipline as Phase 4 close. Any failure → engineer diagnose + fix + re-walk against the updated prep commit; any polish drift caught → folded into the close commit. All 8 ☑ → Phase 6 close commit flips STATUS + ROADMAP + HANDOFF close.
-- **Phase 7 (port scanner) scoping relay** after Phase 6 ships. Fresh proposal (7-ish questions) from engineer, same shape as Phase 5's — CTO review + adjust + greenlight. Non-scope for 6e.
-- **ContainerList-over-SSH positive-arm fixture** — accepted as v1.1 per the 6e scope-bust analysis (see new ISSUES entry). If the CTO has a shape in mind that sidesteps the macOS DD userns friction (e.g. managed-VM CI fixture), relay that shape and we'll reopen at v1.1 pickup time — but Phase 6 ships without it.
-- **Panes past slot 9 unreachable.** ISSUES entry updated with three v1.1 candidate shapes. Pick at v1.1 pickup based on user usage (demo walk doesn't stack >9 panes so no data today).
-- **Fleet procs column** v1.1 polish — accept-and-defer per the 6d-ii carve-out + ISSUES entry. If user feedback during 6e demo surfaces real pain, can revisit; otherwise the per-host workaround (`Ctrl-b t` retargets Processes tile to a host) ships.
+- **v1.0 Slice R1 scope relay** — release binary cross-build (xtask). Per ROADMAP Phase 10 R1: `cargo xtask build-release` cross-compiling `tepegoz` for x86_64-apple-darwin + aarch64-apple-darwin + x86_64-unknown-linux-musl + aarch64-unknown-linux-musl + universal macOS via `lipo`; artifact layout `target/release-bundles/<triple>/tepegoz` + SHA256SUMS + manifest.json; acceptance = five binaries that each `--version` correctly. CTO may flag tactical questions (cargo-zigbuild reuse, `lipo` tooling availability on dev vs. CI, release-profile tuning).
+- **Slices R2 → R3 → R4** in sequence after R1 lands. R2: GitHub Actions release workflow on tag push. R3: install script + Homebrew formula + `cargo install`. R4: first-run UX polish + v1.0.0 tag.
+- **v1.1 carve-out watch-list carries over** from Phase 6 close: Fleet procs aggregation, panes-past-slot-9, ContainerList-over-SSH positive-arm fixture, orphan agent-v<N-1> cleanup. If any of these bite during v1.0 daily-use walk-throughs (especially the install-script acceptance at R3), revisit at R4 polish or as a v1.0.x patch.
 
 ### Phase 6 close-state summary
 
-Ten commits across 6a → 6d-ii ship Phase 6 end-to-end:
+**Ten commits** across 6a → close ship Phase 6 end-to-end:
+
 - **6a** (`f39931f`): agent scaffolding + wire v10 + local handshake demo
 - **6b** (`674b7d3`): remote agent deploy pipeline + `tepegoz doctor --agents`
 - **6c-i** (`0531462`): wire v11 — `ScopeTarget` on retargetable subscriptions
 - **6c-ii** (`16ca267`): daemon agent pool + transparent-proxy routing
 - **6c-iii** (`0f6061d`): Docker retarget UX + `Ctrl-b t` + Decision #7 amendment
 - **6d-i** (`f3840d7`): wire v12 — `Event::AgentCapabilities` + picker capability greying
-- **6d-ii** (current): remote Ports + Processes end-to-end
+- **6d-ii** (`a2c07d9`): remote Ports + Processes end-to-end
+- **6e-prep** (`3d79b0a`): 8-scenario demo script + CI `agents` job + ISSUES v1.1 carve-outs
+- **6e-prep-2** (`c006587`): first cross-build preflight pass (macOS-sans-zigbuild regression fix)
+- **6e-prep-3** (`a735945`): two-layer preflight + side-effect reorder (round-2 regression fix)
+- **close** (just landed): STATUS ✅ + ROADMAP ✅ + DECISIONS #8 v1 scope trim + HANDOFF close
+
+398 tests workspace-wide on macOS. Wire protocol v9 → v12 across the phase. Three ISSUES v1.1 carve-outs preserved: Fleet procs aggregation, panes-past-slot-9 (3 candidate shapes), ContainerList-over-SSH positive-arm fixture (scope-bust analysis → docker-in-docker or managed-VM CI path). User walked the 8-scenario demo per OPERATIONS §"Phase 6 close manual demo prep" ("i tested stuff").
 
 Outstanding for 6e: docs close, 8-scenario manual demo, version-drift CI step, Fleet procs aggregation accept-or-revisit decision.
 
