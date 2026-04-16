@@ -793,11 +793,17 @@ Slice 6b turns the 6a-embedded agent binaries into something you can actually ru
 1. **`cargo xtask demo-phase-6 up --remote`** — spawns a throwaway sshd container (`tepegoz-demo-phase-6-sshd`, separate from demo-phase-5's), cross-builds `tepegoz-agent` for `x86_64-unknown-linux-musl`, connects via tepegoz-ssh, deploys, and drives one handshake round-trip over the exec channel. Validates the full Slice 6b pipeline end-to-end against a known fixture.
 
    ```sh
-   # Requires: docker, ssh-keygen, plus a working cross-compile path —
-   # either `cargo-zigbuild` on PATH (cross-platform, macOS + Linux)
-   # or — Linux only — `rustup target add x86_64-unknown-linux-musl`.
-   # The xtask preflights this BEFORE any side effects; on macOS
-   # without zigbuild it prints the install hint + exits clean.
+   # Requires: docker, ssh-keygen, plus a complete Linux musl cross-
+   # compile toolchain. Two independent layers — BOTH required:
+   #   1. Rust std for the target:  rustup target add x86_64-unknown-linux-musl
+   #   2. A musl-capable linker:    cargo install --locked cargo-zigbuild
+   #                                && brew install zig   (macOS)
+   #                                or apt|dnf|pacman install zig (Linux)
+   #                                (on Linux, `musl-gcc` works instead
+   #                                of the zigbuild+zig pair)
+   # The xtask preflights both layers BEFORE any side effect; missing
+   # pieces trigger a composite install hint + clean exit with zero
+   # tempdir, keypair, or container state.
    cargo xtask demo-phase-6 up --remote
    # Expect (protocol_version reflects live PROTOCOL_VERSION file):
    #   [demo-phase-6] sshd listening at 127.0.0.1:<port>
@@ -912,6 +918,24 @@ cargo xtask demo-phase-6 down --remote
 Closes Phase 6. Same shape as 4d + 5e: 8 scenarios, pass/fail matrix, all rows are the gate. The 8 scenarios exercise the full remote-scopes surface end-to-end: retarget UX (keyboard + mouse), multi-tile concurrency, capability greying, agent disconnect + reconnect state handling.
 
 Unlike demo-phase-5's `up` — which brings up the full fixture + daemon + blocks for TUI in one command — `cargo xtask demo-phase-6 up --remote` today only drives automated verification (handshake + subs through a direct SSH channel) and then exits after printing results. A one-command daemon-spawn wrapper around demo-phase-6 is a v1.1 polish candidate; for the 8-scenario walk the user brings up the fixture via the xtask, then starts the daemon + TUI by hand against the same fixture paths. Three terminals; the prep block below walks through each one.
+
+### Prereqs (one-time)
+
+Beyond `docker` + `ssh-keygen` (standard), the demo cross-compiles the agent for `x86_64-unknown-linux-musl`. That needs TWO independent pieces installed (the xtask preflights both and exits clean with a composite install hint if either is missing):
+
+```sh
+# 1. Rust std-lib for the target (OS-independent):
+rustup target add x86_64-unknown-linux-musl
+
+# 2. A musl-capable linker:
+#   macOS — zig + cargo-zigbuild (no other supported path):
+cargo install --locked cargo-zigbuild
+brew install zig      # the zig install pulls llvm as a dep (~1.6 GiB)
+
+#   Linux — either the zigbuild path above, OR musl-gcc via the
+#   distro package manager (e.g. `apt install musl-tools` /
+#   `dnf install musl-gcc`). Both are accepted.
+```
 
 ### Prep
 
