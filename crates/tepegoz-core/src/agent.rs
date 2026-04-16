@@ -215,18 +215,20 @@ async fn run_agent_driver_russh(
                 }
             }
             msg = channel.wait() => {
+                let Some(msg) = msg else { break; };
                 match msg {
-                    Some(russh::ChannelMsg::Data { data }) => {
-                        if pipe_writer.write_all(&data).await.is_err() { break; }
+                    russh::ChannelMsg::Data { data } => {
+                        let write_result = pipe_writer.write_all(&data).await;
+                        if write_result.is_err() { break; }
                     }
-                    Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                    russh::ChannelMsg::ExtendedData { data, .. } => {
                         // Agent stderr (tracing output). Drain so the
                         // channel window doesn't fill up, but surface
                         // as debug logs only.
                         let s = String::from_utf8_lossy(&data);
                         debug!(alias = %conn.alias, stderr = %s, "agent stderr");
                     }
-                    Some(russh::ChannelMsg::Close) | Some(russh::ChannelMsg::Eof) | None => break,
+                    russh::ChannelMsg::Close | russh::ChannelMsg::Eof => break,
                     _ => {}
                 }
             }

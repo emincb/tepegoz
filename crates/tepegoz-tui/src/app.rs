@@ -20,6 +20,17 @@
 //! [`App::handle_daemon_envelope`], and the tile slot already exists as
 //! a labeled placeholder during development.
 
+// Rust 1.95 added `clippy::collapsible_match` — flags nested `if cond {
+// body }` inside a match arm as replaceable with an arm-level guard.
+// The collapsed form is arguably tidier for one-line bodies but worse
+// for multi-statement bodies + any body with `.await`/side effects in
+// the guard. This file has 11 such instances across host-picker nav,
+// filter key handlers, and pane-event dispatch where the explicit
+// `if` reads more clearly than a multi-line arm guard. Accept the lint
+// at file scope; v1.1 polish can revisit per-instance if the collapsed
+// form wins on a case-by-case basis.
+#![allow(clippy::collapsible_match)]
+
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 

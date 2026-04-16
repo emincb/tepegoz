@@ -313,13 +313,12 @@ autoconnect = true
                 Event::AgentCapabilities {
                     alias,
                     capabilities,
-                } if alias == "demo6d" => {
-                    if capabilities.iter().any(|c| c == "ports")
-                        && capabilities.iter().any(|c| c == "processes")
-                    {
-                        saw_capabilities = true;
-                        eprintln!("[test] AgentCapabilities arrived: {capabilities:?}");
-                    }
+                } if alias == "demo6d"
+                    && capabilities.iter().any(|c| c == "ports")
+                    && capabilities.iter().any(|c| c == "processes") =>
+                {
+                    saw_capabilities = true;
+                    eprintln!("[test] AgentCapabilities arrived: {capabilities:?}");
                 }
                 _ => {}
             }
