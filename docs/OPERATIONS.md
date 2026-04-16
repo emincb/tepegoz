@@ -793,8 +793,11 @@ Slice 6b turns the 6a-embedded agent binaries into something you can actually ru
 1. **`cargo xtask demo-phase-6 up --remote`** — spawns a throwaway sshd container (`tepegoz-demo-phase-6-sshd`, separate from demo-phase-5's), cross-builds `tepegoz-agent` for `x86_64-unknown-linux-musl`, connects via tepegoz-ssh, deploys, and drives one handshake round-trip over the exec channel. Validates the full Slice 6b pipeline end-to-end against a known fixture.
 
    ```sh
-   # Requires: docker, ssh-keygen, cargo-zigbuild (cross-platform) OR
-   # a Linux host with the musl target + linker installed.
+   # Requires: docker, ssh-keygen, plus a working cross-compile path —
+   # either `cargo-zigbuild` on PATH (cross-platform, macOS + Linux)
+   # or — Linux only — `rustup target add x86_64-unknown-linux-musl`.
+   # The xtask preflights this BEFORE any side effects; on macOS
+   # without zigbuild it prints the install hint + exits clean.
    cargo xtask demo-phase-6 up --remote
    # Expect (protocol_version reflects live PROTOCOL_VERSION file):
    #   [demo-phase-6] sshd listening at 127.0.0.1:<port>
