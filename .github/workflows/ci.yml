@@ -82,9 +82,16 @@ jobs:
   # `protocol_version` matches `tepegoz-proto/PROTOCOL_VERSION` at
   # compile time. Mismatch = panic = CI red. No artifacts shipped —
   # this job catches drift, release packaging lives in Phase 10.
+  #
+  # Runs on macos-latest because cargo-zigbuild cross-compiling from
+  # Linux → darwin fails to link (needs CoreFoundation/IOKit/libobjc
+  # frameworks that live in the macOS SDK, which isn't on ubuntu
+  # runners). macos-latest runners ship with Xcode SDK + can also
+  # cross-compile to Linux musl via zigbuild, so all four triples work
+  # from one runner.
   agents:
     name: Agents — cross-compile + drift check
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
