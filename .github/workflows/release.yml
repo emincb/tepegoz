@@ -35,8 +35,13 @@ jobs:
       # 0.16 ships llvm-ar 21 that breaks ring 0.17.14's cc-rs archive
       # step; 0.14 has a macOS 26 SDK-path bug. See xtask/src/preflight.rs
       # `check_zig_ring_compatibility` for the full reasoning.
+      #
+      # mlugg/setup-zig@v2 (not v1) because zig 0.14+ changed the
+      # tarball naming from `zig-<os>-<arch>-<ver>` to
+      # `zig-<arch>-<os>-<ver>`. @v1 is hard-coded to the old naming
+      # and 404s on every zig 0.14.0+ release. @v2 handles both.
       - name: Install zig 0.15.x
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.15.1
 
