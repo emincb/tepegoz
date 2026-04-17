@@ -1363,6 +1363,98 @@ ls -l "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tepegoz-$(id -u)/daemon.sock"
 # what's it logging? check its terminal's stdout, or the file you redirected to.
 ```
 
-## Release process (Phase 10)
+## Release process (v1.0 / renamed Phase 10)
 
-TBD. Activated at Phase 10 per `docs/ROADMAP.md#phase-10--quic-hot-path--release-010--`.
+### Local release build — `cargo xtask build-release` (R1, 2026-04-17)
+
+Cross-compiles the `tepegoz` controller binary for all four Decision #3
+triples + fuses a universal-apple-darwin artifact via `lipo`.
+
+**One-time toolchain:**
+
+```sh
+rustup target add \
+  x86_64-apple-darwin aarch64-apple-darwin \
+  x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+cargo install --locked cargo-zigbuild
+brew install zig@0.15     # macOS: 0.14 also works, 0.15 is the canonical pin
+export PATH="/opt/homebrew/opt/zig@0.15/bin:$PATH"   # add to shellrc
+```
+
+Zig 0.16 is **not** compatible (ships llvm-ar 21 that breaks ring's
+archive step); 0.14 works but has a macOS 26 SDK-path bug on darwin
+targets. R1 preflight enforces 0.14.x or 0.15.x via
+`check_zig_ring_compatibility` — zig 0.15 is the recommended pin.
+
+**Run:**
+
+```sh
+cargo xtask build-release
+```
+
+Produces `target/release-bundles/<triple>/tepegoz` for each of the four
+triples + `target/release-bundles/universal-apple-darwin/tepegoz` (when
+`lipo` is on PATH) + `target/release-bundles/SHA256SUMS` (GNU text
+format, consumable by both `sha256sum -c` and `shasum -a 256 -c`).
+
+**Verify:**
+
+```sh
+cd target/release-bundles
+shasum -a 256 -c SHA256SUMS
+./aarch64-apple-darwin/tepegoz --version    # host-native
+./universal-apple-darwin/tepegoz --version  # runs on both arm64 + x86_64 Macs
+```
+
+Cold-walk wall-clock on an M-series Mac with a cold cache: ~3:40.
+Preflight failures (missing targets / zigbuild / wrong zig version /
+Linux→darwin attempt) exit in <1 s with a composite install hint and
+zero side effects — safe to re-run.
+
+### GitHub Actions release workflow — `.github/workflows/release.yml` (R2)
+
+Trigger on `v*` tag push, or on-demand via `workflow_dispatch` with a
+user-supplied tag name for verification runs that shouldn't pollute
+the tag list.
+
+**Automated release flow (R4-era, canonical):**
+
+```sh
+git tag -a v1.0.0 -m "tepegoz v1.0.0"
+git push origin v1.0.0
+```
+
+The workflow runs on `macos-latest` (only runner that can produce all
+five artifacts — see ROADMAP R2 single-runner rationale), builds via
+`cargo xtask build-release`, then a downstream `ubuntu-latest` job
+flattens + renames binaries as `tepegoz-<triple>`, regenerates
+`SHA256SUMS`, and creates a **draft** GitHub Release via
+`softprops/action-gh-release@v2`. Draft state so release notes can be
+reviewed + edited before publish.
+
+Release assets published per tag:
+
+- `tepegoz-x86_64-apple-darwin`
+- `tepegoz-aarch64-apple-darwin`
+- `tepegoz-universal-apple-darwin`
+- `tepegoz-x86_64-unknown-linux-musl`
+- `tepegoz-aarch64-unknown-linux-musl`
+- `SHA256SUMS`
+
+**Verification flow (no tag push needed):**
+
+```sh
+gh workflow run release.yml -f tag_name=v0.0.1-test
+gh run watch                                       # observe
+gh release view v0.0.1-test                        # inspect draft
+gh release delete v0.0.1-test --yes --cleanup-tag  # clean up
+```
+
+`workflow_dispatch` doesn't create a git tag — only a draft release
+keyed to the provided name. Deleting the draft release via
+`gh release delete --cleanup-tag` removes both the draft and any
+auto-created tag ref.
+
+**Not in v1.0:** GPG signing (deferred to release hardening per the
+same reasoning as minisign — SHA256 catches corruption, signing
+catches tampering, not a v1.0 threat-model concern).

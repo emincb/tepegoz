@@ -610,10 +610,12 @@ Renamed 2026-04-16 from the original "QUIC hot path + release 0.1.0" framing —
 - No new tests (pure xtask addition); 398 workspace tests hold; clippy `--workspace --all-targets -D warnings` clean; fmt clean.
 
 **Slice R2 — GitHub Actions release workflow.**
-- New `.github/workflows/release.yml` triggered on `v*.*.* ` tag push.
-- Runs `cargo xtask build-release` on ubuntu-latest (Linux targets) AND macos-latest (macOS targets — avoids needing the Xcode SDK on Linux for darwin cross-compile). Collects artifacts, uploads to GitHub Releases.
-- SHA256 checksums published alongside binaries. GPG signing optional for v1.0 — decision deferred to R2 kickoff.
-- Acceptance: push a test tag (e.g. `v0.0.1-test`); release workflow produces a draft release with all five binaries attached + SHA256SUMS.
+- `.github/workflows/release.yml` triggered on `v*` tag push OR `workflow_dispatch` (the latter lets us exercise the full workflow against a fake tag name without polluting the tag list — load-bearing for R2's own verification loop).
+- **Single-runner build on macos-latest** producing all 5 artifacts (4 per-triple + universal macOS). Deviation from the original ROADMAP two-runner split: R1's preflight hard-rejects Linux→darwin (no SDKROOT shim ships with xtask), and R1 exposes no target-subset flag, so `build-release` on ubuntu would fail at preflight for any release-shaped invocation. macOS can produce every target (ld64 is multi-arch-native for darwin; cargo-zigbuild cross-compiles to musl from macOS same as from Linux; lipo is preinstalled on the macos-latest Xcode image). Trade: ~4 min wall-clock on release trigger vs. ~2 min split; fine for a tag-push-only gate.
+- Second job (`publish`, ubuntu-latest) downloads the artifact, flattens + renames binaries to `tepegoz-<triple>` for install-script-friendly single-file downloads, regenerates `SHA256SUMS` across the renamed names, and creates a **draft** GitHub Release via `softprops/action-gh-release@v2` with `generate_release_notes: true`. Draft = R4 can review + add release notes before publishing.
+- Zig pinned to `0.15.1` via `mlugg/setup-zig@v1` — R1 preflight gates on 0.14.x/0.15.x.
+- GPG signing **deferred** to release hardening (v1.0.1+). Same reasoning as the minisign deferral below: SHA256 catches corruption; signing catches tampering, which isn't a v1.0 threat model concern. Revisit if user/community signal demands it.
+- Acceptance: `gh workflow run release.yml -f tag_name=v0.0.1-test` (workflow_dispatch path, no tag push) produces a draft release with all 5 binaries + `SHA256SUMS`; `shasum -a 256 -c SHA256SUMS` verifies OK across all 5 entries.
 
 **Slice R3 — Install mechanisms.**
 - **Install script** hosted at `get.tepegoz.dev/install.sh` (register domain) OR `raw.githubusercontent.com/emincb/tepegoz/main/install.sh` (free fallback, decision at R3 kickoff). Auto-detects OS + arch, downloads matching binary from latest GitHub Release, verifies SHA256, installs to `~/.local/bin/tepegoz` (fallback `/usr/local/bin` with `sudo` prompt if `~/.local/bin` not on PATH).

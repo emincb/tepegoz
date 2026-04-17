@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v0.0.1-test). Creates a draft release without pushing a tag.'
+        required: true
+        type: string
+
+# The build job produces all 5 artifacts on macos-latest because R1's
+# preflight hard-rejects Linux→darwin cross-builds (no SDKROOT shim
+# shipped with the xtask). macOS runners can produce every Decision #3
+# triple: ld64 is multi-arch-native for darwin, `cargo zigbuild` cross-
+# compiles to musl just as cleanly from macOS as from Linux, and `lipo`
+# is preinstalled on the macos-latest Xcode image. Single-job path keeps
+# the SHA256SUMS coherent across all artifacts and avoids duplicating
+# musl builds across two runners.
+jobs:
+  build:
+    name: Build release artifacts (all 5 via macos-latest)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + all 4 Decision #3 targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      # Zig 0.15 is mandatory here — R1 preflight gates on this.
+      # 0.16 ships llvm-ar 21 that breaks ring 0.17.14's cc-rs archive
+      # step; 0.14 has a macOS 26 SDK-path bug. See xtask/src/preflight.rs
+      # `check_zig_ring_compatibility` for the full reasoning.
+      - name: Install zig 0.15.x
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.1
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      # No rust-cache — a release build should be reproducible from
+      # clean state, and cache keys don't include zig version or
+      # xtask source changes cleanly.
+
+      - name: Build release artifacts
+        run: cargo xtask build-release
+
+      - name: Verify 5 artifacts + SHA256SUMS produced
+        run: |
+          set -euo pipefail
+          cd target/release-bundles
+          test -f x86_64-apple-darwin/tepegoz
+          test -f aarch64-apple-darwin/tepegoz
+          test -f x86_64-unknown-linux-musl/tepegoz
+          test -f aarch64-unknown-linux-musl/tepegoz
+          test -f universal-apple-darwin/tepegoz
+          test -f SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundles
+          path: target/release-bundles/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish draft GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundles
+          path: bundles/
+
+      # Flatten + rename: install-script UX wants single-file downloads
+      # named `tepegoz-<triple>`. SHA256SUMS is regenerated across the
+      # renamed files so the install script can verify by a single
+      # fetch from the release assets.
+      - name: Arrange release assets + regenerate SHA256SUMS
+        run: |
+          set -euxo pipefail
+          mkdir -p release-assets
+          for triple_dir in bundles/*/; do
+            triple="$(basename "$triple_dir")"
+            bin="$triple_dir/tepegoz"
+            if [ -f "$bin" ]; then
+              cp "$bin" "release-assets/tepegoz-${triple}"
+            fi
+          done
+          cd release-assets
+          sha256sum tepegoz-* > SHA256SUMS
+          ls -la
+          sha256sum -c SHA256SUMS
+
+      # Resolve the release tag name: push-triggered uses the git ref;
+      # workflow_dispatch uses the user-supplied input. The latter
+      # creates a draft release without pushing a tag (useful for R2
+      # verification without polluting the tag list).
+      - name: Resolve tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/tepegoz-x86_64-apple-darwin
+            release-assets/tepegoz-aarch64-apple-darwin
+            release-assets/tepegoz-universal-apple-darwin
+            release-assets/tepegoz-x86_64-unknown-linux-musl
+            release-assets/tepegoz-aarch64-unknown-linux-musl
+            release-assets/SHA256SUMS
