@@ -589,7 +589,7 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
 
 ---
 
-## Phase 10 — v1.0 release — install packaging · 🟠 (R1 landed 2026-04-17)
+## Phase 10 — v1.0 release — install packaging · 🟠 (R1+R2 landed 2026-04-17)
 
 **Goal.** Ship v1.0. One-command installation on any macOS or Linux machine without a Rust toolchain.
 
@@ -609,13 +609,14 @@ Renamed 2026-04-16 from the original "QUIC hot path + release 0.1.0" framing —
 - Cold-walk (5 scenarios): layer-1/layer-2/both/zig-0.16 failure paths each exit in <1 s with zero side effects; success path (~3:38 wall-clock fresh) produces 5 artifacts totalling ~97 MiB; `shasum -a 256 -c SHA256SUMS` OK across all 5 lines; host-target `--version` prints `tepegoz 0.0.1` on both the native arm64 and the universal binary.
 - No new tests (pure xtask addition); 398 workspace tests hold; clippy `--workspace --all-targets -D warnings` clean; fmt clean.
 
-**Slice R2 — GitHub Actions release workflow.**
-- `.github/workflows/release.yml` triggered on `v*` tag push OR `workflow_dispatch` (the latter lets us exercise the full workflow against a fake tag name without polluting the tag list — load-bearing for R2's own verification loop).
-- **Single-runner build on macos-latest** producing all 5 artifacts (4 per-triple + universal macOS). Deviation from the original ROADMAP two-runner split: R1's preflight hard-rejects Linux→darwin (no SDKROOT shim ships with xtask), and R1 exposes no target-subset flag, so `build-release` on ubuntu would fail at preflight for any release-shaped invocation. macOS can produce every target (ld64 is multi-arch-native for darwin; cargo-zigbuild cross-compiles to musl from macOS same as from Linux; lipo is preinstalled on the macos-latest Xcode image). Trade: ~4 min wall-clock on release trigger vs. ~2 min split; fine for a tag-push-only gate.
+**Slice R2 — GitHub Actions release workflow. ✅ `918e6a3`+`801bc6c`+`1711c97` (2026-04-17)**
+- `.github/workflows/release.yml` triggered on `v*` tag push OR `workflow_dispatch` (the latter lets us exercise the full workflow against a fake tag name without polluting the tag list — load-bearing for R2's own verification loop and for any future one-off dev validation).
+- **Single-runner build on macos-latest** producing all 5 artifacts (4 per-triple + universal macOS). Deviation from the original ROADMAP two-runner split: R1's preflight hard-rejects Linux→darwin and exposes no target-subset flag, so `build-release` on ubuntu would fail at preflight for any release-shaped invocation. macOS can produce every target (ld64 is multi-arch-native for darwin; cargo-zigbuild cross-compiles to musl from macOS same as from Linux; lipo is preinstalled on the macos-latest Xcode image). Actual wall-clock ~15 min on a fresh runner (no rust-cache — release builds should be reproducible from clean state).
 - Second job (`publish`, ubuntu-latest) downloads the artifact, flattens + renames binaries to `tepegoz-<triple>` for install-script-friendly single-file downloads, regenerates `SHA256SUMS` across the renamed names, and creates a **draft** GitHub Release via `softprops/action-gh-release@v2` with `generate_release_notes: true`. Draft = R4 can review + add release notes before publishing.
-- Zig pinned to `0.15.1` via `mlugg/setup-zig@v1` — R1 preflight gates on 0.14.x/0.15.x.
+- Zig pinned to `0.15.1` via `mlugg/setup-zig@v2`. Initial attempt used @v1, which is hard-coded to the pre-0.14 tarball-naming convention (`zig-<os>-<arch>-<ver>`); zig 0.14 flipped to `zig-<arch>-<os>-<ver>` and @v1 404s on every 0.14+ release. @v2 handles both. Existing CI `agents` / `cross-build` jobs still use @v1 with zig 0.13.0 — works because 0.13.0 pre-dates the rename; not touched in R2 scope.
+- `build_agents` patched (`1711c97`) to use `cargo build` for darwin-on-macOS (not `cargo zigbuild`) — under zig 0.15 on macos-latest, zigbuild's Mach-O linker fails to populate framework search paths and `CoreFoundation`/`IOKit` link errors out. `build_release` already had this tactical routing; `build_agents` now mirrors it. No-op on user's local Macs (which already had the SDK paths that CI lacked) but load-bearing for CI.
 - GPG signing **deferred** to release hardening (v1.0.1+). Same reasoning as the minisign deferral below: SHA256 catches corruption; signing catches tampering, which isn't a v1.0 threat model concern. Revisit if user/community signal demands it.
-- Acceptance: `gh workflow run release.yml -f tag_name=v0.0.1-test` (workflow_dispatch path, no tag push) produces a draft release with all 5 binaries + `SHA256SUMS`; `shasum -a 256 -c SHA256SUMS` verifies OK across all 5 entries.
+- Verified end-to-end via `gh workflow run release.yml -f tag_name=v0.0.1-test` after the two fix commits (third verification run at `gh run 24545401592`): 5 artifacts + SHA256SUMS produced as a draft release; downloaded aarch64-apple-darwin binary was Mach-O arm64, ran `--version` cleanly, and `shasum -a 256 -c` verified OK. Draft release cleaned up post-verification (`gh release delete v0.0.1-test --yes`).
 
 **Slice R3 — Install mechanisms.**
 - **Install script** hosted at `get.tepegoz.dev/install.sh` (register domain) OR `raw.githubusercontent.com/emincb/tepegoz/main/install.sh` (free fallback, decision at R3 kickoff). Auto-detects OS + arch, downloads matching binary from latest GitHub Release, verifies SHA256, installs to `~/.local/bin/tepegoz` (fallback `/usr/local/bin` with `sudo` prompt if `~/.local/bin` not on PATH).
