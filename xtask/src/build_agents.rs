@@ -80,22 +80,38 @@ fn build_one(
     triple: &str,
     protocol_version: u32,
 ) -> Result<()> {
-    println!("[build-agents] cross-compiling {triple}…");
+    // Pick subcommand per target+host, mirroring `build_release`.
+    // On macOS, darwin targets build via plain `cargo build` so the
+    // native ld64 handles the Mach-O link; zigbuild's Mach-O linker
+    // under zig 0.15 doesn't populate framework search paths on CI's
+    // macos-latest image and fails to find CoreFoundation / IOKit.
+    // zigbuild stays the only path for musl targets on every host,
+    // and for darwin targets from non-macOS hosts (which R1 preflight
+    // blocks today anyway).
+    let is_darwin_target = triple.ends_with("-apple-darwin");
+    let subcmd = if cfg!(target_os = "macos") && is_darwin_target {
+        "build"
+    } else {
+        "zigbuild"
+    };
+    println!("[build-agents] cross-compiling {triple} (cargo {subcmd})…");
     let status = Command::new("cargo")
         .current_dir(workspace_root)
-        .arg("zigbuild")
+        .arg(subcmd)
         .args(["--package", "tepegoz-agent"])
         .args(["--bin", "tepegoz-agent"])
         .args(["--profile", PROFILE])
         .args(["--target", triple])
         .status()
-        .with_context(|| format!("spawn cargo zigbuild for {triple}"))?;
+        .with_context(|| format!("spawn cargo {subcmd} for {triple}"))?;
     if !status.success() {
-        bail!("cargo zigbuild failed for {triple} (exit: {status})");
+        bail!("cargo {subcmd} failed for {triple} (exit: {status})");
     }
 
-    // Cargo + zigbuild write release-agent outputs to
-    // `target/<triple>/release-agent/tepegoz-agent` on every platform.
+    // Cargo writes release-agent outputs to
+    // `target/<triple>/release-agent/tepegoz-agent` for both `build`
+    // and `zigbuild` — the profile name determines the subdir, not
+    // the subcommand.
     let source = workspace_root
         .join("target")
         .join(triple)
@@ -103,7 +119,7 @@ fn build_one(
         .join("tepegoz-agent");
     if !source.exists() {
         bail!(
-            "expected cargo zigbuild output at {} — did the profile or bin name change?",
+            "expected cargo {subcmd} output at {} — did the profile or bin name change?",
             source.display()
         );
     }
