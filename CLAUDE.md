@@ -2,7 +2,7 @@
 
 Single Rust binary that fuses pty multiplexing, SSH fleet management, Docker inspection, and port scanning into one screen. Target user runs many parallel Claude Code agents across local + remote VMs and needs a unified god view.
 
-**Current state.** Phase 3 in progress — Slices A (socket discovery + container list), B (lifecycle actions + logs streaming + container stats), C1 (TUI App + AppEvent/AppAction skeleton + view enum), the C2 gate (daemon Unsubscribe-of-pane-sub bug fix + vim-preservation byte-level proxy), C2 commit 2 (Docker scope rendering: container table + three-state lifecycle + navigation + filter + ShowToast wire), and **C2 commit 3 automated test** (≤2 s latency pin + container-by-name) landed. **C2c3 eyeball demo is on the user to run** (real-terminal vim-preservation check + CTO §7 engine-unavailable-mid-session) before C3 starts. C3 (action keybinds + toasts + logs panel), D (DockerExec → new pane) outstanding. Full state in `docs/STATUS.md`; active issues in `docs/ISSUES.md`.
+**Current state.** Phases 1–6 closed (2026-04-16). v1.0 release work (renamed Phase 10 — install packaging) is the active scope; Slice R1 (release binary cross-build xtask) is up next. Phases 7/8/9 deferred to v1.1 candidates per the v1 scope trim (Decision #8). Full state in `docs/STATUS.md`; active issues in `docs/ISSUES.md`; roadmap in `docs/ROADMAP.md`.
 
 ## Repo
 
@@ -72,25 +72,39 @@ xtask/               build tasks (agent cross-compile, release packaging)
 ## Working discipline
 
 - **Diagnose before fixing.** Read logs first; reproduce locally if possible; state the root cause before writing code. Don't paper over symptoms.
-- **Machine-verify acceptance.** Every phase lands with an integration test that exercises the new behavior end-to-end. "Looks right" is not enough; the user has observed tests passing while real-world behavior diverged.
+- **Machine-verify acceptance.** Every phase lands with an integration test that exercises the new behavior end-to-end. "Looks right" is not enough; tests passing have diverged from real-world behavior before.
 - **Sharpen the blade first.** No AI shortcuts in v1. No features that compromise the substrate.
-- **Implementation autonomy, architectural guardrails.** Tactical calls (local functions, crate plumbing, logging, test shape) are yours. Anything that changes the locked commitments in `docs/DECISIONS.md` needs the user's sign-off.
-- **Docs are authoritative.** When docs and reality conflict, trust reality and update the docs in the same commit. Keep `docs/STATUS.md` and `docs/ISSUES.md` current as phases land.
-- **Session-boundary handoff.** CTO and engineer work in separate Claude Code sessions with separate contexts; the user relays between them. Before context clears, update your section of `docs/HANDOFF.md` with what's in-flight and what you're expecting next. On every session start, read `docs/HANDOFF.md` to pick up where the previous session left off.
+- **Docs are authoritative.** When docs and reality conflict, trust reality and update the docs in the same commit. Keep `docs/STATUS.md` and `docs/ISSUES.md` current as slices land.
+
+## Operating model — single-session autonomy (from 2026-04-17)
+
+Prior "CTO + engineer in separate sessions, user relays" discipline is retired. One Claude session runs planning + implementation + verification + commit + push end-to-end. User involvement gates on product decisions only.
+
+- **Autonomy default.** Plan → implement → verify → commit → push → next slice. No pauses between slices for approval.
+- **Escalate when** changing a locked `DECISIONS.md` entry · rescoping v1 / v1.1 / v2 · real product-direction tradeoffs (feel, UX, feature shape) · destructive ops on shared state (force-push main, prod data, credential ops, third-party service spending) · genuine "I don't know what you want" scope call.
+- **Self-verification before every commit (no exceptions):**
+  - `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` (count holds or rises with expected delta)
+  - Touched `cargo xtask demo-*`? Cold-walk both failure AND success paths before declaring ready (per `feedback_demo_tooling_cold_walk`).
+  - Touched >1 crate or a load-bearing path? Run the `simplify` skill (or spawn a Review subagent) before commit.
+  - TUI behavior changed? Real-terminal eyeball OR explicit "state-machine pinned only, not eyeballed" in commit body.
+  - Cross-check against the README mockup / product vision (per `feedback_slice_vision_crosscheck`).
+- **Plan mode for non-trivial slices** — 3+ commits, wire protocol bumps, new modules, cross-crate refactors. Skip for bug fixes, polish, docs-only.
+- **Subagents freely.** Explore for research · general-purpose for parallel independent work · Plan agent for scoping big slices · Loop for self-paced multi-slice drives. Parallel tool calls when independent.
+- **Destructive ops still gate.** `git push --force` on main, `rm -rf` outside workspace tmp, DB drops, credential ops, third-party publishes — ask first. Everything reversible (reset local, rewrite local commit, delete local file) is free.
+- **End-of-slice signal.** Commit + push + STATUS/ISSUES/DECISIONS updates in the same commit where relevant. Tell user what landed in ≤2 lines.
 
 ## Session start ritual
 
-1. Read this file (auto-loaded) + `docs/STATUS.md` + `docs/ISSUES.md` + `docs/HANDOFF.md`.
-2. `git log --oneline -10` — verify recent commits match what the handoff / status claim.
-3. Run `cargo test --workspace` if touching code; green before starting new work.
-4. If anything in HANDOFF / STATUS is stale vs. reality, fix it before acting.
+1. Read this file (auto-loaded) + `docs/STATUS.md` + `docs/ISSUES.md`.
+2. `git log --oneline -10` — verify recent commits match what STATUS.md claims.
+3. `cargo test --workspace` if touching code; green before starting new work.
+4. If STATUS is stale vs. reality, fix it before acting.
 
 ## Detailed docs (the authoritative written state)
 
 - `docs/STATUS.md` — current phase state, last commit, acceptance test coverage
-- `docs/ROADMAP.md` — full 10-phase plan with per-phase goals, scope, acceptance criteria
+- `docs/ROADMAP.md` — full phase plan with per-phase goals, scope, acceptance criteria
 - `docs/ARCHITECTURE.md` — protocol spec, crate layout, platform matrix, concurrency model, security posture
-- `docs/DECISIONS.md` — the seven locked architectural decisions with reasoning
+- `docs/DECISIONS.md` — locked architectural decisions with reasoning
 - `docs/OPERATIONS.md` — build/test/run/debug runbook, log locations, common issues
 - `docs/ISSUES.md` — active bugs with diagnostic state, resolved issues archive
-- `docs/HANDOFF.md` — in-flight CTO + engineer state between session-boundary clears
