@@ -20,24 +20,20 @@
 //! and prints what the agent reported. `down --remote` removes the
 //! container + tempdir.
 //!
-//! **Cross-compile preflight is step 0** (Phase 6 Slice 6e-prep-3).
-//! Before any keypair / container / cargo-download side effect, the
-//! runner asserts we have a working cross-compile path at both layers
-//! rustc cares about:
+//! **Cross-compile preflight is step 0** (Phase 6 Slice 6e-prep-3,
+//! lifted to `xtask::preflight` in v1.0 Slice R1). Before any keypair
+//! / container / cargo-download side effect, the runner asserts we
+//! have a working cross-compile path at both layers rustc cares about
+//! — see `preflight::check_cross_build_toolchain` for the shape. This
+//! demo passes a single target (`x86_64-unknown-linux-musl`); R1's
+//! `build-release` subcommand consumes the same implementation against
+//! all four Decision #3 triples.
 //!
-//! 1. **Rust std-lib for the target** (`rustup target add
-//!    x86_64-unknown-linux-musl`) — rustc needs a precompiled
-//!    libstd/libcore for the target. OS-independent.
-//! 2. **A linker that can produce ELF for musl** — on macOS,
-//!    `cargo-zigbuild` on PATH (ld64 can't produce ELF); on Linux,
-//!    either `cargo-zigbuild` or `musl-gcc` on PATH.
-//!
-//! Prior versions conflated the two layers (accepting "zigbuild OR
-//! rustup target") which green-lit a macOS host with zigbuild but no
-//! musl std, trap-dooring through a mid-build failure that left an
-//! sshd container behind (round-2 regression, 2026-04-16). The
-//! preflight now asserts BOTH layers and emits a composite install
-//! hint listing every missing piece.
+//! Prior demo-local preflight accepted "zigbuild OR musl-gcc" on
+//! Linux; unified to "zigbuild required" when the preflight was lifted
+//! out so one implementation serves both callers (6e-prep-3's anti-
+//! drift intent). `cargo install --locked cargo-zigbuild` is already
+//! the documented install recipe in OPERATIONS.md §demo prereqs.
 //!
 //! **Side-effect ordering** (Slice 6e-prep-3): agent cross-build runs
 //! BEFORE any keypair generation, tempdir creation, or container
@@ -62,6 +58,8 @@ use tepegoz_proto::{
     codec::{read_envelope, write_envelope},
 };
 use tokio::process::Command as AsyncCommand;
+
+use crate::preflight::{self, ensure_on_path, is_on_path};
 
 /// Container name for Slice 6b's sshd fixture. Distinct from
 /// demo-phase-5's so the two demos don't race on the same
@@ -641,11 +639,11 @@ fn preflight_remote() -> Result<()> {
     // Order is load-bearing: the cross-build toolchain check MUST run
     // before we generate keypairs, spawn containers, or do any other
     // side-effect-bearing setup. The failure mode this guards against
-    // is a macOS host with cargo on PATH but no zigbuild + no musl
-    // linker — plain `cargo build --target x86_64-unknown-linux-musl`
-    // trap-doors through 5+ downloaded crates before failing with
-    // "can't find crate for `core`", leaving an sshd container + tempdir
-    // behind. Catching it up-front is the demo-tooling invariant.
+    // is a macOS host with cargo on PATH but no zigbuild — plain
+    // `cargo build --target x86_64-unknown-linux-musl` trap-doors
+    // through 5+ downloaded crates before failing with "can't find
+    // crate for `core`", leaving an sshd container + tempdir behind.
+    // Catching it up-front is the demo-tooling invariant.
     preflight_cargo()?;
     ensure_on_path(
         "docker",
@@ -655,7 +653,7 @@ fn preflight_remote() -> Result<()> {
         "ssh-keygen",
         "ssh-keygen is required for the --remote demo — part of standard OpenSSH client tools",
     )?;
-    preflight_cross_build_toolchain()?;
+    preflight::check_cross_build_toolchain(&[REMOTE_AGENT_TRIPLE])?;
     let status = std::process::Command::new("docker")
         .arg("info")
         .stdout(Stdio::null())
@@ -668,140 +666,6 @@ fn preflight_remote() -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Ensure we have a working cross-compile path to
-/// `x86_64-unknown-linux-musl` before touching any side effects.
-///
-/// Two independent layers must BOTH be present:
-///
-/// 1. **Rust std-lib for the target.** rustc needs a precompiled
-///    `libstd`/`libcore` for the musl target to link against. Installed
-///    via `rustup target add x86_64-unknown-linux-musl`. OS-independent
-///    — macOS and Linux hosts both need it.
-/// 2. **A linker that can produce ELF for musl.** On macOS, ld64 can't
-///    produce ELF, so `cargo-zigbuild` is effectively required (it
-///    slots zig's cross-linker in place of the host linker). On Linux,
-///    either `cargo-zigbuild` OR `musl-gcc` (or equivalent) on PATH is
-///    sufficient.
-///
-/// The prior version of this preflight conflated the two layers —
-/// accepting "zigbuild OR rustup-target" as an OR, which green-lit a
-/// host with zigbuild but no musl std, then failed mid-build with
-/// `can't find crate for 'core'` and left an sshd container behind
-/// (round-2 regression, CTO-flagged 2026-04-16).
-///
-/// Emits a single composite install hint covering every missing
-/// layer; exits non-zero on any layer's absence; zero side effects
-/// before returning.
-fn preflight_cross_build_toolchain() -> Result<()> {
-    let rust_target_missing = !rustup_has_target(REMOTE_AGENT_TRIPLE);
-    let zigbuild_missing = !is_on_path("cargo-zigbuild");
-    let musl_linker_missing = !is_on_path("musl-gcc");
-
-    let linker_missing = if cfg!(target_os = "macos") {
-        // macOS: only zigbuild is a supported linker path.
-        zigbuild_missing
-    } else {
-        // Linux: either zigbuild OR a system musl linker works.
-        zigbuild_missing && musl_linker_missing
-    };
-
-    if !rust_target_missing && !linker_missing {
-        return Ok(());
-    }
-
-    let mut install_lines: Vec<String> = Vec::new();
-    if zigbuild_missing && cfg!(target_os = "macos") {
-        install_lines.push("cargo install --locked cargo-zigbuild".into());
-        install_lines.push("brew install zig".into());
-    } else if zigbuild_missing && linker_missing {
-        // Linux without any linker: recommend zigbuild (cross-platform,
-        // single install shape) over musl-gcc (distro-specific).
-        install_lines.push("cargo install --locked cargo-zigbuild".into());
-        install_lines.push("# then your package manager's zig: apt|dnf|pacman install zig".into());
-    }
-    if rust_target_missing {
-        install_lines.push(format!("rustup target add {REMOTE_AGENT_TRIPLE}"));
-    }
-    let install_block = install_lines.join("\n  && ");
-
-    bail!(
-        "cross-compiling the Linux agent needs Rust std for {REMOTE_AGENT_TRIPLE} AND a musl-capable linker.\n\
-         Missing on this host:{missing_summary}\n\
-         \n\
-         Install:\n  {install_block}\n\
-         \n\
-         Then re-run:\n  cargo xtask demo-phase-6 up --remote",
-        missing_summary = summarize_missing(
-            rust_target_missing,
-            zigbuild_missing,
-            musl_linker_missing,
-            cfg!(target_os = "macos"),
-        ),
-    )
-}
-
-fn summarize_missing(
-    rust_target: bool,
-    zigbuild: bool,
-    musl_linker: bool,
-    is_macos: bool,
-) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    if rust_target {
-        parts.push("\n  - rustup target (std-lib for the target)");
-    }
-    if is_macos && zigbuild {
-        parts.push("\n  - cargo-zigbuild (linker)");
-    } else if !is_macos && zigbuild && musl_linker {
-        parts.push("\n  - cargo-zigbuild or musl-gcc (linker)");
-    }
-    parts.concat()
-}
-
-/// Returns true iff `rustup target list --installed` lists `target`.
-/// Returns false if rustup isn't on PATH or the subcommand fails —
-/// conservative: treat "can't tell" as "not installed" so the user
-/// gets the actionable install hint rather than a silent fall-through.
-fn rustup_has_target(target: &str) -> bool {
-    let output = std::process::Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .any(|l| l.trim() == target),
-        _ => false,
-    }
-}
-
-/// Non-bailing variant of `ensure_on_path` — returns a bool rather
-/// than propagating the install-hint error. Used by preflight paths
-/// that want to branch on "is X installed?" before deciding the
-/// right diagnostic to emit.
-fn is_on_path(binary: &str) -> bool {
-    std::process::Command::new(binary)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
-}
-
-fn ensure_on_path(binary: &str, hint: &str) -> Result<()> {
-    let result = std::process::Command::new(binary)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("`{binary}` not found on PATH. {hint}")
-        }
-        Err(e) => bail!("failed to probe `{binary}`: {e}. {hint}"),
-    }
 }
 
 fn generate_keypair(paths: &RemotePaths) -> Result<()> {
@@ -930,19 +794,17 @@ fn cargo_build_host_agent() -> Result<()> {
 }
 
 /// Cross-compile the agent for the sshd container's target
-/// (`x86_64-unknown-linux-musl`). `preflight_cross_build_toolchain`
-/// guarantees one of the two paths below is viable before any
-/// side-effect-bearing setup has run; here we just pick whichever
-/// tool is on PATH with no fallback-with-warning shape.
+/// (`x86_64-unknown-linux-musl`). `preflight::check_cross_build_toolchain`
+/// has already asserted both layers (rustup target + cargo-zigbuild) are
+/// present before any side-effect-bearing setup ran; here we just invoke
+/// zigbuild with no fallback — if preflight is wrong and this fails, the
+/// cargo error is the primary diagnostic.
 fn cargo_build_linux_musl_agent() -> Result<PathBuf> {
-    let subcmd = if is_on_path("cargo-zigbuild") {
-        "zigbuild"
-    } else {
-        // Preflight has verified the rustup musl target exists on
-        // Linux hosts; on macOS we bailed before reaching here.
-        "build"
-    };
-    run_cargo_build(&[subcmd]).with_context(|| {
+    debug_assert!(
+        is_on_path("cargo-zigbuild"),
+        "preflight::check_cross_build_toolchain should have caught missing zigbuild",
+    );
+    run_cargo_build(&["zigbuild"]).with_context(|| {
         format!("cross-build for {REMOTE_AGENT_TRIPLE} failed — inspect the cargo output above.")
     })?;
 

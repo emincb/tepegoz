@@ -4,8 +4,10 @@
 use clap::{Parser, Subcommand};
 
 mod build_agents;
+mod build_release;
 mod demo;
 mod demo_phase_6;
+mod preflight;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "Tepegöz build tasks")]
@@ -28,6 +30,19 @@ enum Command {
     /// Requires `zig` + `cargo-zigbuild` on PATH; plain cargo can't
     /// cross-link a Darwin SDK from a Linux host (or vice versa).
     BuildAgents,
+    /// Cross-compile the `tepegoz` controller binary for all four
+    /// Decision #3 target triples, produce a universal macOS binary
+    /// via `lipo` (optional — warn-and-skip when absent), and emit a
+    /// `SHA256SUMS` index across every artifact into
+    /// `target/release-bundles/`. Feeds v1.0 Slice R2's GitHub
+    /// Actions release workflow (upload glob) and R3's install
+    /// script (checksum verification).
+    ///
+    /// Internally invokes `build-agents` first — the controller's
+    /// `build.rs` drift check `include_bytes!`'s populated agent
+    /// arches at compile time; skipping this step silently ships a
+    /// binary that can't deploy agents on remote hosts.
+    BuildRelease,
     /// Package release artifacts with checksums and minisign signatures.
     Package,
     /// One-command runner for the Phase 5 Slice 5e manual demo.
@@ -91,6 +106,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::BuildAgents => build_agents::run()?,
+        Command::BuildRelease => build_release::run()?,
         Command::Package => {
             println!("xtask package: not yet implemented");
         }

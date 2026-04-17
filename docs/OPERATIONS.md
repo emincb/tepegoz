@@ -744,11 +744,12 @@ cargo xtask demo-phase-5 down
 
 ## Building agents + Phase 6 Slice 6a demo
 
-**Cross-compile all four agent targets.** Requires `zig` + `cargo-zigbuild` on PATH (plain cargo can't cross-link a Darwin SDK from a Linux host or vice versa):
+**Cross-compile all four agent targets.** Requires `zig` + `cargo-zigbuild` on PATH (plain cargo can't cross-link a Darwin SDK from a Linux host or vice versa). Zig 0.16 has a llvm-ar 21 regression that breaks ring's cc-rs-driven asm cross-build — this bites `build-release` (controller binary uses ring via russh), not `build-agents` (agent has no ring dep), but the simplest rule is to pin zig 0.15 everywhere so the same PATH works for both:
 
 ```sh
 # One-time setup
-brew install zig                          # or https://ziglang.org/download/
+brew install zig@0.15                     # keg-only; PATH line below makes it live
+export PATH="/opt/homebrew/opt/zig@0.15/bin:$PATH"
 cargo install cargo-zigbuild
 
 # Build agents for all four target triples
@@ -928,13 +929,17 @@ Beyond `docker` + `ssh-keygen` (standard), the demo cross-compiles the agent for
 rustup target add x86_64-unknown-linux-musl
 
 # 2. A musl-capable linker:
-#   macOS — zig + cargo-zigbuild (no other supported path):
+#   macOS — zig 0.15 + cargo-zigbuild (no other supported path).
+#   Zig 0.16 is explicitly incompatible with ring's cc-rs asm build
+#   (llvm-ar 21 regression); pin 0.15 so the same PATH works for both
+#   `build-agents` and `build-release`:
 cargo install --locked cargo-zigbuild
-brew install zig      # the zig install pulls llvm as a dep (~1.6 GiB)
+brew install zig@0.15                                # keg-only
+export PATH="/opt/homebrew/opt/zig@0.15/bin:$PATH"   # prepend so zigbuild picks it up
 
-#   Linux — either the zigbuild path above, OR musl-gcc via the
-#   distro package manager (e.g. `apt install musl-tools` /
-#   `dnf install musl-gcc`). Both are accepted.
+#   Linux — same zig 0.15 pin via the distro package manager (or
+#   download from https://ziglang.org/download/0.15.2/). `build-release`
+#   gates this via `zig version` in preflight.
 ```
 
 ### Prep
