@@ -589,17 +589,25 @@ No wire-protocol change. 5c-ii bumps wire to v8 for `FleetAction` + `FleetAction
 
 ---
 
-## Phase 10 — v1.0 release — install packaging · ⚪
+## Phase 10 — v1.0 release — install packaging · 🟠 (R1 landed 2026-04-17)
 
 **Goal.** Ship v1.0. One-command installation on any macOS or Linux machine without a Rust toolchain.
 
 Renamed 2026-04-16 from the original "QUIC hot path + release 0.1.0" framing — the v1 scope trim (Decision #8) moved QUIC transport swap to v1.0.1 / v1.1 candidates. v1.0 is release packaging only. Original QUIC scope preserved under "Deferred to v1.0.1 / v1.1" below as reference for when the transport-swap picks up.
 
-**Slice R1 — Release binary cross-build (xtask).**
-- Extend the `cargo xtask build-agents` pattern with `cargo xtask build-release` that cross-compiles the full `tepegoz` binary (not just the agent) for four targets: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. Reuses the cargo-zigbuild path from 6a/6b.
-- Pick up the universal macOS `lipo` task deferred from Phase 6 Slice 6b. Produces `tepegoz-universal-apple-darwin` that runs on both Apple Silicon and Intel Macs.
-- Artifact layout: `target/release-bundles/<triple>/tepegoz` + `SHA256SUMS` + `manifest.json` (`version`, `built_at_unix_secs`, `target_triple`).
-- Acceptance: local run produces five binaries (four triples + one universal macOS) that each `--version` correctly.
+**Slice R1 — Release binary cross-build (xtask). ✅ `958f011` (2026-04-17)**
+- `cargo xtask build-release` cross-compiles the full `tepegoz` binary for four Decision #3 triples (`x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) + fuses a universal-apple-darwin artifact via `lipo` when available locally.
+- Layout: `target/release-bundles/<triple>/tepegoz` + `<triple>/manifest.json` (`version`, `built_at_unix_secs`, `target_triple`) + top-level `SHA256SUMS` (GNU text format consumable by both `sha256sum -c` and `shasum -a 256 -c`).
+- Internally invokes `build-agents` first so the controller `build.rs` drift check sees populated agent slots — without it release binaries ship `None` for every agent arch and `deploy_agent` breaks silently at runtime.
+- New shared `xtask::preflight` module (lifted out of `demo_phase_6.rs`) — single two-layer cross-build check consumed by both `build-release` (4 targets) and `demo-phase-6 --remote` (1 target). Closes 6e-prep-3's "avoid two drifting copies" intent.
+- Tactical calls made during R1 landing:
+  - **Per-target subcommand**: `cargo build` for darwin-on-macOS (ld64 is multi-arch-native, handles x86_64-darwin cleanly from an arm64 host); `cargo zigbuild` everywhere else. Sidesteps a zigbuild-llvm-ar-21-vs-ring-cc-rs-archive regression that crashes darwin cross-arch builds.
+  - **Zig 0.15 required** via new `preflight::check_zig_ring_compatibility()`. 0.16 ships llvm-ar 21 that breaks `ring 0.17.14` archive builds; 0.14 has a macOS-26 SDK-path double-prefix bug. 0.15 works on both darwin + musl. Called only by `build-release` since the agent has no ring dep.
+  - **Linux→darwin hard-rejected** in preflight — no SDKROOT shim shipped with the xtask. R2's workflow routes darwin targets to `macos-latest` so production path never hits this.
+  - **`lipo` optional locally, mandatory at R2.** `find_lipo()` accepts `lipo` (Xcode cmdline tools) or `llvm-lipo`; on miss, build emits a clear "skipping universal" note + produces the 4 per-triple binaries. R2 CI enforces `lipo` presence.
+  - **Linker policy unified to zigbuild-required** in the shared preflight. Prior `musl-gcc` allowance on Linux in `demo_phase_6` dropped — one implementation, two callers.
+- Cold-walk (5 scenarios): layer-1/layer-2/both/zig-0.16 failure paths each exit in <1 s with zero side effects; success path (~3:38 wall-clock fresh) produces 5 artifacts totalling ~97 MiB; `shasum -a 256 -c SHA256SUMS` OK across all 5 lines; host-target `--version` prints `tepegoz 0.0.1` on both the native arm64 and the universal binary.
+- No new tests (pure xtask addition); 398 workspace tests hold; clippy `--workspace --all-targets -D warnings` clean; fmt clean.
 
 **Slice R2 — GitHub Actions release workflow.**
 - New `.github/workflows/release.yml` triggered on `v*.*.* ` tag push.
